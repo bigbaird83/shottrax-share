@@ -1,5 +1,5 @@
 /**
- * Golf vendor proxy, inlined from ShotTrax worker-golf-proxy.js.
+ * Golf vendor proxy, inlined from ShotTraxx worker-golf-proxy.js.
  * Runs before board-key parsing so /gca/... and /golfapi/... are never stored
  * as live-board codes. The phone sends no vendor key; secrets stay on this Worker.
  *
