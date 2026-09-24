@@ -117,6 +117,14 @@ export default {
     }
     const isPaint = key.startsWith("id:") || key.startsWith("name:");
     const ttl = isPaint ? 60 * 60 * 24 * 365 : 60 * 60 * 24 * 7;
+    // Unbound BOARDS throws and Cloudflare turns that into error 1101.
+    // Golf routes already returned above, so this only covers board keys.
+    if (request.method === "GET" || request.method === "PUT") {
+      const boards = env && env.BOARDS;
+      if (!boards || typeof boards.get !== "function" || typeof boards.put !== "function") {
+        return golfJson(503, { error: "boards_not_configured" }, cors);
+      }
+    }
     if (request.method === "GET") {
       const val = await env.BOARDS.get(key);
       if (!val) return new Response("{}", { status: 404, headers: { ...cors, "Content-Type": "application/json" } });
