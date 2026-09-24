@@ -1,6 +1,6 @@
 # shottrax-share
 
-Cloudflare Worker for ShotTrax live boards and the course paint cache. It also proxies golf course vendor reads so the phone never holds a vendor key.
+Cloudflare Worker for ShotTraxx live boards and the course paint cache. It also proxies golf course vendor reads so the phone never holds a vendor key.
 
 Live boards stay `GET` / `PUT` on a single path segment in the `BOARDS` KV namespace. Paint cache keys start with `id:` or `name:`.
 
