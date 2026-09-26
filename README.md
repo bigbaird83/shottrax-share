@@ -6,11 +6,11 @@ Live boards stay `GET` / `PUT` on a single path segment in the `BOARDS` KV names
 
 If `env.BOARDS` is not bound, board routes and overlay lookups return `503` `{ "error": "boards_not_configured" }` instead of throwing. Golf proxy routes are unchanged.
 
-Deploy is manual. Brian runs `wrangler deploy` after merge. Do not deploy from CI.
+Merging to `main` deploys this Worker automatically through Cloudflare Workers Builds. A hand `wrangler deploy` is not required. The Workers Builds check fails immediately on every branch other than `main`. That failure is a Cloudflare branch-build setting, not a problem in this repo. After the merge build finishes, verify with the Magnolia curl below.
 
 ## Boards KV
 
-`wrangler.toml` binds `BOARDS` to the existing namespace `shottrax-boards` (`cfa1824a10374ab6a7fa0c97d0990e80`). The next `wrangler deploy` must keep that id so it does not drop the dashboard binding. No `preview_id` is set.
+`wrangler.toml` binds `BOARDS` to the existing namespace `shottrax-boards` (`cfa1824a10374ab6a7fa0c97d0990e80`). The automatic `main` deploy uses this file. Keep this id so that deploy does not drop the dashboard binding. No `preview_id` is set.
 
 Board and paint-cache keys are stored only while that binding is present on the live Worker. If it is missing, those routes return `503` `{ "error": "boards_not_configured" }`.
 
@@ -76,12 +76,14 @@ Overlays are OpenStreetMap data, © OpenStreetMap contributors, under the Open D
 
 https://www.openstreetmap.org/copyright
 
-### Check after Brian deploys
+### Check after merge
+
+Merging to `main` deploys the Worker. When that Workers Builds run finishes, check Magnolia Country Club, AR:
 
 ```
 curl -D - "https://shottrax-share.bcbaird.workers.dev/osm/v1/overlay?courseId=2fa21943-abaa-43a4-a90f-cb06c82216b4&lat=33.1940935&lng=-93.2077463&radius=1800"
 ```
 
-Magnolia Country Club, AR. Expect `200` and golf features. Run it again and expect `X-Overlay-Cache: HIT`.
+Expect `200` and golf features. Run it again and expect `X-Overlay-Cache: HIT`.
 
 `npm test` runs the worker tests (mocked fetch, KV, and cache). It does not deploy.
