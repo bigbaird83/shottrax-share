@@ -632,10 +632,8 @@ async function loadOverlay({
     });
   }
 
-  // Negative marker only when there is no positive copy. It answers 404 for this
-  // exact location only and is never indexed for nearby reuse.
-  if ((await boards.get(noneKey)) != null) return { kind: "empty", cacheState: "HIT" };
-
+  // Nearby reuse beats an exact-location negative marker. A 404 at this pin must
+  // not hide a saved overlay within 600 m.
   const nearby = await findNearbyOverlay(boards, lat, lng, radius).catch(() => null);
   if (nearby) {
     return serveStored({
@@ -652,6 +650,10 @@ async function loadOverlay({
       refreshedState: "HIT-NEAR",
     });
   }
+
+  // Negative marker only when there is no exact or nearby positive. It answers
+  // 404 for this location only and is never indexed for nearby reuse.
+  if ((await boards.get(noneKey)) != null) return { kind: "empty", cacheState: "HIT" };
 
   const upstream = await fetchOverlayUpstream(query);
   if (upstream.kind === "data") {

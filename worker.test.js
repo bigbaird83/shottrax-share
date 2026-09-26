@@ -647,15 +647,41 @@ describe("shottrax-share worker", () => {
       value: JSON.stringify([{ lat: 33.1941, lng: -93.2077, radius: 1800 }]),
     });
     kv.set("osm:v1:none:33.1958,-93.2134:1800", { value: "1", opts: { expirationTtl: 6 * 60 * 60 } });
-    const blocked = await invoke(overlayUrl({
+    const reused = await invoke(overlayUrl({
       courseId: GCA_ID,
       lat: "33.1958",
       lng: "-93.2134",
       radius: "1800",
     }));
-    expect(blocked.status).toBe(404);
-    expect(blocked.headers.get("X-Overlay-Cache")).toBe("HIT");
-    expect(await blocked.json()).toEqual({ error: "no_overlay" });
+    expect(reused.status).toBe(200);
+    expect(reused.headers.get("X-Overlay-Cache")).toBe("HIT-NEAR");
+    expect(await reused.text()).toBe(MAGNOLIA_BODY);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("returns HIT-NEAR when this pin has a negative marker but a saved overlay is within 600 m", async () => {
+    const fetchedAt = Date.now();
+    kv.set(DATA_KEY, {
+      value: MAGNOLIA_BODY,
+      metadata: { fetchedAt },
+      opts: { expirationTtl: 365 * DAY, metadata: { fetchedAt } },
+    });
+    kv.set(INDEX_KEY, {
+      value: JSON.stringify([{ lat: 33.1941, lng: -93.2077, radius: 1800 }]),
+    });
+    kv.set("osm:v1:none:33.1965,-93.2100:1800", {
+      value: "1",
+      opts: { expirationTtl: 6 * 60 * 60 },
+    });
+    const response = await invoke(overlayUrl({
+      courseId: GCA_ID,
+      lat: "33.1965",
+      lng: "-93.2100",
+      radius: "1800",
+    }));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Overlay-Cache")).toBe("HIT-NEAR");
+    expect(await response.text()).toBe(MAGNOLIA_BODY);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
