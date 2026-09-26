@@ -73,8 +73,13 @@ describe("shottrax-share worker", () => {
           const row = kv.get(key);
           return row ? row.value : null;
         },
+        async getWithMetadata(key) {
+          const row = kv.get(key);
+          if (!row) return { value: null, metadata: null };
+          return { value: row.value, metadata: row.metadata ?? null };
+        },
         async put(key, value, opts) {
-          kv.set(key, { value, opts });
+          kv.set(key, { value, opts, metadata: opts?.metadata ?? null });
         },
       },
       GOLF_COURSES_API_KEY: "gca-secret",
@@ -193,10 +198,13 @@ describe("shottrax-share worker", () => {
     expect(await miss.text()).toBe(MAGNOLIA_BODY);
     expect(kv.get(DATA_KEY)).toMatchObject({
       value: MAGNOLIA_BODY,
-      opts: { expirationTtl: 30 * DAY },
+      opts: { expirationTtl: 365 * DAY },
     });
+    expect(kv.get(DATA_KEY).metadata.fetchedAt).toBeGreaterThan(Date.now() - 60_000);
     expect(kv.has(NONE_KEY)).toBe(false);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    const storedEdge = [...edge.values()][0];
+    expect(storedEdge.headers.get("Cache-Control")).toBe("public, max-age=86400");
 
     edge.clear();
     const hit = await invoke(url);
@@ -226,6 +234,73 @@ describe("shottrax-share worker", () => {
     expect(hit.headers.get("X-Overlay-Cache")).toBe("HIT");
     expect(await hit.text()).toBe(MAGNOLIA_BODY);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  function seedOverlay(body, fetchedAt) {
+    kv.set(DATA_KEY, {
+      value: body,
+      metadata: { fetchedAt },
+      opts: { expirationTtl: 365 * DAY, metadata: { fetchedAt } },
+    });
+  }
+
+  it("does not call Overpass for an overlay younger than 30 days", async () => {
+    const fetchedAt = Date.now() - 2 * DAY * 1000;
+    seedOverlay(MAGNOLIA_BODY, fetchedAt);
+    const response = await invoke(magnoliaUrl());
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Overlay-Cache")).toBe("HIT");
+    expect(await response.text()).toBe(MAGNOLIA_BODY);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(kv.get(DATA_KEY).metadata.fetchedAt).toBe(fetchedAt);
+  });
+
+  it("serves a stale overlay as STALE when Overpass returns 504", async () => {
+    const fetchedAt = Date.now() - 31 * DAY * 1000;
+    seedOverlay(MAGNOLIA_BODY, fetchedAt);
+    kv.set(NONE_KEY, { value: "1", metadata: null, opts: { expirationTtl: 6 * 60 * 60 } });
+    mockOverpass(async (url) => {
+      if (url === PRIMARY) return new Response("gateway", { status: 504, headers: { "Retry-After": "45" } });
+      return new Response("gateway", { status: 504 });
+    });
+    const response = await invoke(magnoliaUrl());
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Overlay-Cache")).toBe("STALE");
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(await response.text()).toBe(MAGNOLIA_BODY);
+    expect(kv.get(DATA_KEY).value).toBe(MAGNOLIA_BODY);
+    expect(kv.get(DATA_KEY).metadata.fetchedAt).toBe(fetchedAt);
+    expect(edge.size).toBe(0);
+  });
+
+  it("keeps a stale overlay when the refresh is empty", async () => {
+    const fetchedAt = Date.now() - 31 * DAY * 1000;
+    seedOverlay(MAGNOLIA_BODY, fetchedAt);
+    mockOverpass(async () => overpassOk('{"elements":[]}'));
+    const response = await invoke(magnoliaUrl());
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Overlay-Cache")).toBe("STALE");
+    expect(await response.text()).toBe(MAGNOLIA_BODY);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(kv.get(DATA_KEY).value).toBe(MAGNOLIA_BODY);
+    expect(kv.get(DATA_KEY).metadata.fetchedAt).toBe(fetchedAt);
+    expect(kv.has(NONE_KEY)).toBe(false);
+    expect(edge.size).toBe(0);
+  });
+
+  it("overwrites a stale overlay when the refresh has golf features", async () => {
+    const fetchedAt = Date.now() - 31 * DAY * 1000;
+    const refreshed = '{"elements":[{"type":"way","id":10,"tags":{"golf":"fairway"}}]}';
+    seedOverlay(MAGNOLIA_BODY, fetchedAt);
+    mockOverpass(async () => overpassOk(refreshed));
+    const response = await invoke(magnoliaUrl());
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Overlay-Cache")).toBe("REFRESHED");
+    expect(await response.text()).toBe(refreshed);
+    expect(kv.get(DATA_KEY).value).toBe(refreshed);
+    expect(kv.get(DATA_KEY).opts.expirationTtl).toBe(365 * DAY);
+    expect(kv.get(DATA_KEY).metadata.fetchedAt).toBeGreaterThan(fetchedAt);
+    expect(kv.has(NONE_KEY)).toBe(false);
   });
 
   it("uses the mirror after 429 and caches that success", async () => {

@@ -53,13 +53,18 @@ GET /osm/v1/overlay?courseId=<id>&lat=<lat>&lng=<lng>&radius=<meters>
 | `lng` | Required. Finite, -180 through 180 |
 | `radius` | Optional integer meters. 200–2000, default 1800 |
 
-A hit is `200` `Content-Type: application/json` with the raw Overpass body and `X-Overlay-Cache: HIT` or `MISS`. CORS matches the other routes.
+The phone gets `200` `Content-Type: application/json` and the raw Overpass body, with `X-Overlay-Cache` of `HIT`, `MISS`, `REFRESHED`, or `STALE`. CORS matches the other routes. The body is never a cache wrapper.
 
-Cache key: `osm:v1:<courseId>:<lat to 4 decimals>,<lng to 4 decimals>:<radius>`. A successful response that contains at least one element with a `golf` tag is stored in `BOARDS` for 30 days (`expirationTtl`) and in `caches.default` for a fast edge hit. A cache hit does not call Overpass. Identical misses in the same isolate share one upstream call.
+Cache key: `osm:v1:<courseId>:<lat to 4 decimals>,<lng to 4 decimals>:<radius>`. A successful response (at least one element with a `golf` tag, and no timeout or runtime `remark`) is stored in `BOARDS` as that raw JSON. `expirationTtl` is 365 days so the entry is not deleted on a 30-day timer. `fetchedAt` is KV metadata.
 
-These are not stored: `429`, `5xx`, timeouts, network errors, bad JSON, and an Overpass `200` whose `remark` reports a runtime error or timeout (Overpass uses `200` plus `remark` when a query times out). The phone gets `503` `{ "error": "upstream_busy" }` and `Retry-After` (the upstream value when it sent one, otherwise 30). The Worker retries once. On `429` or `504` the retry goes to `https://overpass.private.coffee/api/interpreter`. The upstream `User-Agent` is `shottracker-worker/1.0 (+https://shottrax-share.bcbaird.workers.dev)`.
+- Younger than 30 days: `X-Overlay-Cache: HIT`. Overpass is not called.
+- 30 days or older: the Worker asks Overpass again. A new non-empty overlay overwrites the entry and is served as `X-Overlay-Cache: REFRESHED`. If Overpass is busy, times out, errors, or returns no golf features, the stored overlay is left unchanged and served as `X-Overlay-Cache: STALE`. A refresh never drops a course's overlays and never answers `503` or `404` while an older copy exists.
 
-A valid response with no golf features is `404` `{ "error": "no_overlay" }`. That result is stored separately for 6 hours at `osm:v1:none:...` and only ever answers `404`.
+`caches.default` holds a copy for 1 day, with `fetchedAt` on that cached response, so an edge hit cannot keep serving an overlay past its refresh. A `STALE` answer is not written to the edge cache. A hit does not call Overpass. Identical misses in the same isolate share one upstream call.
+
+When nothing is stored yet, `429`, `5xx`, timeouts, network errors, bad JSON, and an Overpass `200` whose `remark` reports a runtime error or timeout (Overpass uses `200` plus `remark` when a query times out) are not cached. The phone gets `503` `{ "error": "upstream_busy" }` and `Retry-After` (the upstream value when it sent one, otherwise 30). The Worker retries once. On `429` or `504` the retry goes to `https://overpass.private.coffee/api/interpreter`. The upstream `User-Agent` is `shottracker-worker/1.0 (+https://shottrax-share.bcbaird.workers.dev)`.
+
+A valid response with no golf features, and no positive copy already stored, is `404` `{ "error": "no_overlay" }`. That negative marker is stored for 6 hours at `osm:v1:none:...` and only ever answers `404`. It is not written when a positive overlay exists.
 
 Other overlay errors: `bad_request` (400), `method_not_allowed` (405), `unknown_route` (404), `boards_not_configured` (503). No new secrets, env vars, or KV namespaces.
 

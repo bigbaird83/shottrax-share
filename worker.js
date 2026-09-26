@@ -16,7 +16,11 @@
 const OVERPASS_PRIMARY = "https://overpass-api.de/api/interpreter";
 const OVERPASS_MIRROR = "https://overpass.private.coffee/api/interpreter";
 const OVERPASS_USER_AGENT = "shottracker-worker/1.0 (+https://shottrax-share.bcbaird.workers.dev)";
-const OSM_POSITIVE_TTL = 60 * 60 * 24 * 30;
+/** KV keeps the only copy for a year. Freshness is fetchedAt, not expiration. */
+const OSM_KV_TTL = 60 * 60 * 24 * 365;
+const OSM_FRESH_MS = 30 * 24 * 60 * 60 * 1000;
+/** Short edge TTL so caches.default cannot pin an overlay past its refresh. */
+const OSM_EDGE_TTL = 60 * 60 * 24;
 const OSM_NEGATIVE_TTL = 60 * 60 * 6;
 /** Two attempts plus a short backoff stay under the ~28s budget. */
 const OSM_BUDGET_MS = 27000;
@@ -221,22 +225,42 @@ function overlayDataResponse(body, cors, cacheState) {
     headers: {
       ...cors,
       "Content-Type": "application/json",
-      "Cache-Control": `public, max-age=${OSM_POSITIVE_TTL}`,
+      "Cache-Control": cacheState === "STALE" ? "no-store" : `public, max-age=${OSM_EDGE_TTL}`,
       "X-Overlay-Cache": cacheState,
     },
   });
 }
 
-function serveOutcome(outcome, cors, asHit) {
-  if (outcome.kind === "data") return overlayDataResponse(outcome.body, cors, asHit ? "HIT" : "MISS");
+/** Edge copy carries fetchedAt so a hit older than 30 days is not served as fresh. */
+function edgeCacheResponse(body, cors, fetchedAt) {
+  return new Response(body, {
+    status: 200,
+    headers: {
+      ...cors,
+      "Content-Type": "application/json",
+      "Cache-Control": `public, max-age=${OSM_EDGE_TTL}`,
+      "X-Overlay-Cache": "HIT",
+      "X-Overlay-Fetched-At": String(fetchedAt),
+    },
+  });
+}
+
+function serveOutcome(outcome, cors, cacheState) {
+  if (outcome.kind === "data") return overlayDataResponse(outcome.body, cors, cacheState);
   if (outcome.kind === "empty") {
     return golfJson(404, { error: "no_overlay" }, cors, {
-      "X-Overlay-Cache": asHit ? "HIT" : "MISS",
+      "X-Overlay-Cache": cacheState,
     });
   }
   return golfJson(503, { error: "upstream_busy" }, cors, {
     "Retry-After": outcome.retryAfter || "30",
   });
+}
+
+function presentedState(outcome, waiter) {
+  const state = outcome.cacheState;
+  if (waiter && state === "MISS") return "HIT";
+  return state;
 }
 
 async function callOverpass(url, query, timeoutMs) {
@@ -311,35 +335,74 @@ async function rememberEdge(cache, ctx, edgeKey, response) {
   else await put;
 }
 
+function isFresh(fetchedAt, now = Date.now()) {
+  return Number.isFinite(fetchedAt) && fetchedAt > 0 && now - fetchedAt < OSM_FRESH_MS;
+}
+
+function positivePutOptions(fetchedAt) {
+  return { expirationTtl: OSM_KV_TTL, metadata: { fetchedAt } };
+}
+
+/** Value stays the raw Overpass JSON. fetchedAt lives in KV metadata. */
+async function readPositive(boards, dataKey) {
+  if (typeof boards.getWithMetadata === "function") {
+    const row = await boards.getWithMetadata(dataKey);
+    if (!row || row.value == null) return null;
+    const body = storedOverlay(row.value);
+    if (!body) return null;
+    const fetchedAt = row.metadata && Number(row.metadata.fetchedAt);
+    return { body, fetchedAt: Number.isFinite(fetchedAt) ? fetchedAt : 0 };
+  }
+  const body = storedOverlay(await boards.get(dataKey));
+  if (!body) return null;
+  return { body, fetchedAt: 0 };
+}
+
 async function loadOverlay({ env, ctx, cache, edgeKey, dataKey, noneKey, query, cors }) {
   if (cache && typeof cache.match === "function") {
     const cached = await cache.match(edgeKey);
     if (cached && cached.status === 200) {
-      const body = storedOverlay(await cached.text());
-      if (body) return { kind: "data", body, cached: true };
+      const fetchedAt = Number(cached.headers.get("X-Overlay-Fetched-At"));
+      if (isFresh(fetchedAt)) {
+        const body = storedOverlay(await cached.text());
+        if (body) return { kind: "data", body, cacheState: "HIT" };
+      }
     }
   }
 
   const boards = env.BOARDS;
-  const stored = storedOverlay(await boards.get(dataKey));
-  if (stored) {
-    await rememberEdge(cache, ctx, edgeKey, overlayDataResponse(stored, cors, "HIT"));
-    return { kind: "data", body: stored, cached: true };
+  const existing = await readPositive(boards, dataKey);
+  if (existing && isFresh(existing.fetchedAt)) {
+    await rememberEdge(cache, ctx, edgeKey, edgeCacheResponse(existing.body, cors, existing.fetchedAt));
+    return { kind: "data", body: existing.body, cacheState: "HIT" };
   }
-  // Negative marker: always a 404, even if the stored bytes look like an overlay.
-  if ((await boards.get(noneKey)) != null) return { kind: "empty", cached: true };
+  if (existing) {
+    const upstream = await fetchOverlayUpstream(query);
+    if (upstream.kind === "data") {
+      const fetchedAt = Date.now();
+      await boards.put(dataKey, upstream.body, positivePutOptions(fetchedAt));
+      await rememberEdge(cache, ctx, edgeKey, edgeCacheResponse(upstream.body, cors, fetchedAt));
+      return { kind: "data", body: upstream.body, cacheState: "REFRESHED" };
+    }
+    // Busy, timeout, or empty: never replace a real overlay, never 503/404.
+    return { kind: "data", body: existing.body, cacheState: "STALE" };
+  }
+
+  // Negative marker only when there is no positive copy. It can only answer 404.
+  if ((await boards.get(noneKey)) != null) return { kind: "empty", cacheState: "HIT" };
 
   const upstream = await fetchOverlayUpstream(query);
   if (upstream.kind === "data") {
-    await boards.put(dataKey, upstream.body, { expirationTtl: OSM_POSITIVE_TTL });
-    await rememberEdge(cache, ctx, edgeKey, overlayDataResponse(upstream.body, cors, "HIT"));
-    return { kind: "data", body: upstream.body, cached: false };
+    const fetchedAt = Date.now();
+    await boards.put(dataKey, upstream.body, positivePutOptions(fetchedAt));
+    await rememberEdge(cache, ctx, edgeKey, edgeCacheResponse(upstream.body, cors, fetchedAt));
+    return { kind: "data", body: upstream.body, cacheState: "MISS" };
   }
   if (upstream.kind === "empty") {
     await boards.put(noneKey, "1", { expirationTtl: OSM_NEGATIVE_TTL });
-    return { kind: "empty", cached: false };
+    return { kind: "empty", cacheState: "MISS" };
   }
-  return { kind: "busy", retryAfter: upstream.retryAfter || "30", cached: false };
+  return { kind: "busy", retryAfter: upstream.retryAfter || "30" };
 }
 
 /**
@@ -364,7 +427,7 @@ async function handleOsmOverlay(request, env, ctx, cors) {
   const pending = osmInflight.get(dataKey);
   if (pending) {
     const outcome = await pending;
-    return serveOutcome(outcome, cors, outcome.kind !== "busy");
+    return serveOutcome(outcome, cors, presentedState(outcome, true));
   }
 
   const cache = typeof caches !== "undefined" && caches ? caches.default : null;
@@ -378,11 +441,11 @@ async function handleOsmOverlay(request, env, ctx, cors) {
     noneKey,
     query: overpassQuery(params.lat, params.lng, params.radius),
     cors,
-  }).catch(() => ({ kind: "busy", retryAfter: "30", cached: false }));
+  }).catch(() => ({ kind: "busy", retryAfter: "30" }));
   osmInflight.set(dataKey, run);
   try {
     const outcome = await run;
-    return serveOutcome(outcome, cors, outcome.cached === true);
+    return serveOutcome(outcome, cors, presentedState(outcome, false));
   } finally {
     if (osmInflight.get(dataKey) === run) osmInflight.delete(dataKey);
   }
