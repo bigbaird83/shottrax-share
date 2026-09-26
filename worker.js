@@ -6,7 +6,26 @@
  *   GET /gca/v1/courses[/{id}[/green-centers]]  → golfcoursesapi.com/api/v1/
  *   GET /golfapi/v2.3/courses[/{id}]            → golfapi.io/api/v2.3/
  *   GET /golfapi/v2.3/coordinates/{id}          → golfapi.io/api/v2.3/
+ *
+ * OSM overlay proxy also runs before board-key parsing. The Worker builds the
+ * Overpass query itself (clients never send Overpass QL):
+ *
+ *   GET /osm/v1/overlay?courseId&lat&lng&radius
  */
+
+const OVERPASS_PRIMARY = "https://overpass-api.de/api/interpreter";
+const OVERPASS_MIRROR = "https://overpass.private.coffee/api/interpreter";
+const OVERPASS_USER_AGENT = "shottracker-worker/1.0 (+https://shottrax-share.bcbaird.workers.dev)";
+const OSM_POSITIVE_TTL = 60 * 60 * 24 * 30;
+const OSM_NEGATIVE_TTL = 60 * 60 * 6;
+/** Two attempts plus a short backoff stay under the ~28s budget. */
+const OSM_BUDGET_MS = 27000;
+const OSM_ATTEMPT_MS = 13000;
+const OSM_BACKOFF_MS = 400;
+const COURSE_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+
+/** In-isolate collapse so identical misses share one Overpass call. */
+export const osmInflight = new Map();
 
 const GOLF_VENDORS = {
   gca: {
@@ -26,13 +45,14 @@ const GOLF_VENDORS = {
 /** Edge cache for successful reads. Course data changes rarely; golfapi is paid per call. */
 const GOLF_CACHE_SECONDS = 60 * 60 * 24;
 
-function golfJson(status, body, cors) {
+function golfJson(status, body, cors, extra) {
   return new Response(JSON.stringify(body), {
     status,
     headers: {
       ...cors,
       "Content-Type": "application/json",
       "Cache-Control": "no-store",
+      ...extra,
     },
   });
 }
@@ -96,6 +116,278 @@ async function handleGolfProxy(request, env, ctx, cors) {
   return response;
 }
 
+/**
+ * Same query as ShotTraxx src/course/osmOverlay.ts `overpassQuery`.
+ * Golf-tagged ways and relations around the point, with geometry.
+ * That function does not query nodes; copying it keeps parseOverpassOverlay unchanged.
+ */
+function overpassQuery(lat, lng, radiusM) {
+  const r = Math.max(50, Math.min(3000, Math.round(radiusM)));
+  return `[out:json][timeout:25];
+(
+  way["golf"="green"](around:${r},${lat},${lng});
+  way["golf"="fairway"](around:${r},${lat},${lng});
+  way["golf"="tee"](around:${r},${lat},${lng});
+  way["golf"="hole"](around:${r},${lat},${lng});
+  way["golf"="bunker"](around:${r},${lat},${lng});
+  way["golf"="water_hazard"](around:${r},${lat},${lng});
+  way["golf"="lateral_water_hazard"](around:${r},${lat},${lng});
+  way["golf"="cartpath"](around:${r},${lat},${lng});
+  relation["golf"="green"](around:${r},${lat},${lng});
+  relation["golf"="fairway"](around:${r},${lat},${lng});
+  relation["golf"="tee"](around:${r},${lat},${lng});
+  relation["golf"="bunker"](around:${r},${lat},${lng});
+  relation["golf"="water_hazard"](around:${r},${lat},${lng});
+  relation["golf"="lateral_water_hazard"](around:${r},${lat},${lng});
+);
+out geom;`;
+}
+
+function parseCoord(raw, min, max) {
+  if (typeof raw !== "string") return null;
+  const text = raw.trim();
+  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(text)) return null;
+  const value = Number(text);
+  if (!Number.isFinite(value) || value < min || value > max) return null;
+  return value;
+}
+
+function parseRadius(raw) {
+  if (raw == null) return 1800;
+  if (!/^\d+$/.test(raw)) return null;
+  const radius = Number(raw);
+  if (radius < 200 || radius > 2000) return null;
+  return radius;
+}
+
+function parseOverlayRequest(url) {
+  const courseId = url.searchParams.get("courseId");
+  if (courseId == null || !COURSE_ID_RE.test(courseId)) return null;
+  const lat = parseCoord(url.searchParams.get("lat"), -90, 90);
+  const lng = parseCoord(url.searchParams.get("lng"), -180, 180);
+  if (lat == null || lng == null) return null;
+  const radius = parseRadius(url.searchParams.get("radius"));
+  if (radius == null) return null;
+  return { courseId, lat, lng, radius };
+}
+
+function overlayLocationKey(courseId, lat, lng, radius) {
+  return `${courseId}:${lat.toFixed(4)},${lng.toFixed(4)}:${radius}`;
+}
+
+function remarkIsRuntimeFailure(payload) {
+  if (!payload || typeof payload !== "object") return false;
+  const remark = payload.remark;
+  if (typeof remark !== "string") return false;
+  return /runtime error|timed ?out|timeout|too busy/i.test(remark);
+}
+
+function payloadHasGolf(payload) {
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.elements)) return false;
+  return payload.elements.some((element) => {
+    if (!element || typeof element !== "object") return false;
+    const tags = element.tags;
+    if (!tags || typeof tags !== "object" || Array.isArray(tags)) return false;
+    return typeof tags.golf === "string" && tags.golf.trim() !== "";
+  });
+}
+
+/** Positive cache entries must still be an overlay. A negative marker is never a 200. */
+function storedOverlay(text) {
+  if (typeof text !== "string" || text.length === 0) return null;
+  try {
+    const payload = JSON.parse(text);
+    if (remarkIsRuntimeFailure(payload) || !payloadHasGolf(payload)) return null;
+    return text;
+  } catch {
+    return null;
+  }
+}
+
+function cleanRetryAfter(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 80 || /[\r\n]/.test(trimmed)) return null;
+  return trimmed;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function overlayDataResponse(body, cors, cacheState) {
+  return new Response(body, {
+    status: 200,
+    headers: {
+      ...cors,
+      "Content-Type": "application/json",
+      "Cache-Control": `public, max-age=${OSM_POSITIVE_TTL}`,
+      "X-Overlay-Cache": cacheState,
+    },
+  });
+}
+
+function serveOutcome(outcome, cors, asHit) {
+  if (outcome.kind === "data") return overlayDataResponse(outcome.body, cors, asHit ? "HIT" : "MISS");
+  if (outcome.kind === "empty") {
+    return golfJson(404, { error: "no_overlay" }, cors, {
+      "X-Overlay-Cache": asHit ? "HIT" : "MISS",
+    });
+  }
+  return golfJson(503, { error: "upstream_busy" }, cors, {
+    "Retry-After": outcome.retryAfter || "30",
+  });
+}
+
+async function callOverpass(url, query, timeoutMs) {
+  if (timeoutMs < 200) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "User-Agent": OVERPASS_USER_AGENT,
+      },
+      body: `data=${encodeURIComponent(query)}`,
+      signal: controller.signal,
+    });
+    return { response, status: response.status, text: await response.text() };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** null → retry or give up. Empty is final: no golf features, do not retry. */
+function classifyAttempt(result) {
+  if (!result || result.status !== 200) return null;
+  let payload;
+  try {
+    payload = JSON.parse(result.text);
+  } catch {
+    return null;
+  }
+  if (remarkIsRuntimeFailure(payload)) return null;
+  if (payloadHasGolf(payload)) return { kind: "data", body: result.text };
+  return { kind: "empty" };
+}
+
+async function fetchOverlayUpstream(query) {
+  const deadline = Date.now() + OSM_BUDGET_MS;
+  const first = await callOverpass(OVERPASS_PRIMARY, query, Math.min(OSM_ATTEMPT_MS, deadline - Date.now()));
+  const firstHit = classifyAttempt(first);
+  if (firstHit) return firstHit;
+
+  const firstRetry = first && first.response ? first.response.headers.get("Retry-After") : null;
+  const useMirror = Boolean(first && (first.status === 429 || first.status === 504));
+  const pause = Math.min(OSM_BACKOFF_MS, Math.max(0, deadline - Date.now() - 500));
+  if (pause > 0) await sleep(pause);
+  const remaining = deadline - Date.now();
+  if (remaining < 500) {
+    return { kind: "busy", retryAfter: cleanRetryAfter(firstRetry) || "30" };
+  }
+  const secondUrl = useMirror ? OVERPASS_MIRROR : OVERPASS_PRIMARY;
+  const second = await callOverpass(secondUrl, query, remaining);
+  const secondHit = classifyAttempt(second);
+  if (secondHit) return secondHit;
+  const secondRetry = second && second.response ? second.response.headers.get("Retry-After") : null;
+  return {
+    kind: "busy",
+    retryAfter: cleanRetryAfter(secondRetry) || cleanRetryAfter(firstRetry) || "30",
+  };
+}
+
+async function rememberEdge(cache, ctx, edgeKey, response) {
+  if (!cache || typeof cache.put !== "function") return;
+  // KV is the durable copy. A full edge cache should not fail the phone.
+  const put = Promise.resolve()
+    .then(() => cache.put(edgeKey, response))
+    .catch(() => {});
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(put);
+  else await put;
+}
+
+async function loadOverlay({ env, ctx, cache, edgeKey, dataKey, noneKey, query, cors }) {
+  if (cache && typeof cache.match === "function") {
+    const cached = await cache.match(edgeKey);
+    if (cached && cached.status === 200) {
+      const body = storedOverlay(await cached.text());
+      if (body) return { kind: "data", body, cached: true };
+    }
+  }
+
+  const boards = env.BOARDS;
+  const stored = storedOverlay(await boards.get(dataKey));
+  if (stored) {
+    await rememberEdge(cache, ctx, edgeKey, overlayDataResponse(stored, cors, "HIT"));
+    return { kind: "data", body: stored, cached: true };
+  }
+  // Negative marker: always a 404, even if the stored bytes look like an overlay.
+  if ((await boards.get(noneKey)) != null) return { kind: "empty", cached: true };
+
+  const upstream = await fetchOverlayUpstream(query);
+  if (upstream.kind === "data") {
+    await boards.put(dataKey, upstream.body, { expirationTtl: OSM_POSITIVE_TTL });
+    await rememberEdge(cache, ctx, edgeKey, overlayDataResponse(upstream.body, cors, "HIT"));
+    return { kind: "data", body: upstream.body, cached: false };
+  }
+  if (upstream.kind === "empty") {
+    await boards.put(noneKey, "1", { expirationTtl: OSM_NEGATIVE_TTL });
+    return { kind: "empty", cached: false };
+  }
+  return { kind: "busy", retryAfter: upstream.retryAfter || "30", cached: false };
+}
+
+/**
+ * Response for /osm/..., or null so the caller falls through to share-board GET/PUT.
+ */
+async function handleOsmOverlay(request, env, ctx, cors) {
+  const url = new URL(request.url);
+  if (!url.pathname.startsWith("/osm/")) return null;
+  if (url.pathname !== "/osm/v1/overlay") return golfJson(404, { error: "unknown_route" }, cors);
+  if (request.method !== "GET") return golfJson(405, { error: "method_not_allowed" }, cors);
+
+  const params = parseOverlayRequest(url);
+  if (!params) return golfJson(400, { error: "bad_request" }, cors);
+
+  const locationKey = overlayLocationKey(params.courseId, params.lat, params.lng, params.radius);
+  const dataKey = `osm:v1:${locationKey}`;
+  const noneKey = `osm:v1:none:${locationKey}`;
+  const boards = env && env.BOARDS;
+  const boardsReady = Boolean(boards && typeof boards.get === "function" && typeof boards.put === "function");
+  if (!boardsReady) return golfJson(503, { error: "boards_not_configured" }, cors);
+
+  const pending = osmInflight.get(dataKey);
+  if (pending) {
+    const outcome = await pending;
+    return serveOutcome(outcome, cors, outcome.kind !== "busy");
+  }
+
+  const cache = typeof caches !== "undefined" && caches ? caches.default : null;
+  const edgeKey = new Request(url.toString(), { method: "GET" });
+  const run = loadOverlay({
+    env,
+    ctx,
+    cache,
+    edgeKey,
+    dataKey,
+    noneKey,
+    query: overpassQuery(params.lat, params.lng, params.radius),
+    cors,
+  }).catch(() => ({ kind: "busy", retryAfter: "30", cached: false }));
+  osmInflight.set(dataKey, run);
+  try {
+    const outcome = await run;
+    return serveOutcome(outcome, cors, outcome.cached === true);
+  } finally {
+    if (osmInflight.get(dataKey) === run) osmInflight.delete(dataKey);
+  }
+}
+
 export default {
   async fetch(request, env, ctx) {
     const cors = {
@@ -110,15 +402,22 @@ export default {
     const golf = await handleGolfProxy(request, env, ctx, cors);
     if (golf) return golf;
 
+    const osm = await handleOsmOverlay(request, env, ctx, cors);
+    if (osm) return osm;
+
     const url = new URL(request.url);
     const key = decodeURIComponent(url.pathname.replace(/^\/+/, "").split("/")[0] || "");
     if (!key || key.length > 180) {
       return new Response("bad key", { status: 400, headers: cors });
     }
+    // Overlay cache lives in BOARDS under osm: keys. Boards must not read or replace those.
+    if ((request.method === "GET" || request.method === "PUT") && key.startsWith("osm:")) {
+      return new Response("bad key", { status: 400, headers: cors });
+    }
     const isPaint = key.startsWith("id:") || key.startsWith("name:");
     const ttl = isPaint ? 60 * 60 * 24 * 365 : 60 * 60 * 24 * 7;
     // Unbound BOARDS throws and Cloudflare turns that into error 1101.
-    // Golf routes already returned above, so this only covers board keys.
+    // Golf and OSM routes already returned above, so this only covers board keys.
     if (request.method === "GET" || request.method === "PUT") {
       const boards = env && env.BOARDS;
       if (!boards || typeof boards.get !== "function" || typeof boards.put !== "function") {
