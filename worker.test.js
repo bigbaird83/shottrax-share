@@ -6,8 +6,11 @@ const PRIMARY = "https://overpass-api.de/api/interpreter";
 const MIRROR = "https://overpass.private.coffee/api/interpreter";
 const USER_AGENT = "shottracker-worker/1.0 (+https://shottrax-share.bcbaird.workers.dev)";
 const COURSE_ID = "2fa21943-abaa-43a4-a90f-cb06c82216b4";
-const DATA_KEY = `osm:v1:${COURSE_ID}:33.1941,-93.2077:1800`;
-const NONE_KEY = `osm:v1:none:${COURSE_ID}:33.1941,-93.2077:1800`;
+const DATA_KEY = "osm:v1:33.1941,-93.2077:1800";
+const NONE_KEY = "osm:v1:none:33.1941,-93.2077:1800";
+const REFRESH_KEY = "osm:v1:refreshing:33.1941,-93.2077:1800";
+const INDEX_KEY = "osm:v1:index:33.19,-93.21";
+const GCA_ID = "14322";
 const DAY = 60 * 60 * 24;
 
 const MAGNOLIA_BODY =
@@ -291,7 +294,6 @@ describe("shottrax-share worker", () => {
 
   it("serves STALE immediately when upstream is busy and skips another refresh within the hour", async () => {
     const fetchedAt = Date.now() - 31 * DAY * 1000;
-    const refreshKey = `osm:v1:refreshing:${COURSE_ID}:33.1941,-93.2077:1800`;
     seedOverlay(MAGNOLIA_BODY, fetchedAt);
     let release;
     const gate = new Promise((resolve) => {
@@ -313,7 +315,7 @@ describe("shottrax-share worker", () => {
     expect(response.headers.get("X-Overlay-Cache")).toBe("STALE");
     expect(await response.text()).toBe(MAGNOLIA_BODY);
     expect(calls).toBe(1);
-    expect(kv.get(refreshKey)?.opts?.expirationTtl).toBe(3600);
+    expect(kv.get(REFRESH_KEY)?.opts?.expirationTtl).toBe(3600);
 
     const second = await worker.fetch(new Request(magnoliaUrl()), env, {
       waitUntil(promise) { waits.push(promise); },
@@ -323,7 +325,7 @@ describe("shottrax-share worker", () => {
     expect(await second.text()).toBe(MAGNOLIA_BODY);
     expect(calls).toBe(1);
 
-    const refused = await invoke(`${ORIGIN}/${encodeURIComponent(refreshKey)}`);
+    const refused = await invoke(`${ORIGIN}/${encodeURIComponent(REFRESH_KEY)}`);
     expect(refused.status).toBe(400);
 
     release();
@@ -427,6 +429,7 @@ describe("shottrax-share worker", () => {
     mockOverpass(async () => new Response("not-json", { status: 200 }));
     const bad = await invoke(magnoliaUrl());
     expect(bad.status).toBe(503);
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([PRIMARY, PRIMARY]);
     expect(kv.size).toBe(0);
 
     fetchMock.mockReset();
@@ -435,7 +438,7 @@ describe("shottrax-share worker", () => {
     expect(down.status).toBe(503);
     expect(await down.json()).toEqual({ error: "upstream_busy" });
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock.mock.calls.every((call) => call[0] === PRIMARY)).toBe(true);
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([PRIMARY, MIRROR]);
     expect(kv.size).toBe(0);
     expect(edge.size).toBe(0);
   });
@@ -451,6 +454,7 @@ describe("shottrax-share worker", () => {
     expect(response.status).toBe(200);
     expect(await response.text()).toBe(MAGNOLIA_BODY);
     expect(calls).toBe(2);
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([PRIMARY, MIRROR]);
     expect(kv.get(DATA_KEY)?.value).toBe(MAGNOLIA_BODY);
   });
 
@@ -517,6 +521,211 @@ describe("shottrax-share worker", () => {
     expect(states).toEqual(["HIT", "MISS"]);
     expect(await left.text()).toBe(MAGNOLIA_BODY);
     expect(await right.text()).toBe(MAGNOLIA_BODY);
+  });
+
+  it("reuses a stored overlay for a different courseId at the same place", async () => {
+    mockOverpass(async () => overpassOk());
+    const first = await invoke(magnoliaUrl());
+    expect(first.headers.get("X-Overlay-Cache")).toBe("MISS");
+    expect(kv.has(DATA_KEY)).toBe(true);
+    expect([...kv.keys()].some((key) => key.includes(COURSE_ID))).toBe(false);
+
+    edge.clear();
+    const second = await invoke(magnoliaUrl({ courseId: GCA_ID }));
+    expect(second.status).toBe(200);
+    expect(second.headers.get("X-Overlay-Cache")).toBe("HIT");
+    expect(await second.text()).toBe(MAGNOLIA_BODY);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("reuses the nearest saved overlay within 600 m", async () => {
+    mockOverpass(async () => overpassOk());
+    const stored = await invoke(magnoliaUrl());
+    expect(stored.headers.get("X-Overlay-Cache")).toBe("MISS");
+    expect(JSON.parse(kv.get(INDEX_KEY).value)).toEqual([
+      { lat: 33.1941, lng: -93.2077, radius: 1800 },
+    ]);
+
+    edge.clear();
+    // GCA pin for Magnolia, about 563 m from the rounded OpenGolf pin.
+    const near = await invoke(overlayUrl({
+      courseId: GCA_ID,
+      lat: "33.1958",
+      lng: "-93.2134",
+      radius: "1800",
+    }));
+    expect(near.status).toBe(200);
+    expect(near.headers.get("X-Overlay-Cache")).toBe("HIT-NEAR");
+    expect(await near.text()).toBe(MAGNOLIA_BODY);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    const fartherBody = '{"elements":[{"type":"way","id":10,"tags":{"golf":"fairway"}}]}';
+    const fetchedAt = Date.now();
+    kv.set("osm:v1:33.1985,-93.2077:1800", {
+      value: fartherBody,
+      metadata: { fetchedAt },
+      opts: { expirationTtl: 365 * DAY, metadata: { fetchedAt } },
+    });
+    kv.set(INDEX_KEY, {
+      value: JSON.stringify([
+        { lat: 33.1941, lng: -93.2077, radius: 1800 },
+        { lat: 33.1985, lng: -93.2077, radius: 1800 },
+      ]),
+    });
+    edge.clear();
+    const picked = await invoke(overlayUrl({
+      courseId: GCA_ID,
+      lat: "33.1950",
+      lng: "-93.2077",
+      radius: "1800",
+    }));
+    expect(picked.headers.get("X-Overlay-Cache")).toBe("HIT-NEAR");
+    expect(await picked.text()).toBe(MAGNOLIA_BODY);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not reuse an overlay beyond 600 m or for a different radius", async () => {
+    mockOverpass(async () => overpassOk());
+    await invoke(magnoliaUrl());
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    edge.clear();
+
+    const far = await invoke(overlayUrl({
+      courseId: GCA_ID,
+      lat: "33.2000",
+      lng: "-93.2077",
+      radius: "1800",
+    }));
+    expect(far.status).toBe(200);
+    expect(far.headers.get("X-Overlay-Cache")).toBe("MISS");
+    expect(await far.text()).toBe(MAGNOLIA_BODY);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    edge.clear();
+    const otherRadius = await invoke(overlayUrl({
+      courseId: GCA_ID,
+      lat: "33.1958",
+      lng: "-93.2134",
+      radius: "1600",
+    }));
+    expect(otherRadius.status).toBe(200);
+    expect(otherRadius.headers.get("X-Overlay-Cache")).toBe("MISS");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(kv.has("osm:v1:33.1958,-93.2134:1600")).toBe(true);
+    expect(kv.has("osm:v1:33.1958,-93.2134:1800")).toBe(false);
+  });
+
+  it("does not let a negative marker answer for a nearby location", async () => {
+    kv.set(NONE_KEY, { value: "1", opts: { expirationTtl: 6 * 60 * 60 } });
+    const exact = await invoke(magnoliaUrl());
+    expect(exact.status).toBe(404);
+    expect(exact.headers.get("X-Overlay-Cache")).toBe("HIT");
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    mockOverpass(async () => overpassOk());
+    const neighbor = await invoke(overlayUrl({
+      courseId: GCA_ID,
+      lat: "33.1958",
+      lng: "-93.2134",
+      radius: "1800",
+    }));
+    expect(neighbor.status).toBe(200);
+    expect(neighbor.headers.get("X-Overlay-Cache")).toBe("MISS");
+    expect(await neighbor.text()).toBe(MAGNOLIA_BODY);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    kv.clear();
+    edge.clear();
+    fetchMock.mockClear();
+    const fetchedAt = Date.now();
+    kv.set(DATA_KEY, {
+      value: MAGNOLIA_BODY,
+      metadata: { fetchedAt },
+      opts: { expirationTtl: 365 * DAY, metadata: { fetchedAt } },
+    });
+    kv.set(INDEX_KEY, {
+      value: JSON.stringify([{ lat: 33.1941, lng: -93.2077, radius: 1800 }]),
+    });
+    kv.set("osm:v1:none:33.1958,-93.2134:1800", { value: "1", opts: { expirationTtl: 6 * 60 * 60 } });
+    const blocked = await invoke(overlayUrl({
+      courseId: GCA_ID,
+      lat: "33.1958",
+      lng: "-93.2134",
+      radius: "1800",
+    }));
+    expect(blocked.status).toBe(404);
+    expect(blocked.headers.get("X-Overlay-Cache")).toBe("HIT");
+    expect(await blocked.json()).toEqual({ error: "no_overlay" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("adopts a legacy courseId key only for that same courseId", async () => {
+    const fetchedAt = Date.now() - 2 * DAY * 1000;
+    const legacyKey = `osm:v1:${COURSE_ID}:33.1941,-93.2077:1800`;
+    const legacyRow = {
+      value: MAGNOLIA_BODY,
+      metadata: { fetchedAt },
+      opts: { expirationTtl: 365 * DAY, metadata: { fetchedAt } },
+    };
+    kv.set(legacyKey, legacyRow);
+    mockOverpass(async () => overpassOk());
+    const otherCourse = await invoke(magnoliaUrl({ courseId: GCA_ID }));
+    expect(otherCourse.status).toBe(200);
+    expect(otherCourse.headers.get("X-Overlay-Cache")).toBe("MISS");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    kv.clear();
+    edge.clear();
+    fetchMock.mockClear();
+    kv.set(legacyKey, legacyRow);
+    const adopted = await invoke(magnoliaUrl());
+    expect(adopted.status).toBe(200);
+    expect(adopted.headers.get("X-Overlay-Cache")).toBe("HIT");
+    expect(await adopted.text()).toBe(MAGNOLIA_BODY);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(kv.get(DATA_KEY)?.value).toBe(MAGNOLIA_BODY);
+    expect(kv.get(DATA_KEY)?.metadata?.fetchedAt).toBe(fetchedAt);
+  });
+
+  it("uses the mirror when the primary attempt times out", async () => {
+    vi.useFakeTimers();
+    try {
+      const started = Date.now();
+      let abortedAt = 0;
+      mockOverpass((url, init) => {
+        if (url === PRIMARY) {
+          return new Promise((resolve, reject) => {
+            const fail = () => {
+              abortedAt = Date.now();
+              reject(new Error("The operation was aborted"));
+            };
+            if (init.signal?.aborted) fail();
+            else init.signal?.addEventListener("abort", fail, { once: true });
+          });
+        }
+        expect(url).toBe(MIRROR);
+        expect(init.headers["User-Agent"]).toBe(USER_AGENT);
+        expect(init.headers["Content-Type"]).toBe("application/x-www-form-urlencoded;charset=UTF-8");
+        return Promise.resolve(overpassOk());
+      });
+      const pending = invoke(magnoliaUrl());
+      await vi.advanceTimersByTimeAsync(10_999);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(abortedAt).toBe(0);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(abortedAt - started).toBe(11_000);
+      await vi.advanceTimersByTimeAsync(399);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      const response = await pending;
+      expect(response.status).toBe(200);
+      expect(response.headers.get("X-Overlay-Cache")).toBe("MISS");
+      expect(await response.text()).toBe(MAGNOLIA_BODY);
+      expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([PRIMARY, MIRROR]);
+      expect(kv.get(DATA_KEY)?.value).toBe(MAGNOLIA_BODY);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("refuses board GET and PUT for osm: keys", async () => {
