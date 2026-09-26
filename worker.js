@@ -22,12 +22,21 @@ const OSM_FRESH_MS = 30 * 24 * 60 * 60 * 1000;
 /** Short edge TTL so caches.default cannot pin an overlay past its refresh. */
 const OSM_EDGE_TTL = 60 * 60 * 24;
 const OSM_NEGATIVE_TTL = 60 * 60 * 6;
-/** One refresh attempt per course per hour while the copy is stale. */
+/** One refresh attempt per location per hour while the copy is stale. */
 const OSM_REFRESH_TTL = 60 * 60;
-/** Two attempts plus a short backoff stay under the ~28s budget. */
+/**
+ * Primary gets about 11s. Timeout, throw, 429, and 504 then use the mirror
+ * for whatever is left of the ~27s budget. A short backoff sits between them.
+ */
 const OSM_BUDGET_MS = 27000;
-const OSM_ATTEMPT_MS = 13000;
+const OSM_PRIMARY_MS = 11000;
 const OSM_BACKOFF_MS = 400;
+/** Nearby reuse: same radius, center within this many meters. Not for negative markers. */
+const OSM_NEAR_M = 600;
+/** Coarse index cell, in millionths of a degree. 10_000 millionths = 0.01 degree. */
+const OSM_CELL_MILLIONTHS = 10000;
+const OSM_MAX_CELL_STEPS = 3;
+const EARTH_M = 6371000;
 const COURSE_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 
 /** In-isolate collapse so identical misses share one Overpass call. */
@@ -177,8 +186,88 @@ function parseOverlayRequest(url) {
   return { courseId, lat, lng, radius };
 }
 
-function overlayLocationKey(courseId, lat, lng, radius) {
-  return `${courseId}:${lat.toFixed(4)},${lng.toFixed(4)}:${radius}`;
+/** Location identity. courseId is not part of the key. */
+function overlayLocationKey(lat, lng, radius) {
+  return `${lat.toFixed(4)},${lng.toFixed(4)}:${radius}`;
+}
+
+function cellIndex(value) {
+  const millionths = Math.round(value * 1e6);
+  return Math.floor(millionths / OSM_CELL_MILLIONTHS);
+}
+
+function formatCell(index) {
+  const sign = index < 0 ? "-" : "";
+  const abs = Math.abs(index);
+  const whole = Math.trunc(abs / 100);
+  const frac = abs % 100;
+  return `${sign}${whole}.${String(frac).padStart(2, "0")}`;
+}
+
+function wrapLngCell(index) {
+  const span = 360 * 100;
+  return ((index + 180 * 100) % span + span) % span - 180 * 100;
+}
+
+function clampLatCell(index) {
+  if (index < -90 * 100) return -90 * 100;
+  if (index > 90 * 100) return 90 * 100;
+  return index;
+}
+
+function cellToken(lat, lng) {
+  return `${formatCell(clampLatCell(cellIndex(lat)))},${formatCell(wrapLngCell(cellIndex(lng)))}`;
+}
+
+function cellsAround(lat, lng) {
+  const latSpan = OSM_NEAR_M / 111320;
+  const cos = Math.cos((lat * Math.PI) / 180);
+  const lngSpan = OSM_NEAR_M / Math.max(111320 * Math.abs(cos), 1);
+  const steps = (span) => Math.min(OSM_MAX_CELL_STEPS, Math.floor(span / 0.01) + 1);
+  const latN = steps(latSpan);
+  const lngN = steps(lngSpan);
+  const baseLat = cellIndex(lat);
+  const baseLng = cellIndex(lng);
+  const cells = new Set();
+  for (let i = -latN; i <= latN; i++) {
+    for (let j = -lngN; j <= lngN; j++) {
+      cells.add(`${formatCell(clampLatCell(baseLat + i))},${formatCell(wrapLngCell(baseLng + j))}`);
+    }
+  }
+  return [...cells];
+}
+
+function indexKeyFor(lat, lng) {
+  return `osm:v1:index:${cellToken(lat, lng)}`;
+}
+
+function distanceMeters(lat1, lng1, lat2, lng2) {
+  const rad = Math.PI / 180;
+  const dLat = (lat2 - lat1) * rad;
+  const dLng = (lng2 - lng1) * rad;
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLng / 2) ** 2;
+  return EARTH_M * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(Math.max(0, 1 - a)));
+}
+
+function validIndexEntry(entry) {
+  return Boolean(
+    entry
+    && typeof entry.lat === "number"
+    && typeof entry.lng === "number"
+    && Number.isFinite(entry.lat)
+    && Number.isFinite(entry.lng)
+    && typeof entry.radius === "number"
+    && entry.radius >= 200
+    && entry.radius <= 2000,
+  );
+}
+
+function savedCenter(lat, lng) {
+  return {
+    lat: Number(lat.toFixed(4)),
+    lng: Number(lng.toFixed(4)),
+  };
 }
 
 function remarkIsRuntimeFailure(payload) {
@@ -304,12 +393,14 @@ function classifyAttempt(result) {
 
 async function fetchOverlayUpstream(query) {
   const deadline = Date.now() + OSM_BUDGET_MS;
-  const first = await callOverpass(OVERPASS_PRIMARY, query, Math.min(OSM_ATTEMPT_MS, deadline - Date.now()));
+  const primaryBudget = Math.min(OSM_PRIMARY_MS, Math.max(0, deadline - Date.now()));
+  const first = await callOverpass(OVERPASS_PRIMARY, query, primaryBudget);
   const firstHit = classifyAttempt(first);
   if (firstHit) return firstHit;
 
   const firstRetry = first && first.response ? first.response.headers.get("Retry-After") : null;
-  const useMirror = Boolean(first && (first.status === 429 || first.status === 504));
+  // No response means the primary timed out or threw. Those, plus 429 and 504, use the mirror.
+  const useMirror = !first || first.status === 429 || first.status === 504;
   const pause = Math.min(OSM_BACKOFF_MS, Math.max(0, deadline - Date.now() - 500));
   if (pause > 0) await sleep(pause);
   const remaining = deadline - Date.now();
@@ -325,6 +416,28 @@ async function fetchOverlayUpstream(query) {
     kind: "busy",
     retryAfter: cleanRetryAfter(secondRetry) || cleanRetryAfter(firstRetry) || "30",
   };
+}
+
+/** Remember where a positive overlay was stored so a nearby pin can find it. */
+async function indexSavedOverlay(boards, lat, lng, radius) {
+  const center = savedCenter(lat, lng);
+  const key = indexKeyFor(center.lat, center.lng);
+  let entries = [];
+  const raw = await boards.get(key);
+  if (typeof raw === "string" && raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) entries = parsed.filter(validIndexEntry);
+    } catch {
+      entries = [];
+    }
+  }
+  const exists = entries.some((entry) => entry.lat === center.lat && entry.lng === center.lng && entry.radius === radius);
+  if (!exists) {
+    entries.push({ lat: center.lat, lng: center.lng, radius });
+    if (entries.length > 32) entries = entries.slice(entries.length - 32);
+  }
+  await boards.put(key, JSON.stringify(entries), { expirationTtl: OSM_KV_TTL });
 }
 
 async function rememberEdge(cache, ctx, edgeKey, response) {
@@ -364,12 +477,13 @@ async function readPositive(boards, dataKey) {
  * Ask Overpass for a newer overlay. Success overwrites the positive entry.
  * Busy, timeout, or empty leaves it untouched. Returns the new body, or null.
  */
-async function refreshStoredOverlay({ boards, cache, edgeKey, dataKey, query, cors }) {
+async function refreshStoredOverlay({ boards, cache, edgeKey, dataKey, query, cors, lat, lng, radius }) {
   try {
     const upstream = await fetchOverlayUpstream(query);
     if (upstream.kind !== "data") return null;
     const fetchedAt = Date.now();
     await boards.put(dataKey, upstream.body, positivePutOptions(fetchedAt));
+    await indexSavedOverlay(boards, lat, lng, radius).catch(() => {});
     if (cache && typeof cache.put === "function") {
       await Promise.resolve(cache.put(edgeKey, edgeCacheResponse(upstream.body, cors, fetchedAt))).catch(() => {});
     }
@@ -379,7 +493,117 @@ async function refreshStoredOverlay({ boards, cache, edgeKey, dataKey, query, co
   }
 }
 
-async function loadOverlay({ env, ctx, cache, edgeKey, dataKey, noneKey, refreshKey, query, cors }) {
+/**
+ * Fresh copy is HIT (or HIT-NEAR). A stale copy is served immediately and refreshed
+ * at most once an hour. refreshedState is REFRESHED only when this request waited.
+ */
+async function serveStored({
+  existing,
+  boards,
+  cache,
+  ctx,
+  edgeKey,
+  dataKey,
+  refreshKey,
+  query,
+  cors,
+  lat,
+  lng,
+  radius,
+  freshState,
+  staleState,
+  refreshedState,
+}) {
+  if (isFresh(existing.fetchedAt)) {
+    await rememberEdge(cache, ctx, edgeKey, edgeCacheResponse(existing.body, cors, existing.fetchedAt));
+    return { kind: "data", body: existing.body, cacheState: freshState };
+  }
+  if ((await boards.get(refreshKey)) != null) {
+    return { kind: "data", body: existing.body, cacheState: staleState };
+  }
+  await boards.put(refreshKey, "1", { expirationTtl: OSM_REFRESH_TTL });
+  const refresh = refreshStoredOverlay({ boards, cache, edgeKey, dataKey, query, cors, lat, lng, radius });
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(refresh);
+    return { kind: "data", body: existing.body, cacheState: staleState };
+  }
+  const updated = await refresh;
+  if (updated) return { kind: "data", body: updated.body, cacheState: refreshedState };
+  return { kind: "data", body: existing.body, cacheState: staleState };
+}
+
+/**
+ * One cheap read of the pre-location key for this same courseId and rounded point.
+ * Other course ids are not scanned; those entries re-warm on the next miss.
+ */
+async function adoptLegacy(boards, courseId, lat, lng, radius, dataKey) {
+  const legacyKey = `osm:v1:${courseId}:${overlayLocationKey(lat, lng, radius)}`;
+  const legacy = await readPositive(boards, legacyKey);
+  if (!legacy) return null;
+  if (legacy.fetchedAt > 0) {
+    await boards.put(dataKey, legacy.body, positivePutOptions(legacy.fetchedAt));
+  } else {
+    await boards.put(dataKey, legacy.body, { expirationTtl: OSM_KV_TTL });
+  }
+  await indexSavedOverlay(boards, lat, lng, radius).catch(() => {});
+  return legacy;
+}
+
+/** Nearest saved overlay with the same radius whose center is within OSM_NEAR_M. Negatives are not indexed. */
+async function findNearbyOverlay(boards, lat, lng, radius) {
+  const exact = savedCenter(lat, lng);
+  const cells = cellsAround(lat, lng);
+  const lists = await Promise.all(cells.map(async (cell) => {
+    const raw = await boards.get(`osm:v1:index:${cell}`);
+    if (typeof raw !== "string" || !raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter(validIndexEntry) : [];
+    } catch {
+      return [];
+    }
+  }));
+  const ranked = [];
+  for (const entry of lists.flat()) {
+    if (entry.radius !== radius) continue;
+    if (entry.lat === exact.lat && entry.lng === exact.lng) continue;
+    const dist = distanceMeters(lat, lng, entry.lat, entry.lng);
+    if (dist > OSM_NEAR_M) continue;
+    const token = overlayLocationKey(entry.lat, entry.lng, entry.radius);
+    ranked.push({ entry, dist, token });
+  }
+  ranked.sort((a, b) => a.dist - b.dist || (a.token < b.token ? -1 : a.token > b.token ? 1 : 0));
+  for (const item of ranked) {
+    const dataKey = `osm:v1:${item.token}`;
+    const existing = await readPositive(boards, dataKey);
+    if (!existing) continue;
+    return {
+      ...existing,
+      dataKey,
+      refreshKey: `osm:v1:refreshing:${item.token}`,
+      lat: item.entry.lat,
+      lng: item.entry.lng,
+      radius: item.entry.radius,
+    };
+  }
+  return null;
+}
+
+async function loadOverlay({
+  env,
+  ctx,
+  cache,
+  edgeKey,
+  dataKey,
+  noneKey,
+  refreshKey,
+  query,
+  cors,
+  courseId,
+  lat,
+  lng,
+  radius,
+}) {
   if (cache && typeof cache.match === "function") {
     const cached = await cache.match(edgeKey);
     if (cached && cached.status === 200) {
@@ -392,34 +616,50 @@ async function loadOverlay({ env, ctx, cache, edgeKey, dataKey, noneKey, refresh
   }
 
   const boards = env.BOARDS;
-  const existing = await readPositive(boards, dataKey);
-  if (existing && isFresh(existing.fetchedAt)) {
-    await rememberEdge(cache, ctx, edgeKey, edgeCacheResponse(existing.body, cors, existing.fetchedAt));
-    return { kind: "data", body: existing.body, cacheState: "HIT" };
-  }
+  const storedArgs = { boards, cache, ctx, edgeKey, cors, lat, lng, radius };
+  let existing = await readPositive(boards, dataKey);
+  if (!existing) existing = await adoptLegacy(boards, courseId, lat, lng, radius, dataKey);
   if (existing) {
-    // Serve the old copy now. A refresh marker blocks another Overpass call for an hour.
-    if ((await boards.get(refreshKey)) != null) {
-      return { kind: "data", body: existing.body, cacheState: "STALE" };
-    }
-    await boards.put(refreshKey, "1", { expirationTtl: OSM_REFRESH_TTL });
-    const refresh = refreshStoredOverlay({ boards, cache, edgeKey, dataKey, query, cors });
-    if (ctx && typeof ctx.waitUntil === "function") {
-      ctx.waitUntil(refresh);
-      return { kind: "data", body: existing.body, cacheState: "STALE" };
-    }
-    const updated = await refresh;
-    if (updated) return { kind: "data", body: updated.body, cacheState: "REFRESHED" };
-    return { kind: "data", body: existing.body, cacheState: "STALE" };
+    return serveStored({
+      ...storedArgs,
+      existing,
+      dataKey,
+      refreshKey,
+      query,
+      freshState: "HIT",
+      staleState: "STALE",
+      refreshedState: "REFRESHED",
+    });
   }
 
-  // Negative marker only when there is no positive copy. It can only answer 404.
+  // Nearby reuse beats an exact-location negative marker. A 404 at this pin must
+  // not hide a saved overlay within 600 m.
+  const nearby = await findNearbyOverlay(boards, lat, lng, radius).catch(() => null);
+  if (nearby) {
+    return serveStored({
+      ...storedArgs,
+      existing: nearby,
+      dataKey: nearby.dataKey,
+      refreshKey: nearby.refreshKey,
+      query: overpassQuery(nearby.lat, nearby.lng, nearby.radius),
+      lat: nearby.lat,
+      lng: nearby.lng,
+      radius: nearby.radius,
+      freshState: "HIT-NEAR",
+      staleState: "HIT-NEAR",
+      refreshedState: "HIT-NEAR",
+    });
+  }
+
+  // Negative marker only when there is no exact or nearby positive. It answers
+  // 404 for this location only and is never indexed for nearby reuse.
   if ((await boards.get(noneKey)) != null) return { kind: "empty", cacheState: "HIT" };
 
   const upstream = await fetchOverlayUpstream(query);
   if (upstream.kind === "data") {
     const fetchedAt = Date.now();
     await boards.put(dataKey, upstream.body, positivePutOptions(fetchedAt));
+    await indexSavedOverlay(boards, lat, lng, radius).catch(() => {});
     await rememberEdge(cache, ctx, edgeKey, edgeCacheResponse(upstream.body, cors, fetchedAt));
     return { kind: "data", body: upstream.body, cacheState: "MISS" };
   }
@@ -442,7 +682,8 @@ async function handleOsmOverlay(request, env, ctx, cors) {
   const params = parseOverlayRequest(url);
   if (!params) return golfJson(400, { error: "bad_request" }, cors);
 
-  const locationKey = overlayLocationKey(params.courseId, params.lat, params.lng, params.radius);
+  // courseId stays on the query for clients and for one legacy-key read. It is not part of the cache key.
+  const locationKey = overlayLocationKey(params.lat, params.lng, params.radius);
   const dataKey = `osm:v1:${locationKey}`;
   const noneKey = `osm:v1:none:${locationKey}`;
   const refreshKey = `osm:v1:refreshing:${locationKey}`;
@@ -468,6 +709,10 @@ async function handleOsmOverlay(request, env, ctx, cors) {
     refreshKey,
     query: overpassQuery(params.lat, params.lng, params.radius),
     cors,
+    courseId: params.courseId,
+    lat: params.lat,
+    lng: params.lng,
+    radius: params.radius,
   }).catch(() => ({ kind: "busy", retryAfter: "30" }));
   osmInflight.set(dataKey, run);
   try {
