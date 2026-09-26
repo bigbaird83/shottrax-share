@@ -58,7 +58,9 @@ The phone gets `200` `Content-Type: application/json` and the raw Overpass body,
 Cache key: `osm:v1:<courseId>:<lat to 4 decimals>,<lng to 4 decimals>:<radius>`. A successful response (at least one element with a `golf` tag, and no timeout or runtime `remark`) is stored in `BOARDS` as that raw JSON. `expirationTtl` is 365 days so the entry is not deleted on a 30-day timer. `fetchedAt` is KV metadata.
 
 - Younger than 30 days: `X-Overlay-Cache: HIT`. Overpass is not called.
-- 30 days or older: the Worker asks Overpass again. A new non-empty overlay overwrites the entry and is served as `X-Overlay-Cache: REFRESHED`. If Overpass is busy, times out, errors, or returns no golf features, the stored overlay is left unchanged and served as `X-Overlay-Cache: STALE`. A refresh never drops a course's overlays and never answers `503` or `404` while an older copy exists.
+- 30 days or older: the phone gets the stored overlay immediately with `X-Overlay-Cache: STALE`. The refresh runs in the background (`ctx.waitUntil`). A new non-empty overlay overwrites the entry; the next request is `HIT`. If Overpass is busy, times out, errors, or returns no golf features, the stored overlay is left unchanged. A refresh never drops a course's overlays and never answers `503` or `404` while an older copy exists.
+
+Before a background refresh, the Worker writes `osm:v1:refreshing:<same location key>` with a 1-hour TTL. While that marker exists, another request for the same course serves `STALE` and does not call Overpass. `GET` / `PUT` for that key is refused like any other `osm:` key. Without `ctx.waitUntil` the Worker waits for the refresh instead, and a successful one is `X-Overlay-Cache: REFRESHED`.
 
 `caches.default` holds a copy for 1 day, with `fetchedAt` on that cached response, so an edge hit cannot keep serving an overlay past its refresh. A `STALE` answer is not written to the edge cache. A hit does not call Overpass. Identical misses in the same isolate share one upstream call.
 

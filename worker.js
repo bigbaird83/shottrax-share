@@ -22,6 +22,8 @@ const OSM_FRESH_MS = 30 * 24 * 60 * 60 * 1000;
 /** Short edge TTL so caches.default cannot pin an overlay past its refresh. */
 const OSM_EDGE_TTL = 60 * 60 * 24;
 const OSM_NEGATIVE_TTL = 60 * 60 * 6;
+/** One refresh attempt per course per hour while the copy is stale. */
+const OSM_REFRESH_TTL = 60 * 60;
 /** Two attempts plus a short backoff stay under the ~28s budget. */
 const OSM_BUDGET_MS = 27000;
 const OSM_ATTEMPT_MS = 13000;
@@ -358,7 +360,26 @@ async function readPositive(boards, dataKey) {
   return { body, fetchedAt: 0 };
 }
 
-async function loadOverlay({ env, ctx, cache, edgeKey, dataKey, noneKey, query, cors }) {
+/**
+ * Ask Overpass for a newer overlay. Success overwrites the positive entry.
+ * Busy, timeout, or empty leaves it untouched. Returns the new body, or null.
+ */
+async function refreshStoredOverlay({ boards, cache, edgeKey, dataKey, query, cors }) {
+  try {
+    const upstream = await fetchOverlayUpstream(query);
+    if (upstream.kind !== "data") return null;
+    const fetchedAt = Date.now();
+    await boards.put(dataKey, upstream.body, positivePutOptions(fetchedAt));
+    if (cache && typeof cache.put === "function") {
+      await Promise.resolve(cache.put(edgeKey, edgeCacheResponse(upstream.body, cors, fetchedAt))).catch(() => {});
+    }
+    return { body: upstream.body, fetchedAt };
+  } catch {
+    return null;
+  }
+}
+
+async function loadOverlay({ env, ctx, cache, edgeKey, dataKey, noneKey, refreshKey, query, cors }) {
   if (cache && typeof cache.match === "function") {
     const cached = await cache.match(edgeKey);
     if (cached && cached.status === 200) {
@@ -377,14 +398,18 @@ async function loadOverlay({ env, ctx, cache, edgeKey, dataKey, noneKey, query, 
     return { kind: "data", body: existing.body, cacheState: "HIT" };
   }
   if (existing) {
-    const upstream = await fetchOverlayUpstream(query);
-    if (upstream.kind === "data") {
-      const fetchedAt = Date.now();
-      await boards.put(dataKey, upstream.body, positivePutOptions(fetchedAt));
-      await rememberEdge(cache, ctx, edgeKey, edgeCacheResponse(upstream.body, cors, fetchedAt));
-      return { kind: "data", body: upstream.body, cacheState: "REFRESHED" };
+    // Serve the old copy now. A refresh marker blocks another Overpass call for an hour.
+    if ((await boards.get(refreshKey)) != null) {
+      return { kind: "data", body: existing.body, cacheState: "STALE" };
     }
-    // Busy, timeout, or empty: never replace a real overlay, never 503/404.
+    await boards.put(refreshKey, "1", { expirationTtl: OSM_REFRESH_TTL });
+    const refresh = refreshStoredOverlay({ boards, cache, edgeKey, dataKey, query, cors });
+    if (ctx && typeof ctx.waitUntil === "function") {
+      ctx.waitUntil(refresh);
+      return { kind: "data", body: existing.body, cacheState: "STALE" };
+    }
+    const updated = await refresh;
+    if (updated) return { kind: "data", body: updated.body, cacheState: "REFRESHED" };
     return { kind: "data", body: existing.body, cacheState: "STALE" };
   }
 
@@ -420,6 +445,7 @@ async function handleOsmOverlay(request, env, ctx, cors) {
   const locationKey = overlayLocationKey(params.courseId, params.lat, params.lng, params.radius);
   const dataKey = `osm:v1:${locationKey}`;
   const noneKey = `osm:v1:none:${locationKey}`;
+  const refreshKey = `osm:v1:refreshing:${locationKey}`;
   const boards = env && env.BOARDS;
   const boardsReady = Boolean(boards && typeof boards.get === "function" && typeof boards.put === "function");
   if (!boardsReady) return golfJson(503, { error: "boards_not_configured" }, cors);
@@ -439,6 +465,7 @@ async function handleOsmOverlay(request, env, ctx, cors) {
     edgeKey,
     dataKey,
     noneKey,
+    refreshKey,
     query: overpassQuery(params.lat, params.lng, params.radius),
     cors,
   }).catch(() => ({ kind: "busy", retryAfter: "30" }));

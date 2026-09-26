@@ -108,12 +108,13 @@ describe("shottrax-share worker", () => {
     delete globalThis.caches;
   });
 
-  async function invoke(url, { method = "GET", body, env: envOverride } = {}) {
+  async function invoke(url, { method = "GET", body, env: envOverride, ctx } = {}) {
     const waits = [];
+    const execCtx = ctx === undefined ? { waitUntil(promise) { waits.push(promise); } } : ctx;
     const response = await worker.fetch(
       new Request(url, { method, body }),
       envOverride === undefined ? env : envOverride,
-      { waitUntil(promise) { waits.push(promise); } },
+      execCtx,
     );
     await Promise.all(waits);
     return response;
@@ -288,19 +289,79 @@ describe("shottrax-share worker", () => {
     expect(edge.size).toBe(0);
   });
 
-  it("overwrites a stale overlay when the refresh has golf features", async () => {
+  it("serves STALE immediately when upstream is busy and skips another refresh within the hour", async () => {
+    const fetchedAt = Date.now() - 31 * DAY * 1000;
+    const refreshKey = `osm:v1:refreshing:${COURSE_ID}:33.1941,-93.2077:1800`;
+    seedOverlay(MAGNOLIA_BODY, fetchedAt);
+    let release;
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    let calls = 0;
+    mockOverpass(async () => {
+      calls += 1;
+      await gate;
+      return new Response("gateway", { status: 504 });
+    });
+    const waits = [];
+    const started = Date.now();
+    const response = await worker.fetch(new Request(magnoliaUrl()), env, {
+      waitUntil(promise) { waits.push(promise); },
+    });
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Overlay-Cache")).toBe("STALE");
+    expect(await response.text()).toBe(MAGNOLIA_BODY);
+    expect(calls).toBe(1);
+    expect(kv.get(refreshKey)?.opts?.expirationTtl).toBe(3600);
+
+    const second = await worker.fetch(new Request(magnoliaUrl()), env, {
+      waitUntil(promise) { waits.push(promise); },
+    });
+    expect(second.status).toBe(200);
+    expect(second.headers.get("X-Overlay-Cache")).toBe("STALE");
+    expect(await second.text()).toBe(MAGNOLIA_BODY);
+    expect(calls).toBe(1);
+
+    const refused = await invoke(`${ORIGIN}/${encodeURIComponent(refreshKey)}`);
+    expect(refused.status).toBe(400);
+
+    release();
+    await Promise.all(waits);
+    expect(kv.get(DATA_KEY).value).toBe(MAGNOLIA_BODY);
+    expect(kv.get(DATA_KEY).metadata.fetchedAt).toBe(fetchedAt);
+  });
+
+  it("applies a background refresh so the next request is HIT", async () => {
     const fetchedAt = Date.now() - 31 * DAY * 1000;
     const refreshed = '{"elements":[{"type":"way","id":10,"tags":{"golf":"fairway"}}]}';
     seedOverlay(MAGNOLIA_BODY, fetchedAt);
     mockOverpass(async () => overpassOk(refreshed));
-    const response = await invoke(magnoliaUrl());
-    expect(response.status).toBe(200);
-    expect(response.headers.get("X-Overlay-Cache")).toBe("REFRESHED");
-    expect(await response.text()).toBe(refreshed);
+    const first = await invoke(magnoliaUrl());
+    expect(first.status).toBe(200);
+    expect(first.headers.get("X-Overlay-Cache")).toBe("STALE");
+    expect(await first.text()).toBe(MAGNOLIA_BODY);
     expect(kv.get(DATA_KEY).value).toBe(refreshed);
     expect(kv.get(DATA_KEY).opts.expirationTtl).toBe(365 * DAY);
     expect(kv.get(DATA_KEY).metadata.fetchedAt).toBeGreaterThan(fetchedAt);
     expect(kv.has(NONE_KEY)).toBe(false);
+
+    const second = await invoke(magnoliaUrl());
+    expect(second.status).toBe(200);
+    expect(second.headers.get("X-Overlay-Cache")).toBe("HIT");
+    expect(await second.text()).toBe(refreshed);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("awaits a stale refresh when waitUntil is unavailable", async () => {
+    const fetchedAt = Date.now() - 31 * DAY * 1000;
+    const refreshed = '{"elements":[{"type":"way","id":11,"tags":{"golf":"green"}}]}';
+    seedOverlay(MAGNOLIA_BODY, fetchedAt);
+    mockOverpass(async () => overpassOk(refreshed));
+    const response = await invoke(magnoliaUrl(), { ctx: null });
+    expect(response.headers.get("X-Overlay-Cache")).toBe("REFRESHED");
+    expect(await response.text()).toBe(refreshed);
+    expect(kv.get(DATA_KEY).value).toBe(refreshed);
   });
 
   it("uses the mirror after 429 and caches that success", async () => {
