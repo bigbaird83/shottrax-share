@@ -2037,7 +2037,7 @@ describe("shottrax-share worker", () => {
     const response = await invoke(`${ORIGIN}/gca/v1/courses/${GCA_ID}`);
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("application/json");
-    expect(response.headers.get("Cache-Control")).toBe("public, max-age=86400");
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=300");
     const json = await response.json();
     expect(json.data.scorecard.teeboxes.map((tee) => tee.name)).toEqual(["Gold", "Blue", "White"]);
     for (const tee of json.data.scorecard.teeboxes) {
@@ -2199,6 +2199,41 @@ describe("shottrax-share worker", () => {
       return responder(String(url), init);
     });
   }
+
+  it("limits GCA course-detail client caching to five minutes and keeps the edge copy for a day", async () => {
+    const url = `${ORIGIN}/gca/v1/courses/10001`;
+    const raw = '{"id":"10001","name":"Plain"}';
+    edge.set(url, new Response(raw, {
+      status: 200,
+      headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=86400" },
+    }));
+    const edgeHit = await invoke(url);
+    expect(edgeHit.status).toBe(200);
+    expect(edgeHit.headers.get("Cache-Control")).toBe("public, max-age=300");
+    expect(await edgeHit.text()).toBe(raw);
+    expect(edge.get(url).headers.get("Cache-Control")).toBe("public, max-age=86400");
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    edge.clear();
+    seedGca("gca:course:10001", raw, Date.now() - 1000);
+    const fromKv = await invoke(url);
+    expect(fromKv.status).toBe(200);
+    expect(fromKv.headers.get("Cache-Control")).toBe("public, max-age=300");
+    expect(await fromKv.text()).toBe(raw);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(edge.get(url).headers.get("Cache-Control")).toBe("public, max-age=86400");
+    expect(await edge.get(url).text()).toBe(raw);
+
+    edge.clear();
+    kv.delete("gca:course:10001");
+    fetchMock.mockResolvedValue(scorecardResponse(raw));
+    const upstream = await invoke(url);
+    expect(upstream.status).toBe(200);
+    expect(upstream.headers.get("Cache-Control")).toBe("public, max-age=300");
+    expect(await upstream.text()).toBe(raw);
+    expect(edge.get(url).headers.get("Cache-Control")).toBe("public, max-age=86400");
+    expect(await edge.get(url).text()).toBe(raw);
+  });
 
   it("serves a fresh GCA KV copy without calling upstream and rewarms the edge cache", async () => {
     const storedAt = Date.now() - 29 * DAY * 1000;

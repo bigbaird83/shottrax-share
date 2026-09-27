@@ -160,6 +160,8 @@ const GOLF_VENDORS = {
 
 /** Edge cache for successful reads. Course data changes rarely; golfapi is paid per call. */
 const GOLF_CACHE_SECONDS = 60 * 60 * 24;
+/** Phones must see scorecard corrections quickly. The edge cache and KV keep the longer raw-body lifetime. */
+const GCA_CLIENT_MAX_AGE = 300;
 /** Durable GCA courses/{id} and green-centers bodies. Same horizon as golfapi. */
 const GCA_STORE_TTL = 60 * 60 * 24 * 365;
 /** Hung GCA course fetches abort here so a stored copy can still be served. */
@@ -1631,7 +1633,7 @@ async function handleGcaDurable({ kind, id, url, rest, env, ctx, cors, apiKey, m
       if (cached.status >= 200 && cached.status < 300) {
         const raw = await cached.text();
         return gcaClientResponse(kind, id, raw, cors, {
-          maxAge: GOLF_CACHE_SECONDS,
+          maxAge: GCA_CLIENT_MAX_AGE,
           contentType: cached.headers.get("Content-Type") || "application/json",
         });
       }
@@ -1644,7 +1646,7 @@ async function handleGcaDurable({ kind, id, url, rest, env, ctx, cors, apiKey, m
   const copy = await readGcaStored(boards, storeKey);
   const nowMs = Date.now();
   if (copy && nowMs - copy.storedAt < readGcaRefreshDays(env) * 24 * 60 * 60 * 1000) {
-    const response = gcaClientResponse(kind, id, copy.body, cors, { maxAge: GOLF_CACHE_SECONDS });
+    const response = gcaClientResponse(kind, id, copy.body, cors, { maxAge: GCA_CLIENT_MAX_AGE });
     const put = rememberGolfEdge(cache, ctx, cacheKey, gcaRawEdgeResponse(copy.body, cors));
     if (put) await put;
     return response;
@@ -1677,7 +1679,7 @@ async function handleGcaDurable({ kind, id, url, rest, env, ctx, cors, apiKey, m
       expirationTtl: GCA_STORE_TTL,
       metadata: { status: 200, storedAt: Date.now() },
     });
-    const response = gcaClientResponse(kind, id, text, cors, { maxAge: GOLF_CACHE_SECONDS, contentType });
+    const response = gcaClientResponse(kind, id, text, cors, { maxAge: GCA_CLIENT_MAX_AGE, contentType });
     const put = rememberGolfEdge(cache, ctx, cacheKey, gcaRawEdgeResponse(text, cors, contentType));
     if (put) await put;
     return response;
