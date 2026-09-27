@@ -1311,12 +1311,25 @@ describe("shottrax-share worker", () => {
     expect(body.days).toHaveLength(30);
     expect(body.days[0].date < body.days[29].date).toBe(true);
     expect(body.days[29]).toEqual(body.today);
+    expect(body.globalCap).toBe(100);
     expect(body.today).toMatchObject({
       date: todayKey(),
       lookups: 1,
+      globalLookups: 1,
+      globalCap: 100,
+      allowlistedLookups: 0,
       searches: 1,
       hits: 1,
     });
+    expect(body.days[0].globalLookups).toBe(0);
+    expect(body.days[0].allowlistedLookups).toBe(0);
+    expect(body.today.latency).toEqual({
+      search: { count: 1, median: expect.any(Number), max: expect.any(Number) },
+      course: { count: 1, median: expect.any(Number), max: expect.any(Number) },
+      coordinates: { count: 0, median: null, max: 0 },
+    });
+    expect(body.today.latency.search.max).toBeGreaterThanOrEqual(body.today.latency.search.median);
+    expect(JSON.stringify(body.today.latency)).not.toContain("samples");
     expect(body.today.blocked.device_day).toBe(1);
     expect(body.today.blocked.floor).toBe(0);
     expect(Object.keys(body.today.blocked).sort()).toEqual([
@@ -1631,5 +1644,121 @@ describe("shottrax-share worker", () => {
     ]);
     expect(kv.has(queued[0])).toBe(false);
     expect(stats().lookups).toBe(2);
+  });
+
+  it("does not count allowlisted installs toward the global cap or IP counters", async () => {
+    const owner = "owner-allow-1";
+    const otherListed = "someone-else";
+    const envAllow = {
+      ...env,
+      GOLFAPI_GLOBAL_DAY: "1",
+      GOLFAPI_DEVICE_DAY: "1",
+      GOLFAPI_IP_DAY: "1",
+      GOLFAPI_ALLOWLIST: ` ${otherListed}, ${owner} `,
+    };
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(`shottrax-golfapi-ip-v1:${CLIENT_IP}`),
+    );
+    const ipHash = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    const cappedBucket = JSON.stringify({
+      day: todayKey(),
+      dayCount: 5,
+      searchDay: todayKey(),
+      searchCount: 9,
+    });
+    kv.set(`gq:stats:${todayKey()}`, {
+      value: JSON.stringify({ lookups: 1, searches: 0, hits: 0, blocked: {} }),
+    });
+    kv.set(`gq:dev:${owner}`, { value: cappedBucket });
+    kv.set(`gq:ip:${ipHash}`, { value: cappedBucket });
+    kv.set(`gq:set:ip:${ipHash}`, { value: JSON.stringify({ at: Date.now(), courseId: "kept" }) });
+
+    mockGolfApi(async (url) => {
+      if (url.includes("/courses?")) {
+        return jsonResponse({ apiRequestsLeft: "80", numCourses: 0, courses: [] });
+      }
+      return jsonResponse(coursePayload(url.split("/").pop(), 70));
+    });
+    for (const query of ["one", "two", "three", "four"]) {
+      expect((await golfGet(`/golfapi/v2.3/courses?q=${query}`, { install: owner, env: envAllow })).status).toBe(200);
+    }
+    expect((await golfGet("/golfapi/v2.3/courses/a1", { install: owner, env: envAllow })).status).toBe(200);
+    expect((await golfGet("/golfapi/v2.3/courses/a2", { install: owner, env: envAllow })).status).toBe(200);
+    expect(stats().lookups).toBe(1);
+    expect(stats().allowlistedLookups).toBe(2);
+    expect(stats().searches).toBe(4);
+    expect(JSON.parse(kv.get(`gq:dev:${owner}`).value).dayCount).toBe(5);
+    expect(JSON.parse(kv.get(`gq:dev:${owner}`).value).searchCount).toBe(9);
+    expect(JSON.parse(kv.get(`gq:ip:${ipHash}`).value).dayCount).toBe(5);
+    expect(JSON.parse(kv.get(`gq:ip:${ipHash}`).value).searchCount).toBe(9);
+    expect(JSON.parse(kv.get(`gq:set:ip:${ipHash}`).value).courseId).toBe("kept");
+
+    const blocked = await golfGet("/golfapi/v2.3/courses/n1", { env: envAllow });
+    expect(blocked.status).toBe(429);
+    expect((await blocked.json()).reason).toBe("global_day");
+    expect(stats().lookups).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(6);
+
+    const meta = await invoke(`${ORIGIN}/meta/golfapi`, { env: envAllow });
+    const body = await meta.json();
+    expect(body.globalCap).toBe(1);
+    expect(body.today.globalCap).toBe(1);
+    expect(body.today.globalLookups).toBe(1);
+    expect(body.today.allowlistedLookups).toBe(2);
+    expect(body.days).toHaveLength(30);
+    expect(body.days[29].allowlistedLookups).toBe(2);
+    expect(body.days[0].allowlistedLookups).toBe(0);
+    const text = JSON.stringify(body);
+    expect(text).not.toContain(owner);
+    expect(text).not.toContain(otherListed);
+    expect(text).not.toContain("GOLFAPI_ALLOWLIST");
+
+    kv.set("gq:balance", { value: JSON.stringify({ left: 10, at: 1, lastStatus: 200 }) });
+    fetchMock.mockClear();
+    const floored = await golfGet("/golfapi/v2.3/courses/floor", { install: owner, env: envAllow });
+    const floorBody = await floored.json();
+    expect(floored.status).toBe(429);
+    expect(floorBody.reason).toBe("floor");
+    expect(floorBody.queued).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(stats().allowlistedLookups).toBe(2);
+    expect(stats().lookups).toBe(1);
+  });
+
+  it("reports fetch time count, median, and max without the raw sample", async () => {
+    kv.set(`gq:stats:${todayKey()}`, {
+      value: JSON.stringify({
+        lookups: 0,
+        searches: 0,
+        hits: 0,
+        blocked: {},
+        latency: {
+          search: { count: 4, max: 900, samples: [40, 10, 30, 20] },
+          course: { count: 21, max: 10, samples: Array(21).fill(10) },
+          coordinates: { count: 0, max: 0, samples: [] },
+        },
+      }),
+    });
+    mockGolfApi(async () => jsonResponse(coursePayload("timed", 40)));
+    expect((await golfGet("/golfapi/v2.3/courses/timed")).status).toBe(200);
+
+    const meta = await invoke(`${ORIGIN}/meta/golfapi`);
+    const body = await meta.json();
+    expect(body.globalCap).toBe(100);
+    expect(body.today.latency.search).toEqual({ count: 4, median: 25, max: 900 });
+    expect(body.today.latency.coordinates).toEqual({ count: 0, median: null, max: 0 });
+    expect(body.today.latency.course.count).toBe(22);
+    expect(body.today.latency.course.max).toBeGreaterThanOrEqual(10);
+    expect(body.today.latency.course.median).toEqual(expect.any(Number));
+    expect(JSON.stringify(body.latency || body.today.latency)).not.toContain("samples");
+    const stored = stats().latency.course;
+    expect(stored.count).toBe(22);
+    expect(stored.samples).toHaveLength(21);
+
+    const overridden = await invoke(`${ORIGIN}/meta/golfapi`, { env: { ...env, GOLFAPI_GLOBAL_DAY: "25" } });
+    expect((await overridden.json()).globalCap).toBe(25);
+    const invalid = await invoke(`${ORIGIN}/meta/golfapi`, { env: { ...env, GOLFAPI_GLOBAL_DAY: "nope" } });
+    expect((await invalid.json()).globalCap).toBe(100);
   });
 });
