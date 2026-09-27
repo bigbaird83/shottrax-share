@@ -2,9 +2,9 @@
 
 Cloudflare Worker for ShotTraxx live boards and the course paint cache. It also proxies golf course vendor reads so the phone never holds a vendor key, and it fetches OpenStreetMap golf overlays once per location so phones do not call Overpass themselves.
 
-Live boards stay `GET` / `PUT` on a single path segment in the `BOARDS` KV namespace. Paint cache keys start with `id:` or `name:`. Keys that start with `osm:` are reserved for the overlay cache.
+Live boards stay `GET` / `PUT` on a single path segment in the `BOARDS` KV namespace. Paint cache keys start with `id:` or `name:`. Keys that start with `osm:`, `gq:`, `gapi:`, or `gqueue:` are reserved.
 
-If `env.BOARDS` is not bound, board routes and overlay lookups return `503` `{ "error": "boards_not_configured" }` instead of throwing. Golf proxy routes are unchanged.
+If `env.BOARDS` is not bound, board routes, overlay lookups, and golfapi reads return `503` `{ "error": "boards_not_configured" }` instead of throwing. The GCA proxy does not use that namespace.
 
 Merging to `main` deploys this Worker automatically through Cloudflare Workers Builds. A hand `wrangler deploy` is not required. The Workers Builds check fails immediately on every branch other than `main`. That failure is a Cloudflare branch-build setting, not a problem in this repo. After the merge build finishes, verify with the Magnolia curl below.
 
@@ -14,16 +14,36 @@ Merging to `main` deploys this Worker automatically through Cloudflare Workers B
 
 Board and paint-cache keys are stored only while that binding is present on the live Worker. If it is missing, those routes return `503` `{ "error": "boards_not_configured" }`.
 
-`GET` and `PUT` for a key that starts with `osm:` return `400` and do not read or write KV, so a board request cannot read or replace an overlay cache entry.
+`GET`, `PUT`, and `DELETE` for a reserved prefix return `400` and do not read or write KV, so a board request cannot read, replace, or reset an overlay, a golfapi counter, a stored course, or the refill queue. Paint keys (`id:`, `name:`) and ordinary board codes are unchanged.
 
 ## Golf vendor proxy
 
-Successful GETs are cached at the edge for 24 hours. Upstream status codes pass through unchanged.
+GCA reads are cached at the edge for 24 hours. Upstream status codes pass through unchanged.
+
+Golfapi is paid. One lookup is one set: a search plus `courses/{id}` plus `coordinates/{id}`. The set is counted on its first fresh upstream call and stays open for 15 minutes, separately for the device and for the IP (`gq:set:`). A fresh search opens the set and counts 1. A fresh course or coordinates call for the first course id in that window counts nothing extra. If the search was a cache hit, the later course call opens the set and counts 1. A different course id opens a new set and counts again. Cache hits never count. Course and coordinates bodies are stored in KV for a year (`gapi:course:`, `gapi:coord:`) and served free to everyone. Successful searches are stored for 30 days (`gapi:search:`) so a repeat of that query is free. Any other `/golfapi/` path is `404`. A 200 with no course data, or an error body, is not stored and is not edge-cached.
+
+Limits default to 3 lookups per device per UTC day, 10 per ISO week, and 20 per month. IP limits are twice that. The whole Worker allows 100 fresh lookups per UTC day. Fresh upstream calls stop when the last known `apiRequestsLeft` is 10 or less. There is no separate search budget. Fresh searches are also capped at 3 times the device daily limit per device per day (9 at the default), including searches inside an open set. A phone with no install id has that same search cap counted on its IP. Override the lookup limits with `[vars]` in `wrangler.toml` (`GOLFAPI_DEVICE_DAY`, `GOLFAPI_DEVICE_WEEK`, `GOLFAPI_DEVICE_MONTH`, `GOLFAPI_IP_DAY`, `GOLFAPI_IP_WEEK`, `GOLFAPI_IP_MONTH`, `GOLFAPI_GLOBAL_DAY`, `GOLFAPI_FLOOR`). Invalid values keep the defaults. Older `GOLFAPI_SEARCH_*` vars are ignored. The API key is not a var.
+
+The phone sends `X-Install-Id` (8–64 characters, `A–Z`, `a–z`, `0–9`, `-`). Anything else is ignored. The Worker also limits `CF-Connecting-IP`. IPs are stored only as a SHA-256 with a fixed prefix. Both limits apply, because the install id can be spoofed.
+
+Install ids in `GOLFAPI_ALLOWLIST` (comma-separated) skip the device limits, the IP limits, the search cap, and the global daily cap. Their lookups are not added to the global count or the IP counters. They are counted separately (`allowlistedLookups`). The balance floor still applies. Set this as a Worker secret so it is not in git and a deploy does not wipe it:
+
+```
+wrangler secret put GOLFAPI_ALLOWLIST
+```
+
+Over a limit the response is `429` `{ "error": "golfapi_limited", "reason": "device_day", "queued": true, "retryAfterSec": ... }` plus `Retry-After`. The app already treats a non-2xx as "use free and GCA data," so the course still opens. Course ids are queued as `gqueue:{id}`. A search that is limited is queued as `gqueue:q:{hash}` (one row per normalized query; the first query string is the one that is replayed). A cron at 08:00 UTC runs the queue while the global cap and the balance floor allow it. A course row fetches `courses/{id}` and `coordinates/{id}` into `gapi:`. A search row runs the search, stores it for 30 days, and fetches course plus coordinates only when exactly one result's normalized name equals the query. Otherwise it stores just the search. The next open is free, and the app writes its combined paint into the shared paint cache. Errors stay queued and stop after 5 attempts.
+
+`GET /meta/golfapi` returns the last known balance, an `asOf` ISO time for that balance reading, a `generatedAt` time for the response, today's global lookup count (`today.globalLookups`) and the cap (`globalCap` and `today.globalCap`), allowlisted lookups for today and each of the last 30 UTC days, search counts, blocks by reason, the queue length, and today's fetch timing. Timing is per endpoint (`search`, `course`, `coordinates`): how many fresh upstream calls, a median of a 21-sample reservoir, and the max for the day. It does not return the key, the allowlist, install ids, or IPs.
+
+KV counters are not atomic, and one key accepts about one write per second, so a burst can overshoot a limit by a couple of calls. The global cap and the balance floor are the backstop.
+
+On a day that uses the full budget (100 sets) the writes are about one per counter touch: a new set writes the device bucket, the IP bucket, the daily stats (including the latency sample), the balance, a short set record, and a body. A course or coordinates call inside that set writes the balance, the body, and the set record, not another lookup counter. A full search plus course plus coordinates set is on the order of 15 writes, so 100 of those can pass the free plan's 1,000 writes/day. The global cap limits paid golfapi calls; it does not keep KV inside the free tier on a maxed-out day. Repeat opens of a stored course are one write (the hit counter) and one read. Search bodies are smaller and expire after 30 days; course and coordinates bodies stay for a year. The Workers Free KV plan allows 1,000 writes, 1,000 deletes, 1,000 lists, and 100,000 reads per day, plus 1 GB. A quieter day, and a few hundred repeat opens, still fit. Cache-hit accounting is the other way the free write cap gets tight.
 
 | Phone path | Upstream |
 |---|---|
 | `GET /gca/v1/courses`, `/gca/v1/courses/{id}`, `/gca/v1/courses/{id}/green-centers` | `https://golfcoursesapi.com/api/v1/` |
-| `GET /golfapi/v2.3/courses`, `/golfapi/v2.3/courses/{id}`, `/golfapi/v2.3/coordinates/{id}` | `https://golfapi.io/api/v2.3/` |
+| `GET /golfapi/v2.3/courses?q=`, `/golfapi/v2.3/courses/{id}`, `/golfapi/v2.3/coordinates/{id}` | `https://golfapi.io/api/v2.3/` |
 
 The Worker adds `Authorization: Bearer <secret>`. Set both secrets on the Worker (do not commit them):
 
@@ -32,7 +52,7 @@ wrangler secret put GOLF_COURSES_API_KEY
 wrangler secret put GOLFAPI_KEY
 ```
 
-JSON errors: `method_not_allowed` (405), `unknown_route` (404), `not_configured` (503), `boards_not_configured` (503), `upstream_unreachable` (502).
+JSON errors: `method_not_allowed` (405), `unknown_route` (404), `not_configured` (503), `boards_not_configured` (503), `upstream_unreachable` (502), `golfapi_limited` (429), `no_course_data` (404 on a repeat of an empty golfapi answer).
 
 After deploy, search Magnolia with:
 
