@@ -19,13 +19,21 @@
  * Golfapi quota (paid golfapi.io). GCA and OSM are not on this budget.
  * Periods are UTC: day YYYY-MM-DD, week ISO (YYYY-Www), month YYYY-MM.
  *
- * One lookup is the first fresh upstream fetch of courses/{id} or
- * coordinates/{id} for a course id by that device or IP within 24h, so the
- * pair counts once. Anything served from the edge cache or the gapi: KV store
- * is free and is not a lookup. Searches (courses?q=) use a separate daily
- * budget and do not spend lookups. A 200 with no course data, or an error
- * body, is not stored and is not edge-cached. A 24h gq:empty: marker stops a
- * retry of that empty answer from calling upstream again.
+ * One lookup is one set: a search plus courses/{id} plus coordinates/{id}.
+ * The set is counted on its first fresh upstream call and stays open for 15
+ * minutes per device and per IP (gq:set:, short TTL). A fresh search opens it
+ * and counts 1. A fresh courses/{id} or coordinates/{id} for the first course
+ * id in that window counts nothing extra. A course call with no open set (the
+ * search was a cache hit) opens a set and counts 1. A different course id
+ * opens a new set and counts again. Cache hits never count and do not open a
+ * set. There is no separate search budget. Fresh searches are also capped at
+ * 3x the device daily lookup limit per device per day, including searches
+ * inside an open set.
+ *
+ * A 200 with no course data, or an error body, is not stored and is not
+ * edge-cached. A 24h gq:empty: marker stops a retry of that empty answer from
+ * calling upstream again. Successful searches are stored for 30 days (gapi:search:)
+ * so a queued search is free the next time.
  *
  * Defaults, overridden by [vars] in wrangler.toml. Non-integers, negatives,
  * and blanks keep the default. IP limits default to twice the device limits
@@ -35,9 +43,6 @@
  *   GOLFAPI_IP_DAY           GOLFAPI_IP_WEEK           GOLFAPI_IP_MONTH
  *   GOLFAPI_GLOBAL_DAY=40
  *   GOLFAPI_FLOOR=10         block fresh upstream calls when known balance <= this
- *   GOLFAPI_SEARCH_DEVICE_DAY=10
- *   GOLFAPI_SEARCH_IP_DAY    defaults to 2x the device search limit (20)
- *   GOLFAPI_SEARCH_GLOBAL_DAY=60
  *
  * Identity: header X-Install-Id (8–64 chars of [A-Za-z0-9-], else ignored)
  * and CF-Connecting-IP. Both are enforced when present; the install id is
@@ -45,8 +50,13 @@
  *
  * Over a limit the phone gets 429 {error:"golfapi_limited", reason, queued,
  * retryAfterSec} and Retry-After. The app already falls back to free + GCA
- * data on non-2xx. Course ids are queued (gqueue:, deduped) and the daily
- * cron fills gapi: while under the global cap and above the floor.
+ * data on non-2xx. Course ids and search queries are queued (gqueue:, deduped)
+ * and the daily cron fills gapi: while under the global cap and above the floor.
+ * A queued search is followed by course + coordinates only when exactly one
+ * result's normalized name equals the query.
+ *
+ * GET /meta/golfapi includes asOf (when the balance was read) and generatedAt.
+ * It does not include the key, install ids, or IPs.
  *
  * Counters live in the BOARDS namespace under gq: (stats, balance, per-device
  * and per-IP buckets). KV writes are not atomic, and the same key accepts
@@ -110,9 +120,14 @@ const GOLFAPI_BUCKET_TTL = 60 * 60 * 24 * 32;
 const GOLFAPI_STATS_TTL = 60 * 60 * 24 * 40;
 /** A queued course that nobody refills expires instead of sitting forever. */
 const GOLFAPI_QUEUE_TTL = 60 * 60 * 24 * 14;
-const GOLFAPI_SEEN_MS = 60 * 60 * 24 * 1000;
+/** How long one search + course + coordinates set stays open. */
+const GOLFAPI_SET_MS = 15 * 60 * 1000;
+const GOLFAPI_SET_TTL = 15 * 60;
+const GOLFAPI_SEARCH_TTL = 60 * 60 * 24 * 30;
+const GOLFAPI_SEARCH_GUARD = 3;
 const GOLFAPI_GIVE_UP = 5;
 const GOLFAPI_IP_PREFIX = "shottrax-golfapi-ip-v1:";
+const GOLFAPI_SEARCH_PREFIX = "shottrax-golfapi-search-v1:";
 const GOLFAPI_BALANCE_KEY = "gq:balance";
 const RESERVED_BOARD_PREFIXES = ["osm:", "gq:", "gapi:", "gqueue:"];
 const GOLFAPI_REASONS = [
@@ -125,8 +140,6 @@ const GOLFAPI_REASONS = [
   "global_day",
   "floor",
   "search_device_day",
-  "search_ip_day",
-  "search_global_day",
 ];
 
 function isReservedBoardKey(key) {
@@ -147,7 +160,6 @@ function readGolfapiLimits(env) {
   const deviceDay = readConfigInt(source.GOLFAPI_DEVICE_DAY) ?? 3;
   const deviceWeek = readConfigInt(source.GOLFAPI_DEVICE_WEEK) ?? 10;
   const deviceMonth = readConfigInt(source.GOLFAPI_DEVICE_MONTH) ?? 20;
-  const searchDeviceDay = readConfigInt(source.GOLFAPI_SEARCH_DEVICE_DAY) ?? 10;
   return {
     deviceDay,
     deviceWeek,
@@ -157,9 +169,7 @@ function readGolfapiLimits(env) {
     ipMonth: readConfigInt(source.GOLFAPI_IP_MONTH) ?? deviceMonth * 2,
     globalDay: readConfigInt(source.GOLFAPI_GLOBAL_DAY) ?? 40,
     floor: readConfigInt(source.GOLFAPI_FLOOR) ?? 10,
-    searchDeviceDay,
-    searchIpDay: readConfigInt(source.GOLFAPI_SEARCH_IP_DAY) ?? searchDeviceDay * 2,
-    searchGlobalDay: readConfigInt(source.GOLFAPI_SEARCH_GLOBAL_DAY) ?? 60,
+    searchCap: deviceDay * GOLFAPI_SEARCH_GUARD,
   };
 }
 
@@ -217,12 +227,22 @@ function readInstallId(request) {
   return id;
 }
 
-async function hashClientIp(ip) {
-  const digest = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(GOLFAPI_IP_PREFIX + ip),
-  );
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function hashClientIp(ip) {
+  return sha256Hex(GOLFAPI_IP_PREFIX + ip);
+}
+
+function normalizeName(value) {
+  if (typeof value !== "string") return "";
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+async function searchToken(normalized) {
+  return sha256Hex(GOLFAPI_SEARCH_PREFIX + normalized);
 }
 
 async function readIpHash(request) {
@@ -298,6 +318,33 @@ function courseHasData(payload) {
 function coordHasData(payload) {
   if (payloadHasError(payload)) return false;
   return Array.isArray(payload.coordinates) && payload.coordinates.length > 0;
+}
+
+function searchHasData(payload) {
+  if (payloadHasError(payload)) return false;
+  return Array.isArray(payload.courses);
+}
+
+function searchBodyOk(text) {
+  try {
+    return searchHasData(JSON.parse(text));
+  } catch {
+    return false;
+  }
+}
+
+/** The one course whose normalized course or club name equals the query, or null. */
+function matchingCourseId(payload, normalizedQuery) {
+  if (!searchHasData(payload) || !normalizedQuery) return null;
+  const hits = [];
+  for (const course of payload.courses) {
+    if (!isPlainObject(course)) continue;
+    const names = [course.courseName, course.clubName, course.name].map(normalizeName).filter(Boolean);
+    if (!names.some((name) => name === normalizedQuery)) continue;
+    hits.push(safeGolfapiId(String(course.courseID ?? course.courseId ?? "")));
+  }
+  if (hits.length !== 1) return null;
+  return hits[0];
 }
 
 function bodyHasData(kind, text) {
@@ -414,7 +461,6 @@ function emptyBucket(now) {
     monthCount: 0,
     searchDay: periods.day,
     searchCount: 0,
-    seen: {},
   };
 }
 
@@ -432,13 +478,6 @@ function normalizeBucket(raw, now) {
   if (parsed.week === periods.week) bucket.weekCount = clampCount(parsed.weekCount);
   if (parsed.month === periods.month) bucket.monthCount = clampCount(parsed.monthCount);
   if (parsed.searchDay === periods.day) bucket.searchCount = clampCount(parsed.searchCount);
-  const cutoff = now.getTime() - GOLFAPI_SEEN_MS;
-  if (isPlainObject(parsed.seen)) {
-    for (const [id, at] of Object.entries(parsed.seen)) {
-      if (!safeGolfapiId(id) || typeof at !== "number" || at < cutoff) continue;
-      bucket.seen[id] = at;
-    }
-  }
   return bucket;
 }
 
@@ -452,12 +491,63 @@ async function saveBucket(boards, key, bucket) {
   await putCounter(boards, key, JSON.stringify(bucket), { expirationTtl: GOLFAPI_BUCKET_TTL });
 }
 
-function rememberSeen(bucket, courseId, nowMs) {
-  bucket.seen[courseId] = nowMs;
-  const entries = Object.entries(bucket.seen);
-  if (entries.length <= 64) return;
-  entries.sort((left, right) => left[1] - right[1]);
-  bucket.seen = Object.fromEntries(entries.slice(entries.length - 64));
+async function readSet(boards, key, now) {
+  const raw = await boards.get(key);
+  if (typeof raw !== "string" || !raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!isPlainObject(parsed) || typeof parsed.at !== "number") return null;
+    if (now.getTime() - parsed.at >= GOLFAPI_SET_MS) return null;
+    const courseId = typeof parsed.courseId === "string" ? safeGolfapiId(parsed.courseId) : null;
+    return { at: parsed.at, courseId };
+  } catch {
+    return null;
+  }
+}
+
+async function writeSet(boards, key, set, now) {
+  const elapsed = Math.floor((now.getTime() - set.at) / 1000);
+  const ttl = Math.max(60, GOLFAPI_SET_TTL - Math.max(0, elapsed));
+  await putCounter(boards, key, JSON.stringify({ at: set.at, courseId: set.courseId || null }), { expirationTtl: ttl });
+}
+
+function planCourse(openSet, courseId, nowMs) {
+  if (!openSet || (openSet.courseId && openSet.courseId !== courseId)) {
+    return { charge: true, next: { at: nowMs, courseId } };
+  }
+  return { charge: false, next: { at: openSet.at, courseId: openSet.courseId || courseId } };
+}
+
+function planSearch(openSet, nowMs) {
+  if (!openSet) return { charge: true, next: { at: nowMs, courseId: null } };
+  return { charge: false, next: null };
+}
+
+function lookupBlockReason({ chargeDevice, chargeIp, chargeGlobal, dev, ip, stats, limits }) {
+  if (chargeGlobal && stats.lookups >= limits.globalDay) return "global_day";
+  if (chargeDevice && dev) {
+    if (dev.dayCount >= limits.deviceDay) return "device_day";
+    if (dev.weekCount >= limits.deviceWeek) return "device_week";
+    if (dev.monthCount >= limits.deviceMonth) return "device_month";
+  }
+  if (chargeIp && ip) {
+    if (ip.dayCount >= limits.ipDay) return "ip_day";
+    if (ip.weekCount >= limits.ipWeek) return "ip_week";
+    if (ip.monthCount >= limits.ipMonth) return "ip_month";
+  }
+  return null;
+}
+
+async function loadIdentity(boards, installId, ipHash, now) {
+  const devKey = installId ? `gq:dev:${installId}` : null;
+  const ipKey = ipHash ? `gq:ip:${ipHash}` : null;
+  const devSetKey = installId ? `gq:set:dev:${installId}` : null;
+  const ipSetKey = ipHash ? `gq:set:ip:${ipHash}` : null;
+  const dev = devKey ? await loadBucket(boards, devKey, now) : null;
+  const ip = ipKey ? await loadBucket(boards, ipKey, now) : null;
+  const devSet = devSetKey ? await readSet(boards, devSetKey, now) : null;
+  const ipSet = ipSetKey ? await readSet(boards, ipSetKey, now) : null;
+  return { devKey, ipKey, devSetKey, ipSetKey, dev, ip, devSet, ipSet };
 }
 
 async function readBalance(boards) {
@@ -488,12 +578,18 @@ async function rememberBalance(boards, status, payload) {
   return next;
 }
 
+function balanceAsOf(balance) {
+  if (!balance || typeof balance.at !== "number" || balance.at <= 0) return null;
+  return new Date(balance.at).toISOString();
+}
+
 function publicBalance(balance) {
   if (!balance) return null;
   return {
     left: typeof balance.left === "number" ? balance.left : null,
     at: balance.at,
     lastStatus: balance.lastStatus,
+    asOf: balanceAsOf(balance),
   };
 }
 
@@ -514,11 +610,25 @@ async function enqueueCourse(boards, courseId) {
   await boards.put(key, JSON.stringify({ attempts: 0, at: Date.now() }), { expirationTtl: GOLFAPI_QUEUE_TTL });
 }
 
-async function rejectLimited(boards, day, reason, queued, courseId, cors, now) {
+async function enqueueSearch(boards, job) {
+  const token = await searchToken(job.q);
+  const key = `gqueue:q:${token}`;
+  const existing = await boards.get(key);
+  if (existing != null) return;
+  await boards.put(key, JSON.stringify({
+    attempts: 0,
+    at: Date.now(),
+    q: job.q,
+    search: job.search,
+  }), { expirationTtl: GOLFAPI_QUEUE_TTL });
+}
+
+async function rejectLimited(boards, day, reason, queued, courseId, cors, now, searchJob) {
   await bumpStats(boards, day, (stats) => {
     stats.blocked[reason] = clampCount(stats.blocked[reason]) + 1;
   });
   if (queued && courseId) await enqueueCourse(boards, courseId);
+  if (queued && searchJob) await enqueueSearch(boards, searchJob);
   return limitedResponse(reason, Boolean(queued), cors, now);
 }
 
@@ -575,58 +685,93 @@ async function fetchGolfapiUpstream(env, pathAndQuery) {
   }
 }
 
-async function chargeLookup(boards, periods, devKey, dev, ipKey, ip, chargeDevice, chargeIp, chargeGlobal, definitive, courseId, nowMs) {
-  if (chargeDevice && dev) {
-    dev.dayCount += 1;
-    dev.weekCount += 1;
-    dev.monthCount += 1;
-    if (definitive) rememberSeen(dev, courseId, nowMs);
-    await saveBucket(boards, devKey, dev);
+async function recordFresh(boards, periods, ident, chargeDevice, chargeIp, chargeGlobal, countSearch) {
+  if (ident.dev && (countSearch || chargeDevice)) {
+    if (countSearch) ident.dev.searchCount += 1;
+    if (chargeDevice) {
+      ident.dev.dayCount += 1;
+      ident.dev.weekCount += 1;
+      ident.dev.monthCount += 1;
+    }
+    await saveBucket(boards, ident.devKey, ident.dev);
   }
-  if (chargeIp && ip) {
-    ip.dayCount += 1;
-    ip.weekCount += 1;
-    ip.monthCount += 1;
-    if (definitive) rememberSeen(ip, courseId, nowMs);
-    await saveBucket(boards, ipKey, ip);
+  if (ident.ip && ((countSearch && !ident.dev) || chargeIp)) {
+    if (countSearch && !ident.dev) ident.ip.searchCount += 1;
+    if (chargeIp) {
+      ident.ip.dayCount += 1;
+      ident.ip.weekCount += 1;
+      ident.ip.monthCount += 1;
+    }
+    await saveBucket(boards, ident.ipKey, ident.ip);
   }
-  if (chargeGlobal) {
+  if (chargeGlobal || countSearch) {
     await bumpStats(boards, periods.day, (stats) => {
-      stats.lookups += 1;
+      if (chargeGlobal) stats.lookups += 1;
+      if (countSearch) stats.searches += 1;
     });
   }
 }
 
+async function commitSets(boards, ident, devPlan, ipPlan, now) {
+  if (devPlan && devPlan.next) await writeSet(boards, ident.devSetKey, devPlan.next, now);
+  if (ipPlan && ipPlan.next) await writeSet(boards, ident.ipSetKey, ipPlan.next, now);
+}
+
 async function handleGolfapiSearch({ url, env, ctx, cors, boards, now, periods, limits, installId, ipHash }) {
+  const normalized = normalizeName(url.searchParams.get("q"));
+  if (!normalized) return golfJson(404, { error: "unknown_route" }, cors);
+  const token = await searchToken(normalized);
+  const storeKey = `gapi:search:${token}`;
+  const searchJob = { q: normalized, search: url.search };
+  const stored = await boards.get(storeKey);
+  if (typeof stored === "string" && searchBodyOk(stored)) {
+    await bumpStats(boards, periods.day, (stats) => {
+      stats.hits += 1;
+    });
+    return storedGolfResponse(stored, cors);
+  }
+
   const cache = edgeCache();
   const cacheKey = new Request(url.toString(), { method: "GET" });
   if (cache && typeof cache.match === "function") {
     const cached = await cache.match(cacheKey);
     if (cached && cached.status >= 200 && cached.status < 300) {
-      await bumpStats(boards, periods.day, (stats) => {
-        stats.hits += 1;
-      });
-      return cached;
+      const text = await cached.text();
+      if (searchBodyOk(text)) {
+        await boards.put(storeKey, text, { expirationTtl: GOLFAPI_SEARCH_TTL });
+        await bumpStats(boards, periods.day, (stats) => {
+          stats.hits += 1;
+        });
+        return storedGolfResponse(text, cors);
+      }
     }
   }
 
-  const devKey = installId ? `gq:dev:${installId}` : null;
-  const ipKey = ipHash ? `gq:ip:${ipHash}` : null;
-  const dev = devKey ? await loadBucket(boards, devKey, now) : null;
-  const ip = ipKey ? await loadBucket(boards, ipKey, now) : null;
+  const ident = await loadIdentity(boards, installId, ipHash, now);
+  const devPlan = ident.dev ? planSearch(ident.devSet, now.getTime()) : null;
+  const ipPlan = ident.ip ? planSearch(ident.ipSet, now.getTime()) : null;
+  const chargeDevice = Boolean(devPlan && devPlan.charge);
+  const chargeIp = Boolean(ipPlan && ipPlan.charge);
+  const chargeGlobal = chargeDevice || chargeIp || (!ident.dev && !ident.ip);
+  const searchCount = ident.dev ? ident.dev.searchCount : (ident.ip ? ident.ip.searchCount : 0);
   const balance = await readBalance(boards);
   if (balanceBlocks(balance, limits.floor)) {
-    return rejectLimited(boards, periods.day, "floor", false, null, cors, now);
+    return rejectLimited(boards, periods.day, "floor", true, null, cors, now, searchJob);
   }
-  const stats = await readStats(boards, `gq:stats:${periods.day}`);
-  if (stats.searches >= limits.searchGlobalDay) {
-    return rejectLimited(boards, periods.day, "search_global_day", false, null, cors, now);
+  if (chargeGlobal) {
+    const reason = lookupBlockReason({
+      chargeDevice,
+      chargeIp,
+      chargeGlobal,
+      dev: ident.dev,
+      ip: ident.ip,
+      stats: await readStats(boards, `gq:stats:${periods.day}`),
+      limits,
+    });
+    if (reason) return rejectLimited(boards, periods.day, reason, true, null, cors, now, searchJob);
   }
-  if (dev && dev.searchCount >= limits.searchDeviceDay) {
-    return rejectLimited(boards, periods.day, "search_device_day", false, null, cors, now);
-  }
-  if (ip && ip.searchCount >= limits.searchIpDay) {
-    return rejectLimited(boards, periods.day, "search_ip_day", false, null, cors, now);
+  if ((ident.dev || ident.ip) && searchCount >= limits.searchCap) {
+    return rejectLimited(boards, periods.day, "search_device_day", true, null, cors, now, searchJob);
   }
 
   const upstream = await fetchGolfapiUpstream(env, `courses${url.search}`);
@@ -635,22 +780,16 @@ async function handleGolfapiSearch({ url, env, ctx, cors, boards, now, periods, 
 
   const classified = classifyGolfapi("search", upstream.status, upstream.text);
   await rememberBalance(boards, upstream.status, classified.payload);
-  if (dev) {
-    dev.searchCount += 1;
-    await saveBucket(boards, devKey, dev);
-  }
-  if (ip) {
-    ip.searchCount += 1;
-    await saveBucket(boards, ipKey, ip);
-  }
-  await bumpStats(boards, periods.day, (statsNow) => {
-    statsNow.searches += 1;
-  });
+  await recordFresh(boards, periods, ident, chargeDevice, chargeIp, chargeGlobal, true);
+  await commitSets(boards, ident, devPlan, ipPlan, now);
 
-  const cacheable = upstream.status >= 200 && upstream.status < 300;
-  const response = upstreamGolfResponse(upstream.status, upstream.text, upstream.contentType, cors, cacheable);
-  if (cacheable) await rememberGolfEdge(cache, ctx, cacheKey, response);
-  return response;
+  if (searchHasData(classified.payload)) {
+    await boards.put(storeKey, upstream.text, { expirationTtl: GOLFAPI_SEARCH_TTL });
+    const response = upstreamGolfResponse(upstream.status, upstream.text, upstream.contentType, cors, true);
+    await rememberGolfEdge(cache, ctx, cacheKey, response);
+    return response;
+  }
+  return upstreamGolfResponse(upstream.status, upstream.text, upstream.contentType, cors, false);
 }
 
 async function handleGolfapiLookup({ kind, id, url, env, ctx, cors, boards, now, periods, limits, installId, ipHash }) {
@@ -687,35 +826,28 @@ async function handleGolfapiLookup({ kind, id, url, env, ctx, cors, boards, now,
     return golfJson(404, { error: "no_course_data" }, cors);
   }
 
-  const devKey = installId ? `gq:dev:${installId}` : null;
-  const ipKey = ipHash ? `gq:ip:${ipHash}` : null;
-  const dev = devKey ? await loadBucket(boards, devKey, now) : null;
-  const ip = ipKey ? await loadBucket(boards, ipKey, now) : null;
-  const deviceSeen = Boolean(dev && typeof dev.seen[id] === "number");
-  const ipSeen = Boolean(ip && typeof ip.seen[id] === "number");
-  const chargeDevice = Boolean(dev) && !deviceSeen;
-  const chargeIp = Boolean(ip) && !ipSeen;
-  const chargeGlobal = chargeDevice || chargeIp || (!dev && !ip);
+  const ident = await loadIdentity(boards, installId, ipHash, now);
+  const devPlan = ident.dev ? planCourse(ident.devSet, id, now.getTime()) : null;
+  const ipPlan = ident.ip ? planCourse(ident.ipSet, id, now.getTime()) : null;
+  const chargeDevice = Boolean(devPlan && devPlan.charge);
+  const chargeIp = Boolean(ipPlan && ipPlan.charge);
+  const chargeGlobal = chargeDevice || chargeIp || (!ident.dev && !ident.ip);
 
   const balance = await readBalance(boards);
   if (balanceBlocks(balance, limits.floor)) {
     return rejectLimited(boards, periods.day, "floor", true, id, cors, now);
   }
   if (chargeGlobal) {
-    const stats = await readStats(boards, `gq:stats:${periods.day}`);
-    if (stats.lookups >= limits.globalDay) {
-      return rejectLimited(boards, periods.day, "global_day", true, id, cors, now);
-    }
-  }
-  if (chargeDevice) {
-    if (dev.dayCount >= limits.deviceDay) return rejectLimited(boards, periods.day, "device_day", true, id, cors, now);
-    if (dev.weekCount >= limits.deviceWeek) return rejectLimited(boards, periods.day, "device_week", true, id, cors, now);
-    if (dev.monthCount >= limits.deviceMonth) return rejectLimited(boards, periods.day, "device_month", true, id, cors, now);
-  }
-  if (chargeIp) {
-    if (ip.dayCount >= limits.ipDay) return rejectLimited(boards, periods.day, "ip_day", true, id, cors, now);
-    if (ip.weekCount >= limits.ipWeek) return rejectLimited(boards, periods.day, "ip_week", true, id, cors, now);
-    if (ip.monthCount >= limits.ipMonth) return rejectLimited(boards, periods.day, "ip_month", true, id, cors, now);
+    const reason = lookupBlockReason({
+      chargeDevice,
+      chargeIp,
+      chargeGlobal,
+      dev: ident.dev,
+      ip: ident.ip,
+      stats: await readStats(boards, `gq:stats:${periods.day}`),
+      limits,
+    });
+    if (reason) return rejectLimited(boards, periods.day, reason, true, id, cors, now);
   }
 
   const stem = kind === "course" ? "courses" : "coordinates";
@@ -725,21 +857,8 @@ async function handleGolfapiLookup({ kind, id, url, env, ctx, cors, boards, now,
 
   const classified = classifyGolfapi(kind, upstream.status, upstream.text);
   await rememberBalance(boards, upstream.status, classified.payload);
-  const definitive = classified.outcome === "data" || classified.outcome === "nodata";
-  await chargeLookup(
-    boards,
-    periods,
-    devKey,
-    dev,
-    ipKey,
-    ip,
-    chargeDevice,
-    chargeIp,
-    chargeGlobal,
-    definitive,
-    id,
-    now.getTime(),
-  );
+  await recordFresh(boards, periods, ident, chargeDevice, chargeIp, chargeGlobal, false);
+  await commitSets(boards, ident, devPlan, ipPlan, now);
 
   if (classified.outcome === "data") {
     await boards.put(storeKey, upstream.text, { expirationTtl: GOLFAPI_STORE_TTL });
@@ -802,10 +921,112 @@ function parseQueueRecord(raw) {
     return {
       attempts: Number.isInteger(attempts) && attempts > 0 ? attempts : 0,
       at: Number(parsed && parsed.at) || 0,
+      q: typeof parsed?.q === "string" ? parsed.q : "",
+      search: typeof parsed?.search === "string" ? parsed.search : "",
     };
   } catch {
-    return { attempts: 0, at: 0 };
+    return { attempts: 0, at: 0, q: "", search: "" };
   }
+}
+
+async function partReady(boards, kind, id) {
+  if (typeof (await boards.get(storeKeyFor(kind, id))) === "string") return true;
+  return (await boards.get(emptyMarkerKey(kind, id))) != null;
+}
+
+async function pullQueuedPart(env, boards, state, kind, id) {
+  const stem = kind === "course" ? "courses" : "coordinates";
+  const upstream = await fetchGolfapiUpstream(env, `${stem}/${id}`);
+  if (!upstream.configured || upstream.thrown) {
+    state.failed = true;
+    return;
+  }
+  state.fetched = true;
+  const classified = classifyGolfapi(kind, upstream.status, upstream.text);
+  await rememberBalance(boards, upstream.status, classified.payload);
+  if (classified.outcome === "error") {
+    state.failed = true;
+    return;
+  }
+  if (classified.outcome === "data") {
+    await boards.put(storeKeyFor(kind, id), upstream.text, { expirationTtl: GOLFAPI_STORE_TTL });
+    await boards.delete(emptyMarkerKey(kind, id));
+    return;
+  }
+  await boards.put(emptyMarkerKey(kind, id), "1", { expirationTtl: GOLF_CACHE_SECONDS });
+}
+
+/** Course then coordinates. A floor hit between them leaves the queue row for the next cron. */
+async function refillCoursePair(env, boards, limits, state, courseId) {
+  let courseDone = await partReady(boards, "course", courseId);
+  let coordDone = await partReady(boards, "coord", courseId);
+  if (!courseDone) {
+    if (balanceBlocks(await readBalance(boards), limits.floor)) {
+      state.stop = true;
+      return;
+    }
+    await pullQueuedPart(env, boards, state, "course", courseId);
+    if (state.failed) return;
+    courseDone = true;
+  }
+  if (!coordDone) {
+    if (balanceBlocks(await readBalance(boards), limits.floor)) {
+      state.stop = true;
+      return;
+    }
+    await pullQueuedPart(env, boards, state, "coord", courseId);
+    if (state.failed) return;
+    coordDone = true;
+  }
+  state.done = courseDone && coordDone;
+}
+
+async function drainSearchItem(env, boards, limits, item) {
+  const state = { fetched: false, failed: false, stop: false, done: false };
+  const storeKey = `gapi:search:${item.token}`;
+  let stored = await boards.get(storeKey);
+  if (typeof stored !== "string" || !searchBodyOk(stored)) {
+    const upstream = await fetchGolfapiUpstream(env, `courses${item.record.search}`);
+    if (!upstream.configured || upstream.thrown) {
+      state.failed = true;
+      return state;
+    }
+    state.fetched = true;
+    let payload = null;
+    if (typeof upstream.text === "string" && upstream.text) {
+      try {
+        payload = JSON.parse(upstream.text);
+      } catch {
+        payload = null;
+      }
+    }
+    await rememberBalance(boards, upstream.status, payload);
+    const httpOk = upstream.status >= 200 && upstream.status < 300;
+    if (upstream.status === 404 || (httpOk && !searchHasData(payload))) {
+      state.done = true;
+      return state;
+    }
+    if (!httpOk || !searchHasData(payload)) {
+      state.failed = true;
+      return state;
+    }
+    await boards.put(storeKey, upstream.text, { expirationTtl: GOLFAPI_SEARCH_TTL });
+    stored = upstream.text;
+  }
+
+  let payload = null;
+  try {
+    payload = JSON.parse(stored);
+  } catch {
+    payload = null;
+  }
+  const courseId = matchingCourseId(payload, item.record.q);
+  if (!courseId) {
+    state.done = true;
+    return state;
+  }
+  await refillCoursePair(env, boards, limits, state, courseId);
+  return state;
 }
 
 async function drainGolfapiQueue(env) {
@@ -820,82 +1041,58 @@ async function drainGolfapiQueue(env) {
   const names = await listKeys(boards, "gqueue:");
   const items = [];
   for (const name of names) {
+    const record = parseQueueRecord(await boards.get(name));
+    if (name.startsWith("gqueue:q:")) {
+      const token = name.slice("gqueue:q:".length);
+      const searchOk = record.search.startsWith("?") && !/[\r\n#]/.test(record.search);
+      const tokenOk = /^[0-9a-f]{64}$/.test(token) && token === await searchToken(record.q);
+      if (!tokenOk || record.q !== normalizeName(record.q) || !searchOk) {
+        await boards.delete(name);
+        continue;
+      }
+      items.push({ name, kind: "search", token, record });
+      continue;
+    }
     const id = safeGolfapiId(name.slice("gqueue:".length));
     if (!id || name !== `gqueue:${id}`) {
       await boards.delete(name);
       continue;
     }
-    items.push({ name, id, record: parseQueueRecord(await boards.get(name)) });
+    items.push({ name, kind: "course", id, record });
   }
-  items.sort((left, right) => left.record.at - right.record.at || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+  items.sort((left, right) => left.record.at - right.record.at || (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
 
   for (const item of items) {
     if (item.record.attempts >= GOLFAPI_GIVE_UP) continue;
-    const balance = await readBalance(boards);
-    if (balanceBlocks(balance, limits.floor)) break;
+    if (balanceBlocks(await readBalance(boards), limits.floor)) break;
     const stats = await readStats(boards, `gq:stats:${periods.day}`);
     if (stats.lookups >= limits.globalDay) break;
 
-    let failed = false;
-    let fetched = false;
-    const partDone = async (kind, storeKey) => {
-      if (typeof (await boards.get(storeKey)) === "string") return true;
-      return (await boards.get(emptyMarkerKey(kind, item.id))) != null;
-    };
-    let courseDone = await partDone("course", courseStoreKey(item.id));
-    let coordDone = await partDone("coord", coordStoreKey(item.id));
+    const outcome = item.kind === "search"
+      ? await drainSearchItem(env, boards, limits, item)
+      : await (async () => {
+        const state = { fetched: false, failed: false, stop: false, done: false };
+        await refillCoursePair(env, boards, limits, state, item.id);
+        return state;
+      })();
 
-    const pull = async (kind, path, storeKey) => {
-      const upstream = await fetchGolfapiUpstream(env, path);
-      if (!upstream.configured || upstream.thrown) {
-        failed = true;
-        return;
-      }
-      fetched = true;
-      const classified = classifyGolfapi(kind, upstream.status, upstream.text);
-      await rememberBalance(boards, upstream.status, classified.payload);
-      if (classified.outcome === "error") {
-        failed = true;
-        return;
-      }
-      if (classified.outcome === "data") {
-        await boards.put(storeKey, upstream.text, { expirationTtl: GOLFAPI_STORE_TTL });
-        await boards.delete(emptyMarkerKey(kind, item.id));
-        return;
-      }
-      await boards.put(emptyMarkerKey(kind, item.id), "1", { expirationTtl: GOLF_CACHE_SECONDS });
-    };
-
-    if (!courseDone) {
-      await pull("course", `courses/${item.id}`, courseStoreKey(item.id));
-      if (!failed) courseDone = true;
-    }
-    if (!failed && !coordDone) {
-      if (balanceBlocks(await readBalance(boards), limits.floor)) {
-        if (fetched) {
-          await bumpStats(boards, periods.day, (row) => {
-            row.lookups += 1;
-          });
-        }
-        break;
-      }
-      await pull("coord", `coordinates/${item.id}`, coordStoreKey(item.id));
-      if (!failed) coordDone = true;
-    }
-
-    if (fetched) {
+    if (outcome.fetched) {
       await bumpStats(boards, periods.day, (row) => {
         row.lookups += 1;
       });
     }
-    if (failed) {
+    if (outcome.stop) break;
+    if (outcome.failed) {
       const attempts = item.record.attempts + 1;
-      await boards.put(item.name, JSON.stringify({ attempts, at: item.record.at || Date.now() }), {
-        expirationTtl: GOLFAPI_QUEUE_TTL,
-      });
+      const body = { attempts, at: item.record.at || Date.now() };
+      if (item.kind === "search") {
+        body.q = item.record.q;
+        body.search = item.record.search;
+      }
+      await boards.put(item.name, JSON.stringify(body), { expirationTtl: GOLFAPI_QUEUE_TTL });
       continue;
     }
-    if (courseDone && coordDone) await boards.delete(item.name);
+    if (outcome.done) await boards.delete(item.name);
   }
 }
 
@@ -915,6 +1112,8 @@ async function handleGolfapiMeta(request, env, cors) {
   const queue = await listKeys(boards, "gqueue:");
   return golfJson(200, {
     balance: publicBalance(balance),
+    asOf: balanceAsOf(balance),
+    generatedAt: now.toISOString(),
     today: days[days.length - 1],
     days,
     queueLength: queue.length,

@@ -1087,46 +1087,50 @@ describe("shottrax-share worker", () => {
     const searchBody = await search.json();
     expect(search.status).toBe(429);
     expect(searchBody.reason).toBe("floor");
-    expect(searchBody.queued).toBe(false);
+    expect(searchBody.queued).toBe(true);
     expect(fetchMock).not.toHaveBeenCalled();
-    expect([...kv.keys()].filter((key) => key.startsWith("gqueue:"))).toEqual([]);
+    const queuedSearch = [...kv.keys()].filter((key) => key.startsWith("gqueue:"));
+    expect(queuedSearch).toHaveLength(1);
+    expect(queuedSearch[0].startsWith("gqueue:q:")).toBe(true);
   });
 
-  it("keeps search limits separate from lookups", async () => {
+  it("caps fresh searches at 3x the device day, including inside an open set", async () => {
     mockGolfApi(async (url) => {
-      expect(url).toContain("golfapi.io/api/v2.3/courses?");
-      return jsonResponse({
-        apiRequestsLeft: "70",
-        numCourses: 1,
-        courses: [{ courseID: "abc", courseName: "Magnolia" }],
-      });
+      if (url.includes("/courses?")) {
+        return jsonResponse({
+          apiRequestsLeft: "70",
+          numCourses: 1,
+          courses: [{ courseID: "abc", courseName: "Somewhere" }],
+        });
+      }
+      return jsonResponse(coursePayload(url.split("/").pop(), 60));
     });
-    const searchEnv = { ...env, GOLFAPI_SEARCH_DEVICE_DAY: "1" };
-    const first = await golfGet("/golfapi/v2.3/courses?country=US&q=Magnolia", { env: searchEnv });
-    expect(first.status).toBe(200);
-    expect(stats().searches).toBe(1);
-    expect(stats().lookups).toBe(0);
-
-    const repeat = await golfGet("/golfapi/v2.3/courses?country=US&q=Magnolia", { env: searchEnv });
-    expect(repeat.status).toBe(200);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(stats().searches).toBe(1);
-    expect(stats().hits).toBe(1);
-
-    const second = await golfGet("/golfapi/v2.3/courses?q=Other", { env: searchEnv });
-    const body = await second.json();
-    expect(second.status).toBe(429);
-    expect(body.reason).toBe("search_device_day");
-    expect(body.queued).toBe(false);
-    expect([...kv.keys()].some((key) => key.startsWith("gqueue:"))).toBe(false);
-
-    mockGolfApi(async (url) => {
-      expect(url).toContain("/courses/lookup");
-      return jsonResponse(coursePayload("lookup", 60));
-    });
-    expect((await golfGet("/golfapi/v2.3/courses/lookup", { env: searchEnv })).status).toBe(200);
+    const searchEnv = { ...env, GOLFAPI_DEVICE_DAY: "1", GOLFAPI_SEARCH_DEVICE_DAY: "100" };
+    expect((await golfGet("/golfapi/v2.3/courses?q=one", { env: searchEnv })).status).toBe(200);
+    expect((await golfGet("/golfapi/v2.3/courses?q=two", { env: searchEnv })).status).toBe(200);
+    expect((await golfGet("/golfapi/v2.3/courses?q=three", { env: searchEnv })).status).toBe(200);
     expect(stats().lookups).toBe(1);
-    expect(stats().searches).toBe(1);
+    expect(stats().searches).toBe(3);
+
+    const blocked = await golfGet("/golfapi/v2.3/courses?q=four", { env: searchEnv });
+    const body = await blocked.json();
+    expect(blocked.status).toBe(429);
+    expect(body.reason).toBe("search_device_day");
+    expect(body.queued).toBe(true);
+    const again = await golfGet("/golfapi/v2.3/courses?q=Four", { env: searchEnv });
+    expect(again.status).toBe(429);
+    const queued = [...kv.keys()].filter((key) => key.startsWith("gqueue:q:"));
+    expect(queued).toHaveLength(1);
+    expect(JSON.parse(kv.get(queued[0]).value).q).toBe("four");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+
+    expect((await golfGet("/golfapi/v2.3/courses/pebble", { env: searchEnv })).status).toBe(200);
+    expect(stats().lookups).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    const other = await golfGet("/golfapi/v2.3/courses/other", { env: searchEnv });
+    expect(other.status).toBe(429);
+    expect((await other.json()).reason).toBe("device_day");
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
   it("does not store an error body or a 200 with no course data", async () => {
@@ -1231,25 +1235,49 @@ describe("shottrax-share worker", () => {
     edge.clear();
     fetchMock.mockClear();
     mockGolfApi(async () => jsonResponse({ apiRequestsLeft: "50", numCourses: 0, courses: [] }));
-    const searchCap = { ...env, GOLFAPI_SEARCH_GLOBAL_DAY: "1", GOLFAPI_SEARCH_DEVICE_DAY: "10" };
-    expect((await golfGet("/golfapi/v2.3/courses?q=one", { env: searchCap })).status).toBe(200);
-    const searchBlocked = await golfGet("/golfapi/v2.3/courses?q=two", { install: OTHER_INSTALL, env: searchCap });
-    expect((await searchBlocked.json()).reason).toBe("search_global_day");
-    expect(stats().lookups).toBe(0);
+    const ignoredSearchVars = { ...env, GOLFAPI_SEARCH_GLOBAL_DAY: "1", GOLFAPI_SEARCH_DEVICE_DAY: "10" };
+    expect((await golfGet("/golfapi/v2.3/courses?q=one", { env: ignoredSearchVars })).status).toBe(200);
+    expect((await golfGet("/golfapi/v2.3/courses?q=two", { env: ignoredSearchVars })).status).toBe(200);
+    expect(stats().lookups).toBe(1);
+    expect(stats().searches).toBe(2);
   });
 
-  it("charges a lookup again after the 24h pair window", async () => {
+  it("keeps an open 15 minute set free and treats an expired set as closed", async () => {
+    async function sha256Hex(text) {
+      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+      return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    }
+    async function seedSets(courseId, at) {
+      const value = JSON.stringify({ at, courseId });
+      kv.set(`gq:set:dev:${INSTALL}`, { value });
+      kv.set(`gq:set:ip:${await sha256Hex(`shottrax-golfapi-ip-v1:${CLIENT_IP}`)}`, { value });
+    }
     kv.set(`gq:dev:${INSTALL}`, {
-      value: JSON.stringify({
-        day: todayKey(),
-        dayCount: 3,
-        seen: { stale: Date.now() - 25 * 60 * 60 * 1000 },
-      }),
+      value: JSON.stringify({ day: todayKey(), dayCount: 3 }),
     });
-    mockGolfApi(async () => jsonResponse(coursePayload("stale")));
-    const blocked = await golfGet("/golfapi/v2.3/courses/stale");
-    expect(blocked.status).toBe(429);
-    expect((await blocked.json()).reason).toBe("device_day");
+    await seedSets("pebble", Date.now());
+    mockGolfApi(async () => jsonResponse(coursePayload("pebble")));
+    expect((await golfGet("/golfapi/v2.3/courses/pebble")).status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(stats().lookups).toBe(0);
+    expect(JSON.parse(kv.get(`gq:dev:${INSTALL}`).value).dayCount).toBe(3);
+
+    fetchMock.mockClear();
+    const other = await golfGet("/golfapi/v2.3/courses/other");
+    expect(other.status).toBe(429);
+    expect((await other.json()).reason).toBe("device_day");
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    kv.clear();
+    edge.clear();
+    fetchMock.mockClear();
+    kv.set(`gq:dev:${INSTALL}`, {
+      value: JSON.stringify({ day: todayKey(), dayCount: 3 }),
+    });
+    await seedSets("pebble", Date.now() - 16 * 60 * 1000);
+    const expired = await golfGet("/golfapi/v2.3/courses/pebble");
+    expect(expired.status).toBe(429);
+    expect((await expired.json()).reason).toBe("device_day");
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -1270,7 +1298,15 @@ describe("shottrax-share worker", () => {
     expect(meta.status).toBe(200);
     expect(meta.headers.get("Cache-Control")).toBe("no-store");
     const body = await meta.json();
-    expect(body.balance).toEqual({ left: 33.5, at: expect.any(Number), lastStatus: 200 });
+    expect(body.balance).toEqual({
+      left: 33.5,
+      at: expect.any(Number),
+      lastStatus: 200,
+      asOf: expect.any(String),
+    });
+    expect(body.asOf).toBe(new Date(body.balance.at).toISOString());
+    expect(body.balance.asOf).toBe(body.asOf);
+    expect(Number.isNaN(Date.parse(body.generatedAt))).toBe(false);
     expect(body.queueLength).toBe(1);
     expect(body.days).toHaveLength(30);
     expect(body.days[0].date < body.days[29].date).toBe(true);
@@ -1293,8 +1329,6 @@ describe("shottrax-share worker", () => {
       "ip_month",
       "ip_week",
       "search_device_day",
-      "search_global_day",
-      "search_ip_day",
     ]);
     const text = JSON.stringify(body);
     expect(text).not.toContain("golf-secret");
@@ -1404,5 +1438,198 @@ describe("shottrax-share worker", () => {
 
     const options = await invoke(`${ORIGIN}/golfapi/v2.3/courses/abc`, { method: "OPTIONS" });
     expect(options.headers.get("Access-Control-Allow-Headers")).toBe("Content-Type, X-Install-Id");
+  });
+
+  it("counts a fresh search and the first course id as one lookup", async () => {
+    mockGolfApi(async (url) => {
+      if (url.includes("/courses?")) {
+        return jsonResponse({
+          apiRequestsLeft: "70",
+          numCourses: 1,
+          courses: [{ courseID: "pebble", courseName: "Magnolia" }],
+        });
+      }
+      const id = url.split("/").pop();
+      if (url.includes("/coordinates/")) return jsonResponse(coordPayload(id, 60));
+      return jsonResponse(coursePayload(id, 65));
+    });
+    expect((await golfGet("/golfapi/v2.3/courses?q=Magnolia")).status).toBe(200);
+    expect((await golfGet("/golfapi/v2.3/courses?q=magnolia")).status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const searchKeys = [...kv.keys()].filter((key) => key.startsWith("gapi:search:"));
+    expect(searchKeys).toHaveLength(1);
+    expect(kv.get(searchKeys[0]).opts.expirationTtl).toBe(30 * DAY);
+    expect(stats().lookups).toBe(1);
+    expect(stats().searches).toBe(1);
+    expect(stats().hits).toBe(1);
+
+    expect((await golfGet("/golfapi/v2.3/coordinates/pebble")).status).toBe(200);
+    expect((await golfGet("/golfapi/v2.3/courses/pebble")).status).toBe(200);
+    expect(stats().lookups).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+
+    expect((await golfGet("/golfapi/v2.3/courses/other")).status).toBe(200);
+    expect(stats().lookups).toBe(2);
+  });
+
+  it("does not open a set when the search is already stored", async () => {
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode("shottrax-golfapi-search-v1:magnolia"),
+    );
+    const token = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    kv.set(`gapi:search:${token}`, {
+      value: JSON.stringify({
+        apiRequestsLeft: "40",
+        numCourses: 1,
+        courses: [{ courseID: "pebble", courseName: "Magnolia" }],
+      }),
+    });
+    mockGolfApi(async (url) => {
+      const id = url.split("/").pop();
+      if (url.includes("/coordinates/")) return jsonResponse(coordPayload(id));
+      return jsonResponse(coursePayload(id));
+    });
+    expect((await golfGet("/golfapi/v2.3/courses?q=Magnolia")).status).toBe(200);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect([...kv.keys()].some((key) => key.startsWith("gq:set:"))).toBe(false);
+    expect(stats().lookups).toBe(0);
+    expect(stats().hits).toBe(1);
+
+    expect((await golfGet("/golfapi/v2.3/courses/pebble")).status).toBe(200);
+    expect(stats().lookups).toBe(1);
+    expect((await golfGet("/golfapi/v2.3/coordinates/pebble")).status).toBe(200);
+    expect(stats().lookups).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("drains a queued search and follows a unique normalized name", async () => {
+    kv.set("gq:balance", { value: JSON.stringify({ left: 9, at: 1, lastStatus: 200 }) });
+    const blocked = await golfGet("/golfapi/v2.3/courses?country=US&q=Magnolia");
+    expect(blocked.status).toBe(429);
+    expect((await blocked.json()).queued).toBe(true);
+    expect((await golfGet("/golfapi/v2.3/courses?q=magnolia")).status).toBe(429);
+    const queued = [...kv.keys()].filter((key) => key.startsWith("gqueue:"));
+    expect(queued).toHaveLength(1);
+    expect(JSON.parse(kv.get(queued[0]).value)).toMatchObject({
+      attempts: 0,
+      q: "magnolia",
+      search: "?country=US&q=Magnolia",
+    });
+    kv.set("gqueue:q:nope", { value: JSON.stringify({ attempts: 0, at: 5, q: "nope", search: "?q=nope" }) });
+
+    kv.set("gq:balance", { value: JSON.stringify({ left: 40, at: 1, lastStatus: 200 }) });
+    const calls = [];
+    mockGolfApi(async (url) => {
+      calls.push(url);
+      if (url.includes("/courses?")) {
+        return jsonResponse({
+          apiRequestsLeft: "30",
+          numCourses: 1,
+          courses: [{ courseID: "pebble", courseName: "Magnolia" }],
+        });
+      }
+      if (url.endsWith("/courses/pebble")) return jsonResponse(coursePayload("pebble", 28));
+      if (url.endsWith("/coordinates/pebble")) return jsonResponse(coordPayload("pebble", 27));
+      throw new Error(url);
+    });
+    await runDrain();
+    expect(calls).toEqual([
+      "https://golfapi.io/api/v2.3/courses?country=US&q=Magnolia",
+      "https://golfapi.io/api/v2.3/courses/pebble",
+      "https://golfapi.io/api/v2.3/coordinates/pebble",
+    ]);
+    expect(kv.has(queued[0])).toBe(false);
+    expect(kv.has("gqueue:q:nope")).toBe(false);
+    const token = queued[0].slice("gqueue:q:".length);
+    expect(kv.get(`gapi:search:${token}`)?.opts.expirationTtl).toBe(30 * DAY);
+    expect(kv.get("gapi:course:pebble")?.opts.expirationTtl).toBe(365 * DAY);
+    expect(kv.get("gapi:coord:pebble")?.value).toContain("coordinates");
+    expect(stats().lookups).toBe(1);
+
+    fetchMock.mockClear();
+    expect((await golfGet("/golfapi/v2.3/courses?q=magnolia")).status).toBe(200);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(stats().lookups).toBe(1);
+  });
+
+  it("stores only the search when the queued name is not a single match", async () => {
+    async function enqueue(path) {
+      kv.set("gq:balance", { value: JSON.stringify({ left: 9, at: 1, lastStatus: 200 }) });
+      expect((await golfGet(path)).status).toBe(429);
+      kv.set("gq:balance", { value: JSON.stringify({ left: 40, at: 1, lastStatus: 200 }) });
+    }
+
+    await enqueue("/golfapi/v2.3/courses?q=Pine");
+    const calls = [];
+    mockGolfApi(async (url) => {
+      calls.push(url);
+      return jsonResponse({
+        apiRequestsLeft: "30",
+        numCourses: 2,
+        courses: [
+          { courseID: "a", courseName: "Pine" },
+          { courseID: "b", clubName: "Pine" },
+        ],
+      });
+    });
+    await runDrain();
+    expect(calls).toEqual(["https://golfapi.io/api/v2.3/courses?q=Pine"]);
+    expect([...kv.keys()].some((key) => key.startsWith("gapi:course:"))).toBe(false);
+    expect([...kv.keys()].some((key) => key.startsWith("gapi:search:"))).toBe(true);
+    expect([...kv.keys()].some((key) => key.startsWith("gqueue:"))).toBe(false);
+    expect(stats().lookups).toBe(1);
+
+    kv.clear();
+    edge.clear();
+    calls.length = 0;
+    await enqueue("/golfapi/v2.3/courses?q=Missing");
+    mockGolfApi(async (url) => {
+      calls.push(url);
+      return jsonResponse({
+        apiRequestsLeft: "22",
+        numCourses: 1,
+        courses: [{ courseID: "zzz", courseName: "Other" }],
+      });
+    });
+    await runDrain();
+    expect(calls).toEqual(["https://golfapi.io/api/v2.3/courses?q=Missing"]);
+    expect([...kv.keys()].some((key) => key.startsWith("gapi:course:"))).toBe(false);
+    expect([...kv.keys()].some((key) => key.startsWith("gqueue:"))).toBe(false);
+    expect(stats().lookups).toBe(1);
+  });
+
+  it("leaves a queued search in place when the floor hits before course details", async () => {
+    kv.set("gq:balance", { value: JSON.stringify({ left: 9, at: 1, lastStatus: 200 }) });
+    expect((await golfGet("/golfapi/v2.3/courses?q=Magnolia")).status).toBe(429);
+    const queued = [...kv.keys()].filter((key) => key.startsWith("gqueue:q:"));
+    kv.set("gq:balance", { value: JSON.stringify({ left: 40, at: 1, lastStatus: 200 }) });
+    mockGolfApi(async () => jsonResponse({
+      apiRequestsLeft: "10",
+      numCourses: 1,
+      courses: [{ courseID: "pebble", courseName: "Magnolia" }],
+    }));
+    await runDrain();
+    expect(kv.has(queued[0])).toBe(true);
+    expect(JSON.parse(kv.get(queued[0]).value).attempts).toBe(0);
+    expect(kv.has("gapi:search:" + queued[0].slice("gqueue:q:".length))).toBe(true);
+    expect(kv.has("gapi:course:pebble")).toBe(false);
+    expect(stats().lookups).toBe(1);
+
+    const calls = [];
+    kv.set("gq:balance", { value: JSON.stringify({ left: 30, at: 1, lastStatus: 200 }) });
+    mockGolfApi(async (url) => {
+      calls.push(url);
+      if (url.endsWith("/courses/pebble")) return jsonResponse(coursePayload("pebble", 20));
+      if (url.endsWith("/coordinates/pebble")) return jsonResponse(coordPayload("pebble", 19));
+      throw new Error(url);
+    });
+    await runDrain();
+    expect(calls).toEqual([
+      "https://golfapi.io/api/v2.3/courses/pebble",
+      "https://golfapi.io/api/v2.3/coordinates/pebble",
+    ]);
+    expect(kv.has(queued[0])).toBe(false);
+    expect(stats().lookups).toBe(2);
   });
 });

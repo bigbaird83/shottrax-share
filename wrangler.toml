@@ -10,7 +10,7 @@ compatibility_date = "2026-09-23"
 binding = "BOARDS"
 id = "cfa1824a10374ab6a7fa0c97d0990e80"
 
-# Daily refill of queued golfapi course ids. 08:00 UTC is early morning in the US.
+# Daily refill of queued golfapi course ids and searches. 08:00 UTC is early morning in the US.
 [triggers]
 crons = ["0 8 * * *"]
 
@@ -26,6 +26,6 @@ crons = ["0 8 * * *"]
 # GOLFAPI_IP_MONTH = "40"
 # GOLFAPI_GLOBAL_DAY = "40"
 # GOLFAPI_FLOOR = "10"
-# GOLFAPI_SEARCH_DEVICE_DAY = "10"
-# GOLFAPI_SEARCH_IP_DAY = "20"
-# GOLFAPI_SEARCH_GLOBAL_DAY = "60"
+# A search + course + coordinates set stays open for 15 minutes.
+# Fresh searches are also capped at 3x GOLFAPI_DEVICE_DAY per device per day.
+# GOLFAPI_SEARCH_* vars are not read.
