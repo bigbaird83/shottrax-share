@@ -2467,24 +2467,50 @@ describe("shottrax-share worker", () => {
   });
 
   it("serves GCA without an install id until GCA_REQUIRE_INSTALL_ID is on", async () => {
+    const appId = "id_1790517745797_pfjtwbfa";
     seedGca("gca:course:14322", COURSE_RAW, Date.now() - 1000);
-    const open = await invoke(`${ORIGIN}/gca/v1/courses/14322`);
-    expect(open.status).toBe(200);
-    expect(await open.text()).toBe(COURSE_RAW);
-    expect(open.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    const fromKv = await invoke(`${ORIGIN}/gca/v1/courses/14322`);
+    expect(fromKv.status).toBe(200);
+    expect(await fromKv.text()).toBe(COURSE_RAW);
+    expect(fromKv.headers.get("Access-Control-Allow-Origin")).toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
     expect(gcaStats().missingInstallId).toBe(1);
 
+    let kvOps = 0;
+    for (const method of ["get", "getWithMetadata", "put", "delete", "list"]) {
+      const original = env.BOARDS[method].bind(env.BOARDS);
+      env.BOARDS[method] = async (...args) => {
+        kvOps += 1;
+        return original(...args);
+      };
+    }
+    const edgeHit = await invoke(`${ORIGIN}/gca/v1/courses/14322`, {
+      env: { ...env, GCA_REQUIRE_INSTALL_ID: "nope" },
+    });
+    expect(edgeHit.status).toBe(200);
+    expect(await edgeHit.text()).toBe(COURSE_RAW);
+    expect(gcaStats().missingInstallId).toBe(1);
+    expect(kvOps).toBe(0);
+
     const named = await invoke(`${ORIGIN}/gca/v1/courses/14322`, {
-      headers: { "X-Install-Id": "id_1790517745797_pfjtwbfa" },
+      headers: { "X-Install-Id": appId },
     });
     expect(named.status).toBe(200);
     expect(gcaStats().missingInstallId).toBe(1);
 
-    const loose = await invoke(`${ORIGIN}/gca/v1/courses/14322`, {
-      env: { ...env, GCA_REQUIRE_INSTALL_ID: "nope" },
+    mockGca(async () => new Response('{"id":"upstream"}', {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+    const upstream = await invoke(`${ORIGIN}/gca/v1/courses/upstream`);
+    expect(upstream.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(gcaStats().missingInstallId).toBe(2);
+
+    const upstreamId = await invoke(`${ORIGIN}/gca/v1/courses/with-id`, {
+      headers: { "X-Install-Id": appId },
     });
-    expect(loose.status).toBe(200);
+    expect(upstreamId.status).toBe(200);
     expect(gcaStats().missingInstallId).toBe(2);
 
     const closed = {
@@ -2507,7 +2533,7 @@ describe("shottrax-share worker", () => {
 
     const allowed = await invoke(`${ORIGIN}/gca/v1/courses/14322`, {
       env: { ...env, GCA_REQUIRE_INSTALL_ID: "true" },
-      headers: { "X-Install-Id": "id_1790517745797_pfjtwbfa" },
+      headers: { "X-Install-Id": appId },
     });
     expect(allowed.status).toBe(200);
     expect(await allowed.text()).toBe(COURSE_RAW);

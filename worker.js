@@ -68,8 +68,10 @@ import { applyGcaScorecardCorrection } from "./gca-corrections.js";
  * queue write except blocked.install_id_required (GET /meta/golfapi).
  * The 08:00 UTC cron is not an HTTP request and does not read the header.
  * /gca/v1/* still serves a missing id while GCA_REQUIRE_INSTALL_ID is off
- * (the default) and counts that request as missingInstallId. When the var
- * is on, the same 401 is returned before any KV read or upstream call.
+ * (the default). missingInstallId counts only an edge-cache miss (a fresh
+ * KV serve, an upstream fetch, a stale serve, or a 404), not an edge hit.
+ * When the var is on, the same 401 is returned before any cache, KV, or
+ * upstream work.
  * CF-Connecting-IP is limited on golfapi once an id is present. The id is
  * spoofable. IPs are stored only as SHA-256 with a fixed prefix, never raw.
  *
@@ -107,6 +109,8 @@ import { applyGcaScorecardCorrection } from "./gca-corrections.js";
  * correction applies to edge, KV, and stale serves. The KV value stays raw.
  * Daily counts (upstream, 429, stale, missingInstallId) live at
  * gca:stats:YYYY-MM-DD for 40 days and are returned by GET /meta/gca.
+ * missingInstallId is an edge-cache miss with no valid install id. An edge
+ * hit does not read or write KV for that count. A valid id is not counted.
  * GCA_REQUIRE_INSTALL_ID is an optional var, default off. No new secrets.
  */
 
@@ -1571,7 +1575,7 @@ async function fetchGcaDurable(apiKey, upstreamUrl) {
   }
 }
 
-async function handleGcaEdgeOnly({ url, rest, env, ctx, cors, apiKey, route }) {
+async function handleGcaEdgeOnly({ url, rest, env, ctx, cors, apiKey, route, missingInstallId }) {
   const upstreamUrl = `${GOLF_VENDORS.gca.upstream}${rest}${url.search}`;
   const cache = edgeCache();
   const cacheKey = new Request(url.toString(), { method: "GET" });
@@ -1582,6 +1586,7 @@ async function handleGcaEdgeOnly({ url, rest, env, ctx, cors, apiKey, route }) {
 
   const day = utcDay(new Date(), 0);
   const boards = env && env.BOARDS;
+  if (missingInstallId) await recordGcaMissingInstall(boards, day);
   let upstream;
   try {
     upstream = await fetch(upstreamUrl, {
@@ -1611,7 +1616,7 @@ async function handleGcaEdgeOnly({ url, rest, env, ctx, cors, apiKey, route }) {
   return response;
 }
 
-async function handleGcaDurable({ kind, id, url, rest, env, ctx, cors, apiKey }) {
+async function handleGcaDurable({ kind, id, url, rest, env, ctx, cors, apiKey, missingInstallId }) {
   const boards = env && env.BOARDS;
   if (!boards || typeof boards.get !== "function" || typeof boards.put !== "function") {
     return golfJson(503, { error: "boards_not_configured" }, cors);
@@ -1633,6 +1638,8 @@ async function handleGcaDurable({ kind, id, url, rest, env, ctx, cors, apiKey })
       if (cached.status === 404) return cached;
     }
   }
+
+  if (missingInstallId) await recordGcaMissingInstall(boards, utcDay(new Date(), 0));
 
   const copy = await readGcaStored(boards, storeKey);
   const nowMs = Date.now();
@@ -1703,17 +1710,15 @@ async function handleGcaDurable({ kind, id, url, rest, env, ctx, cors, apiKey })
 }
 
 async function handleGca(request, url, rest, env, ctx, cors, apiKey) {
-  if (!readInstallId(request)) {
-    if (gcaRequiresInstallId(env)) {
-      return golfJson(401, { error: "install_id_required" }, cors);
-    }
-    await recordGcaMissingInstall(env && env.BOARDS, utcDay(new Date(), 0));
+  const missingInstallId = !readInstallId(request);
+  if (missingInstallId && gcaRequiresInstallId(env)) {
+    return golfJson(401, { error: "install_id_required" }, cors);
   }
   const parsed = parseGcaRest(rest);
   if (parsed.kind === "course" || parsed.kind === "green-centers") {
-    return handleGcaDurable({ kind: parsed.kind, id: parsed.id, url, rest, env, ctx, cors, apiKey });
+    return handleGcaDurable({ kind: parsed.kind, id: parsed.id, url, rest, env, ctx, cors, apiKey, missingInstallId });
   }
-  return handleGcaEdgeOnly({ url, rest, env, ctx, cors, apiKey, route: "search" });
+  return handleGcaEdgeOnly({ url, rest, env, ctx, cors, apiKey, route: "search", missingInstallId });
 }
 
 /**
