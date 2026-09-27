@@ -57,6 +57,7 @@ wrangler secret put GOLFAPI_KEY
 ```
 
 `/gca/` and `/golfapi/` responses omit `Access-Control-Allow-Origin`, including OPTIONS preflight and errors. Share-board routes, `/meta/*`, and `/osm/` still send `Access-Control-Allow-Origin: *`. The phone is React Native, so CORS does not affect it. There is no browser page in this repo that calls `/gca/` or `/golfapi/`.
+Dropping CORS on `/gca/` and `/golfapi/` means the Expo web dev target (`expo start --web` in the app repo) can't load course data through this Worker from a browser. Native iOS and Android builds aren't affected.
 
 JSON errors: `install_id_required` (401), `method_not_allowed` (405), `unknown_route` (404), `not_configured` (503), `boards_not_configured` (503), `upstream_unreachable` (502), `golfapi_limited` (429), `no_course_data` (404 on a repeat of an empty golfapi answer).
 
