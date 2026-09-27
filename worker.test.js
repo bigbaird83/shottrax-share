@@ -1486,6 +1486,131 @@ describe("shottrax-share worker", () => {
     expect(stats().lookups).toBe(2);
   });
 
+  async function searchTokenFor(text) {
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(`shottrax-golfapi-search-v1:${text}`),
+    );
+    return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  function searchPayload(courseID, courseName, left = "70") {
+    return {
+      apiRequestsLeft: left,
+      numCourses: 1,
+      courses: [{ courseID, courseName }],
+    };
+  }
+
+  it("accepts a name= golfapi search, counts it, and serves the repeat from the store", async () => {
+    const calls = [];
+    mockGolfApi(async (url) => {
+      calls.push(url);
+      if (url.includes("name=Oak")) {
+        return jsonResponse(searchPayload("oak", "Oak Marsh"));
+      }
+      if (url.includes("q=Pebble")) return jsonResponse(searchPayload("pebble", "Pebble"));
+      throw new Error(url);
+    });
+
+    const first = await golfGet("/golfapi/v2.3/courses?country=US&name=Oak%20Marsh");
+    expect(first.status).toBe(200);
+    expect(await first.json()).toMatchObject({ courses: [{ courseID: "oak", courseName: "Oak Marsh" }] });
+    expect(calls).toEqual(["https://golfapi.io/api/v2.3/courses?country=US&name=Oak%20Marsh"]);
+    expect(stats().lookups).toBe(1);
+    expect(stats().searches).toBe(1);
+    const oakToken = await searchTokenFor("oak marsh");
+    expect(kv.get(`gapi:search:${oakToken}`)?.opts.expirationTtl).toBe(30 * DAY);
+
+    calls.length = 0;
+    fetchMock.mockClear();
+    const repeat = await golfGet("/golfapi/v2.3/courses?country=US&name=oak%20marsh");
+    expect(repeat.status).toBe(200);
+    expect(await repeat.json()).toMatchObject({ courses: [{ courseID: "oak" }] });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(stats().lookups).toBe(1);
+    expect(stats().searches).toBe(1);
+    expect(stats().hits).toBe(1);
+
+    const preferred = await golfGet("/golfapi/v2.3/courses?name=Oak%20Marsh&q=other");
+    expect(preferred.status).toBe(200);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(stats().hits).toBe(2);
+
+    const byQ = await golfGet("/golfapi/v2.3/courses?q=Pebble");
+    expect(byQ.status).toBe(200);
+    expect(calls).toEqual(["https://golfapi.io/api/v2.3/courses?q=Pebble"]);
+    expect(stats().lookups).toBe(1);
+    expect(stats().searches).toBe(2);
+    expect(kv.has(`gapi:search:${await searchTokenFor("pebble")}`)).toBe(true);
+
+    const blankName = await golfGet("/golfapi/v2.3/courses?name=%20&q=Pebble");
+    expect(blankName.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(stats().hits).toBe(3);
+
+    for (const path of [
+      "/golfapi/v2.3/courses",
+      "/golfapi/v2.3/courses?country=US",
+      "/golfapi/v2.3/courses?name=",
+      "/golfapi/v2.3/courses?name=%20&q=",
+    ]) {
+      const missing = await golfGet(path);
+      expect(missing.status, path).toBe(404);
+      expect(await missing.json()).toEqual({ error: "unknown_route" });
+    }
+    expect(stats().searches).toBe(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("queues a limited name= search and the drain replays name=", async () => {
+    const searchEnv = { ...env, GOLFAPI_DEVICE_DAY: "1" };
+    mockGolfApi(async (url) => {
+      if (!url.includes("/courses?")) throw new Error(url);
+      return jsonResponse(searchPayload("x", "Somewhere", "70"));
+    });
+    expect((await golfGet("/golfapi/v2.3/courses?name=one", { env: searchEnv })).status).toBe(200);
+    expect((await golfGet("/golfapi/v2.3/courses?name=two", { env: searchEnv })).status).toBe(200);
+    expect((await golfGet("/golfapi/v2.3/courses?q=three", { env: searchEnv })).status).toBe(200);
+    expect(stats().lookups).toBe(1);
+    expect(stats().searches).toBe(3);
+
+    const blocked = await golfGet("/golfapi/v2.3/courses?country=US&name=Oak%20Marsh", { env: searchEnv });
+    const body = await blocked.json();
+    expect(blocked.status).toBe(429);
+    expect(body.reason).toBe("search_device_day");
+    expect(body.queued).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const queued = [...kv.keys()].filter((key) => key.startsWith("gqueue:q:"));
+    expect(queued).toEqual([`gqueue:q:${await searchTokenFor("oak marsh")}`]);
+    expect(JSON.parse(kv.get(queued[0]).value)).toMatchObject({
+      attempts: 0,
+      q: "oak marsh",
+      search: "?country=US&name=Oak%20Marsh",
+    });
+
+    const calls = [];
+    mockGolfApi(async (url) => {
+      calls.push(url);
+      if (url.includes("/courses?")) {
+        return jsonResponse(searchPayload("oak", "Oak Marsh", "30"));
+      }
+      if (url.endsWith("/courses/oak")) return jsonResponse(coursePayload("oak", 28));
+      if (url.endsWith("/coordinates/oak")) return jsonResponse(coordPayload("oak", 27));
+      throw new Error(url);
+    });
+    await runDrain(searchEnv);
+    expect(calls).toEqual([
+      "https://golfapi.io/api/v2.3/courses?country=US&name=Oak%20Marsh",
+      "https://golfapi.io/api/v2.3/courses/oak",
+      "https://golfapi.io/api/v2.3/coordinates/oak",
+    ]);
+    expect(kv.has(queued[0])).toBe(false);
+    expect(kv.get(`gapi:search:${await searchTokenFor("oak marsh")}`)?.opts.expirationTtl).toBe(30 * DAY);
+    expect(kv.has("gapi:course:oak")).toBe(true);
+    expect(kv.has("gapi:coord:oak")).toBe(true);
+  });
+
   it("does not open a set when the search is already stored", async () => {
     const digest = await crypto.subtle.digest(
       "SHA-256",
