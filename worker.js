@@ -1,4 +1,4 @@
-import { GCA_CORRECTIONS, applyGcaScorecardCorrection } from "./gca-corrections.js";
+import { applyGcaScorecardCorrection } from "./gca-corrections.js";
 
 /**
  * Golf vendor proxy, inlined from ShotTraxx worker-golf-proxy.js.
@@ -10,12 +10,15 @@ import { GCA_CORRECTIONS, applyGcaScorecardCorrection } from "./gca-corrections.
  *   GET /golfapi/v2.3/courses/{id}              → golfapi.io/api/v2.3/
  *   GET /golfapi/v2.3/coordinates/{id}          → golfapi.io/api/v2.3/
  *   GET /meta/golfapi                           → quota snapshot, no secrets
+ *   GET /meta/gca                               → GCA call / 429 / stale counts
  *
  * Any other /golfapi/ path is 404. The API key is the GOLFAPI_KEY secret only.
  *
  * Successful JSON for a listed `/gca/v1/courses/{id}` is filled from
- * gca-corrections.js after an edge-cache hit and after a fresh upstream read.
+ * gca-corrections.js in presentGcaCourseBody, once, on the way out: an
+ * edge-cache hit, a fresh upstream read, a fresh KV copy, and a stale KV copy.
  * Search, list, green-centers, and golfapi bodies are returned unchanged.
+ * KV and the edge cache keep the raw upstream body.
  *
  * OSM overlay proxy also runs before board-key parsing. The Worker builds the
  * Overpass query itself (clients never send Overpass QL):
@@ -78,7 +81,20 @@ import { GCA_CORRECTIONS, applyGcaScorecardCorrection } from "./gca-corrections.
  * about one write per second, so a burst can overshoot by 1–2. The global
  * daily cap and the balance floor are the backstop. A Durable Object could
  * make this exact later. Public GET/PUT/DELETE cannot read or write gq:,
- * gapi:, gqueue:, or osm: keys.
+ * gapi:, gqueue:, gca:, or osm: keys.
+ *
+ * GCA search stays edge-only for 24 hours. courses/{id} and
+ * courses/{id}/green-centers keep the raw upstream body in BOARDS for a year
+ * (gca:course:{id}, gca:greens:{id}) with metadata { status: 200, storedAt }.
+ * Read order is the edge cache, then KV. A copy younger than GCA_REFRESH_DAYS
+ * (default 30) is served with no upstream call and re-warms the edge cache.
+ * An older copy is refreshed: a 2xx overwrites KV and the edge cache; a 429,
+ * 5xx, timeout, or thrown fetch serves that copy with X-Course-Data-Stale: 1
+ * and X-Course-Data-Age (seconds). Error bodies are never written to KV.
+ * presentGcaCourseBody is the only response-time transform, so a scorecard
+ * correction applies to edge, KV, and stale serves. The KV value stays raw.
+ * Daily counts (upstream, 429, stale) live at gca:stats:YYYY-MM-DD for 40 days
+ * and are returned by GET /meta/gca. No new secrets.
  */
 
 const OVERPASS_PRIMARY = "https://overpass-api.de/api/interpreter";
@@ -127,6 +143,19 @@ const GOLF_VENDORS = {
 
 /** Edge cache for successful reads. Course data changes rarely; golfapi is paid per call. */
 const GOLF_CACHE_SECONDS = 60 * 60 * 24;
+/** Durable GCA courses/{id} and green-centers bodies. Same horizon as golfapi. */
+const GCA_STORE_TTL = 60 * 60 * 24 * 365;
+/** Hung GCA course fetches abort here so a stored copy can still be served. */
+const GCA_UPSTREAM_MS = 15000;
+/** Optional negative edge cache for a GCA 404 when nothing is stored in KV. */
+const GCA_NEGATIVE_TTL = 300;
+const GCA_REFRESH_DAYS_DEFAULT = 30;
+const GCA_RATE_HEADERS = new Set([
+  "x-ratelimit-limit",
+  "x-ratelimit-remaining",
+  "x-ratelimit-reset",
+  "retry-after",
+]);
 /** Durable courses/{id} and coordinates/{id} bodies. Same horizon as the paint cache. */
 const GOLFAPI_STORE_TTL = 60 * 60 * 24 * 365;
 /** Device/IP buckets cover a month plus a little, so a late read still sees that month. */
@@ -147,7 +176,7 @@ const GOLFAPI_LATENCY_KINDS = ["search", "course", "coordinates"];
 const GOLFAPI_IP_PREFIX = "shottrax-golfapi-ip-v1:";
 const GOLFAPI_SEARCH_PREFIX = "shottrax-golfapi-search-v1:";
 const GOLFAPI_BALANCE_KEY = "gq:balance";
-const RESERVED_BOARD_PREFIXES = ["osm:", "gq:", "gapi:", "gqueue:"];
+const RESERVED_BOARD_PREFIXES = ["osm:", "gq:", "gapi:", "gqueue:", "gca:"];
 const GOLFAPI_REASONS = [
   "device_day",
   "device_week",
@@ -171,6 +200,11 @@ function readConfigInt(value) {
     if (Number.isSafeInteger(parsed) && parsed <= 1_000_000) return parsed;
   }
   return null;
+}
+
+function readGcaRefreshDays(env) {
+  const parsed = readConfigInt(env && env.GCA_REFRESH_DAYS);
+  return parsed == null ? GCA_REFRESH_DAYS_DEFAULT : parsed;
 }
 
 function readGolfapiLimits(env) {
@@ -511,6 +545,52 @@ async function bumpStats(boards, day, mutate) {
   mutate(stats);
   await putCounter(boards, key, JSON.stringify(stats), { expirationTtl: GOLFAPI_STATS_TTL });
   return stats;
+}
+
+function blankGcaStats() {
+  return { upstream: 0, rateLimited: 0, stale: 0 };
+}
+
+async function readGcaStats(boards, key) {
+  const stats = blankGcaStats();
+  const raw = await boards.get(key);
+  if (typeof raw !== "string" || !raw) return stats;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!isPlainObject(parsed)) return stats;
+    stats.upstream = clampCount(parsed.upstream);
+    stats.rateLimited = clampCount(parsed.rateLimited);
+    stats.stale = clampCount(parsed.stale);
+  } catch {
+    return blankGcaStats();
+  }
+  return stats;
+}
+
+async function bumpGcaStats(boards, day, mutate) {
+  const key = `gca:stats:${day}`;
+  const stats = await readGcaStats(boards, key);
+  mutate(stats);
+  await putCounter(boards, key, JSON.stringify(stats), { expirationTtl: GOLFAPI_STATS_TTL });
+  return stats;
+}
+
+function gcaStatsView(date, stats) {
+  return {
+    date,
+    upstream: clampCount(stats && stats.upstream),
+    rateLimited: clampCount(stats && stats.rateLimited),
+    stale: clampCount(stats && stats.stale),
+  };
+}
+
+async function recordGcaUpstream(boards, day, { status, stale }) {
+  if (!boards || typeof boards.get !== "function" || typeof boards.put !== "function") return;
+  await bumpGcaStats(boards, day, (stats) => {
+    stats.upstream += 1;
+    if (status === 429) stats.rateLimited += 1;
+    if (stale) stats.stale += 1;
+  });
 }
 
 function emptyBlocked() {
@@ -1276,6 +1356,26 @@ async function handleGolfapiMeta(request, env, cors) {
   }, cors);
 }
 
+async function handleGcaMeta(request, env, cors) {
+  if (request.method !== "GET") return golfJson(405, { error: "method_not_allowed" }, cors);
+  const boards = env && env.BOARDS;
+  if (!boards || typeof boards.get !== "function") {
+    return golfJson(503, { error: "boards_not_configured" }, cors);
+  }
+  const now = new Date();
+  const days = [];
+  for (let offset = -29; offset <= 0; offset += 1) {
+    const date = utcDay(now, offset);
+    days.push(gcaStatsView(date, await readGcaStats(boards, `gca:stats:${date}`)));
+  }
+  return golfJson(200, {
+    refreshDays: readGcaRefreshDays(env),
+    generatedAt: now.toISOString(),
+    today: days[days.length - 1],
+    days,
+  }, cors);
+}
+
 function golfJson(status, body, cors, extra) {
   return new Response(JSON.stringify(body), {
     status,
@@ -1298,52 +1398,261 @@ function matchGolfVendor(pathname) {
   return null;
 }
 
-/** Listed GCA course detail only. Search, green-centers, and golfapi stay null. */
-function gcaListedCourseId(hit) {
-  if (hit.vendor !== GOLF_VENDORS.gca) return null;
-  const match = /^courses\/([^/]+)$/.exec(hit.rest);
-  if (!match || !Object.hasOwn(GCA_CORRECTIONS, match[1])) return null;
-  return match[1];
-}
-
 function isJsonContentType(value) {
   const media = String(value ?? "").split(";")[0].trim().toLowerCase();
   return media === "application/json" || media.endsWith("+json");
 }
 
-function replayGolfBody(response, raw) {
-  return new Response(raw, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
+function safeGcaId(raw) {
+  if (typeof raw !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(raw)) return null;
+  return raw;
+}
+
+/** Search stays edge-only. Course and green-centers are the durable reads. */
+function parseGcaRest(rest) {
+  if (rest === "courses") return { kind: "search" };
+  let match = /^courses\/([^/]+)\/green-centers$/.exec(rest);
+  if (match) {
+    const id = safeGcaId(match[1]);
+    return id ? { kind: "green-centers", id } : { kind: "search" };
+  }
+  match = /^courses\/([^/]+)$/.exec(rest);
+  if (match) {
+    const id = safeGcaId(match[1]);
+    return id ? { kind: "course", id } : { kind: "search" };
+  }
+  return { kind: "search" };
+}
+
+function gcaStoreKey(kind, id) {
+  return kind === "green-centers" ? `gca:greens:${id}` : `gca:course:${id}`;
+}
+
+function gcaRateHeaderValues(headers) {
+  const values = {};
+  if (!headers || typeof headers.forEach !== "function") return values;
+  headers.forEach((value, name) => {
+    const lower = String(name).toLowerCase();
+    if (!GCA_RATE_HEADERS.has(lower) && !lower.startsWith("ratelimit-")) return;
+    const text = String(value);
+    values[lower] = text.length > 200 ? text.slice(0, 200) : text;
   });
+  return values;
+}
+
+function logGcaRateLimit(kind, status, headers) {
+  const rates = gcaRateHeaderValues(headers);
+  if (status !== 429 && Object.keys(rates).length === 0) return;
+  console.log(JSON.stringify({ route: kind, status, ...rates }));
 }
 
 /**
- * Fill a listed course body on the way out. The edge cache keeps the upstream
- * bytes, so a body stored before this layer still gets the correction.
+ * Only response-time transform for a durable GCA body. Called once per
+ * client response. KV and the edge cache keep the raw upstream bytes.
+ * Fill-only scorecard corrections run here for courses/{id}.
  */
-async function finishGolfCourse(response, courseId) {
-  if (!courseId) return response;
-  if (response.status < 200 || response.status >= 300) return response;
-  if (!isJsonContentType(response.headers.get("Content-Type"))) return response;
-
-  const raw = await response.text();
+export function presentGcaCourseBody(kind, courseId, rawBody, contentType) {
+  if (kind !== "course") return rawBody;
+  if (contentType != null && contentType !== "" && !isJsonContentType(contentType)) return rawBody;
   let payload;
   try {
-    payload = JSON.parse(raw);
+    payload = JSON.parse(rawBody);
   } catch {
-    return replayGolfBody(response, raw);
+    return rawBody;
   }
-  if (!applyGcaScorecardCorrection(payload, courseId)) return replayGolfBody(response, raw);
+  if (!applyGcaScorecardCorrection(payload, courseId)) return rawBody;
+  return JSON.stringify(payload);
+}
 
-  const headers = new Headers(response.headers);
-  headers.delete("Content-Length");
-  return new Response(JSON.stringify(payload), {
-    status: response.status,
-    statusText: response.statusText,
-    headers,
+function gcaClientResponse(kind, courseId, rawBody, cors, { maxAge, stale, ageSeconds, contentType } = {}) {
+  const body = presentGcaCourseBody(kind, courseId, rawBody, contentType);
+  const headers = {
+    ...cors,
+    "Content-Type": contentType || "application/json",
+    "Cache-Control": maxAge ? `public, max-age=${maxAge}` : "no-store",
+  };
+  if (stale) {
+    headers["X-Course-Data-Stale"] = "1";
+    if (Number.isInteger(ageSeconds) && ageSeconds >= 0) headers["X-Course-Data-Age"] = String(ageSeconds);
+  }
+  return new Response(body, { status: 200, headers });
+}
+
+function gcaRawEdgeResponse(rawBody, cors, contentType) {
+  return new Response(rawBody, {
+    status: 200,
+    headers: {
+      ...cors,
+      "Content-Type": contentType || "application/json",
+      "Cache-Control": `public, max-age=${GOLF_CACHE_SECONDS}`,
+    },
   });
+}
+
+async function readGcaStored(boards, key) {
+  if (!boards || typeof boards.getWithMetadata !== "function") return null;
+  const row = await boards.getWithMetadata(key);
+  if (!row || typeof row.value !== "string" || row.value.length === 0) return null;
+  const metadata = row.metadata;
+  if (!isPlainObject(metadata) || metadata.status !== 200) return null;
+  if (typeof metadata.storedAt !== "number" || !Number.isFinite(metadata.storedAt)) return null;
+  return { body: row.value, storedAt: metadata.storedAt };
+}
+
+async function fetchGcaDurable(apiKey, upstreamUrl) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), GCA_UPSTREAM_MS);
+  try {
+    const response = await fetch(upstreamUrl, {
+      headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
+      signal: controller.signal,
+    });
+    const body = await response.arrayBuffer();
+    return { thrown: false, response, body };
+  } catch {
+    return { thrown: true, response: null, body: null };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function handleGcaEdgeOnly({ url, rest, env, ctx, cors, apiKey, route }) {
+  const upstreamUrl = `${GOLF_VENDORS.gca.upstream}${rest}${url.search}`;
+  const cache = edgeCache();
+  const cacheKey = new Request(url.toString(), { method: "GET" });
+  if (cache && typeof cache.match === "function") {
+    const cached = await cache.match(cacheKey);
+    if (cached) return cached;
+  }
+
+  const day = utcDay(new Date(), 0);
+  const boards = env && env.BOARDS;
+  let upstream;
+  try {
+    upstream = await fetch(upstreamUrl, {
+      headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
+    });
+  } catch {
+    await recordGcaUpstream(boards, day, { status: null, stale: false });
+    return golfJson(502, { error: "upstream_unreachable" }, cors);
+  }
+
+  logGcaRateLimit(route, upstream.status, upstream.headers);
+  await recordGcaUpstream(boards, day, { status: upstream.status, stale: false });
+  const body = await upstream.arrayBuffer();
+  const ok = upstream.status >= 200 && upstream.status < 300;
+  const response = new Response(body, {
+    status: upstream.status,
+    headers: {
+      ...cors,
+      "Content-Type": upstream.headers.get("Content-Type") ?? "application/json",
+      "Cache-Control": ok ? `public, max-age=${GOLF_CACHE_SECONDS}` : "no-store",
+    },
+  });
+  if (ok) {
+    const put = rememberGolfEdge(cache, ctx, cacheKey, response);
+    if (put) await put;
+  }
+  return response;
+}
+
+async function handleGcaDurable({ kind, id, url, rest, env, ctx, cors, apiKey }) {
+  const boards = env && env.BOARDS;
+  if (!boards || typeof boards.get !== "function" || typeof boards.put !== "function") {
+    return golfJson(503, { error: "boards_not_configured" }, cors);
+  }
+
+  const storeKey = gcaStoreKey(kind, id);
+  const cache = edgeCache();
+  const cacheKey = new Request(url.toString(), { method: "GET" });
+  if (cache && typeof cache.match === "function") {
+    const cached = await cache.match(cacheKey);
+    if (cached) {
+      if (cached.status >= 200 && cached.status < 300) {
+        const raw = await cached.text();
+        return gcaClientResponse(kind, id, raw, cors, {
+          maxAge: GOLF_CACHE_SECONDS,
+          contentType: cached.headers.get("Content-Type") || "application/json",
+        });
+      }
+      if (cached.status === 404) return cached;
+    }
+  }
+
+  const copy = await readGcaStored(boards, storeKey);
+  const nowMs = Date.now();
+  if (copy && nowMs - copy.storedAt < readGcaRefreshDays(env) * 24 * 60 * 60 * 1000) {
+    const response = gcaClientResponse(kind, id, copy.body, cors, { maxAge: GOLF_CACHE_SECONDS });
+    const put = rememberGolfEdge(cache, ctx, cacheKey, gcaRawEdgeResponse(copy.body, cors));
+    if (put) await put;
+    return response;
+  }
+
+  const outcome = await fetchGcaDurable(apiKey, `${GOLF_VENDORS.gca.upstream}${rest}${url.search}`);
+  const day = utcDay(new Date(), 0);
+  const status = outcome.response ? outcome.response.status : null;
+  if (outcome.response) logGcaRateLimit(kind, status, outcome.response.headers);
+
+  const upstreamFailed = outcome.thrown || status === 429 || (typeof status === "number" && status >= 500);
+  if (upstreamFailed && copy) {
+    await recordGcaUpstream(boards, day, { status, stale: true });
+    const ageSeconds = Math.max(0, Math.floor((Date.now() - copy.storedAt) / 1000));
+    return gcaClientResponse(kind, id, copy.body, cors, { stale: true, ageSeconds });
+  }
+
+  await recordGcaUpstream(boards, day, { status, stale: false });
+  if (outcome.thrown) return golfJson(502, { error: "upstream_unreachable" }, cors);
+
+  if (status === 429) {
+    const retry = cleanRetryAfter(outcome.response.headers.get("Retry-After")) || "30";
+    return golfJson(429, { error: "rate_limited" }, cors, { "Retry-After": retry });
+  }
+
+  const text = new TextDecoder().decode(outcome.body);
+  if (status >= 200 && status < 300) {
+    const contentType = outcome.response.headers.get("Content-Type") || "application/json";
+    await boards.put(storeKey, text, {
+      expirationTtl: GCA_STORE_TTL,
+      metadata: { status: 200, storedAt: Date.now() },
+    });
+    const response = gcaClientResponse(kind, id, text, cors, { maxAge: GOLF_CACHE_SECONDS, contentType });
+    const put = rememberGolfEdge(cache, ctx, cacheKey, gcaRawEdgeResponse(text, cors, contentType));
+    if (put) await put;
+    return response;
+  }
+
+  if (status === 404) {
+    const notFound = new Response(outcome.body, {
+      status: 404,
+      headers: {
+        ...cors,
+        "Content-Type": outcome.response.headers.get("Content-Type") ?? "application/json",
+        "Cache-Control": copy ? "no-store" : `public, max-age=${GCA_NEGATIVE_TTL}`,
+      },
+    });
+    if (!copy) {
+      const put = rememberGolfEdge(cache, ctx, cacheKey, notFound);
+      if (put) await put;
+    }
+    return notFound;
+  }
+
+  return new Response(outcome.body, {
+    status,
+    headers: {
+      ...cors,
+      "Content-Type": outcome.response.headers.get("Content-Type") ?? "application/json",
+      "Cache-Control": "no-store",
+    },
+  });
+}
+
+async function handleGca(url, rest, env, ctx, cors, apiKey) {
+  const parsed = parseGcaRest(rest);
+  if (parsed.kind === "course" || parsed.kind === "green-centers") {
+    return handleGcaDurable({ kind: parsed.kind, id: parsed.id, url, rest, env, ctx, cors, apiKey });
+  }
+  return handleGcaEdgeOnly({ url, rest, env, ctx, cors, apiKey, route: "search" });
 }
 
 /**
@@ -1362,41 +1671,7 @@ async function handleGolfProxy(request, env, ctx, cors) {
   if (hit.vendor.secret === "GOLFAPI_KEY") {
     return handleGolfapi(request, url, hit.rest, env, ctx, cors);
   }
-
-  const courseId = gcaListedCourseId(hit);
-  const upstreamUrl = `${hit.vendor.upstream}${hit.rest}${url.search}`;
-  const cache = typeof caches !== "undefined" ? caches.default : null;
-  const cacheKey = new Request(url.toString(), { method: "GET" });
-  if (cache) {
-    const cached = await cache.match(cacheKey);
-    if (cached) return finishGolfCourse(cached, courseId);
-  }
-
-  let upstream;
-  try {
-    upstream = await fetch(upstreamUrl, {
-      headers: { Accept: "application/json", Authorization: `Bearer ${key}` },
-    });
-  } catch {
-    return golfJson(502, { error: "upstream_unreachable" }, cors);
-  }
-
-  const body = await upstream.arrayBuffer();
-  const ok = upstream.status >= 200 && upstream.status < 300;
-  const response = new Response(body, {
-    status: upstream.status,
-    headers: {
-      ...cors,
-      "Content-Type": upstream.headers.get("Content-Type") ?? "application/json",
-      "Cache-Control": ok ? `public, max-age=${GOLF_CACHE_SECONDS}` : "no-store",
-    },
-  });
-  if (ok && cache) {
-    const put = cache.put(cacheKey, response.clone());
-    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(put);
-    else await put;
-  }
-  return finishGolfCourse(response, courseId);
+  return handleGca(url, hit.rest, env, ctx, cors, key);
 }
 
 /**
@@ -2006,6 +2281,9 @@ export default {
     if (requestUrl.pathname === "/meta/golfapi") {
       return handleGolfapiMeta(request, env, cors);
     }
+    if (requestUrl.pathname === "/meta/gca") {
+      return handleGcaMeta(request, env, cors);
+    }
 
     const golf = await handleGolfProxy(request, env, ctx, cors);
     if (golf) return golf;
@@ -2018,7 +2296,7 @@ export default {
     if (!key || key.length > 180) {
       return new Response("bad key", { status: 400, headers: cors });
     }
-    // Overlay, golfapi counters, the course store, and the refill queue share BOARDS.
+    // Overlay, golfapi counters, the course store, GCA copies, and the refill queue share BOARDS.
     // Public board routes must not read, replace, or delete those keys.
     if ((request.method === "GET" || request.method === "PUT" || request.method === "DELETE") && isReservedBoardKey(key)) {
       return new Response("bad key", { status: 400, headers: cors });

@@ -33,3 +33,5 @@ crons = ["0 8 * * *"]
 # A search + course + coordinates set stays open for 15 minutes.
 # Fresh searches are also capped at 3x GOLFAPI_DEVICE_DAY per device per day.
 # GOLFAPI_SEARCH_* vars are not read.
+# GCA course and green-centers copies refresh after this many days. Default 30.
+# GCA_REFRESH_DAYS = "30"
