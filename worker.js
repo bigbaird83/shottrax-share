@@ -62,9 +62,19 @@ import { applyGcaScorecardCorrection } from "./gca-corrections.js";
  * They are counted on their own as allowlistedLookups. The ids are never
  * returned by /meta/golfapi.
  *
- * Identity: header X-Install-Id (8–64 chars of [A-Za-z0-9_-], else ignored)
- * and CF-Connecting-IP. Both are enforced when present; the install id is
+ * Identity: header X-Install-Id (8–64 chars of [A-Za-z0-9_-]).
+ * /golfapi/v2.3/* requires a valid id. Missing or invalid is 401
+ * {error:"install_id_required"} with no upstream call and no counter or
+ * queue write except blocked.install_id_required (GET /meta/golfapi).
+ * The 08:00 UTC cron is not an HTTP request and does not read the header.
+ * /gca/v1/* still serves a missing id while GCA_REQUIRE_INSTALL_ID is off
+ * (the default) and counts that request as missingInstallId. When the var
+ * is on, the same 401 is returned before any KV read or upstream call.
+ * CF-Connecting-IP is limited on golfapi once an id is present. The id is
  * spoofable. IPs are stored only as SHA-256 with a fixed prefix, never raw.
+ *
+ * /gca/ and /golfapi/ responses do not send Access-Control-Allow-Origin,
+ * including OPTIONS and errors. Share boards, /meta/*, and /osm/ still send *.
  *
  * Over a limit the phone gets 429 {error:"golfapi_limited", reason, queued,
  * retryAfterSec} and Retry-After. The app already falls back to free + GCA
@@ -95,8 +105,9 @@ import { applyGcaScorecardCorrection } from "./gca-corrections.js";
  * and X-Course-Data-Age (seconds). Error bodies are never written to KV.
  * presentGcaCourseBody is the only response-time transform, so a scorecard
  * correction applies to edge, KV, and stale serves. The KV value stays raw.
- * Daily counts (upstream, 429, stale) live at gca:stats:YYYY-MM-DD for 40 days
- * and are returned by GET /meta/gca. No new secrets.
+ * Daily counts (upstream, 429, stale, missingInstallId) live at
+ * gca:stats:YYYY-MM-DD for 40 days and are returned by GET /meta/gca.
+ * GCA_REQUIRE_INSTALL_ID is an optional var, default off. No new secrets.
  */
 
 const OVERPASS_PRIMARY = "https://overpass-api.de/api/interpreter";
@@ -189,6 +200,7 @@ const GOLFAPI_REASONS = [
   "global_day",
   "floor",
   "search_device_day",
+  "install_id_required",
 ];
 
 function isReservedBoardKey(key) {
@@ -207,6 +219,15 @@ function readConfigInt(value) {
 function readGcaRefreshDays(env) {
   const parsed = readConfigInt(env && env.GCA_REFRESH_DAYS);
   return parsed == null ? GCA_REFRESH_DAYS_DEFAULT : parsed;
+}
+
+/** Off unless the var is 1, true, yes, or on. Installed builds omit the GCA header. */
+function gcaRequiresInstallId(env) {
+  const raw = env && env.GCA_REQUIRE_INSTALL_ID;
+  if (raw === true) return true;
+  if (typeof raw !== "string") return false;
+  const text = raw.trim().toLowerCase();
+  return text === "1" || text === "true" || text === "yes" || text === "on";
 }
 
 function readGolfapiLimits(env) {
@@ -562,7 +583,7 @@ async function bumpStats(boards, day, mutate) {
 }
 
 function blankGcaStats() {
-  return { upstream: 0, rateLimited: 0, stale: 0 };
+  return { upstream: 0, rateLimited: 0, stale: 0, missingInstallId: 0 };
 }
 
 async function readGcaStats(boards, key) {
@@ -575,6 +596,7 @@ async function readGcaStats(boards, key) {
     stats.upstream = clampCount(parsed.upstream);
     stats.rateLimited = clampCount(parsed.rateLimited);
     stats.stale = clampCount(parsed.stale);
+    stats.missingInstallId = clampCount(parsed.missingInstallId);
   } catch {
     return blankGcaStats();
   }
@@ -595,6 +617,7 @@ function gcaStatsView(date, stats) {
     upstream: clampCount(stats && stats.upstream),
     rateLimited: clampCount(stats && stats.rateLimited),
     stale: clampCount(stats && stats.stale),
+    missingInstallId: clampCount(stats && stats.missingInstallId),
   };
 }
 
@@ -604,6 +627,23 @@ async function recordGcaUpstream(boards, day, { status, stale }) {
     stats.upstream += 1;
     if (status === 429) stats.rateLimited += 1;
     if (stale) stats.stale += 1;
+  });
+}
+
+async function recordGcaMissingInstall(boards, day) {
+  if (!boards || typeof boards.get !== "function" || typeof boards.put !== "function") return;
+  await bumpGcaStats(boards, day, (stats) => {
+    stats.missingInstallId += 1;
+  });
+}
+
+/** The only write for a golfapi call that has no valid X-Install-Id. */
+async function noteGolfapiInstallRequired(env) {
+  const boards = env && env.BOARDS;
+  if (!boards || typeof boards.get !== "function" || typeof boards.put !== "function") return;
+  const day = golfapiPeriods(new Date()).day;
+  await bumpStats(boards, day, (stats) => {
+    stats.blocked.install_id_required = clampCount(stats.blocked.install_id_required) + 1;
   });
 }
 
@@ -1662,7 +1702,13 @@ async function handleGcaDurable({ kind, id, url, rest, env, ctx, cors, apiKey })
   });
 }
 
-async function handleGca(url, rest, env, ctx, cors, apiKey) {
+async function handleGca(request, url, rest, env, ctx, cors, apiKey) {
+  if (!readInstallId(request)) {
+    if (gcaRequiresInstallId(env)) {
+      return golfJson(401, { error: "install_id_required" }, cors);
+    }
+    await recordGcaMissingInstall(env && env.BOARDS, utcDay(new Date(), 0));
+  }
   const parsed = parseGcaRest(rest);
   if (parsed.kind === "course" || parsed.kind === "green-centers") {
     return handleGcaDurable({ kind: parsed.kind, id: parsed.id, url, rest, env, ctx, cors, apiKey });
@@ -1674,10 +1720,29 @@ async function handleGca(url, rest, env, ctx, cors, apiKey) {
  * Response for a golf proxy route, or null so the caller falls through to
  * share-board GET/PUT /{code}.
  */
+function responseWithoutAllowOrigin(response) {
+  if (!response.headers.has("Access-Control-Allow-Origin")) return response;
+  const headers = new Headers(response.headers);
+  headers.delete("Access-Control-Allow-Origin");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 async function handleGolfProxy(request, env, ctx, cors) {
   const url = new URL(request.url);
   const hit = matchGolfVendor(url.pathname);
   if (!hit) return null;
+  if (hit.vendor.secret === "GOLFAPI_KEY") {
+    if (!readInstallId(request)) {
+      await noteGolfapiInstallRequired(env);
+      return golfJson(401, { error: "install_id_required" }, cors);
+    }
+  } else if (!readInstallId(request) && gcaRequiresInstallId(env)) {
+    return golfJson(401, { error: "install_id_required" }, cors);
+  }
   if (request.method !== "GET") return golfJson(405, { error: "method_not_allowed" }, cors);
   if (hit.rest == null) return golfJson(404, { error: "unknown_route" }, cors);
 
@@ -1686,7 +1751,7 @@ async function handleGolfProxy(request, env, ctx, cors) {
   if (hit.vendor.secret === "GOLFAPI_KEY") {
     return handleGolfapi(request, url, hit.rest, env, ctx, cors);
   }
-  return handleGca(url, hit.rest, env, ctx, cors, key);
+  return handleGca(request, url, hit.rest, env, ctx, cors, key);
 }
 
 /**
@@ -2281,18 +2346,24 @@ async function handleOsmOverlay(request, env, ctx, cors) {
   }
 }
 
+function corsHeaders(pathname) {
+  const headers = {
+    "Access-Control-Allow-Methods": "GET,PUT,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, X-Install-Id",
+  };
+  if (!pathname.startsWith("/gca/") && !pathname.startsWith("/golfapi/")) {
+    headers["Access-Control-Allow-Origin"] = "*";
+  }
+  return headers;
+}
+
 export default {
   async fetch(request, env, ctx) {
-    const cors = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET,PUT,OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, X-Install-Id",
-    };
+    const requestUrl = new URL(request.url);
+    const cors = corsHeaders(requestUrl.pathname);
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: cors });
     }
-
-    const requestUrl = new URL(request.url);
     if (requestUrl.pathname === "/meta/golfapi") {
       return handleGolfapiMeta(request, env, cors);
     }
@@ -2301,7 +2372,7 @@ export default {
     }
 
     const golf = await handleGolfProxy(request, env, ctx, cors);
-    if (golf) return golf;
+    if (golf) return responseWithoutAllowOrigin(golf);
 
     const osm = await handleOsmOverlay(request, env, ctx, cors);
     if (osm) return osm;
