@@ -35,3 +35,7 @@ crons = ["0 8 * * *"]
 # GOLFAPI_SEARCH_* vars are not read.
 # GCA course and green-centers copies refresh after this many days. Default 30.
 # GCA_REFRESH_DAYS = "30"
+# Require X-Install-Id on /gca/v1/*. Leave unset. Installed builds do not send
+# the header on GCA, so turning this on would reject them. While it is off,
+# those calls are counted as missingInstallId on GET /meta/gca.
+# GCA_REQUIRE_INSTALL_ID = "true"

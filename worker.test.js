@@ -828,7 +828,9 @@ describe("shottrax-share worker", () => {
       expect(init.headers.Authorization).toBe("Bearer golf-secret");
       return new Response('{"ok":true}', { status: 200, headers: { "Content-Type": "application/json" } });
     });
-    const golfapi = await invoke(`${ORIGIN}/golfapi/v2.3/coordinates/abc`);
+    const golfapi = await invoke(`${ORIGIN}/golfapi/v2.3/coordinates/abc`, {
+      headers: { "X-Install-Id": "install-0001" },
+    });
     expect(golfapi.status).toBe(200);
     expect(await golfapi.json()).toEqual({ ok: true });
 
@@ -841,7 +843,10 @@ describe("shottrax-share worker", () => {
     expect(unknown.status).toBe(404);
     expect(await unknown.json()).toEqual({ error: "unknown_route" });
 
-    const unconfigured = await invoke(`${ORIGIN}/golfapi/v2.3/courses`, { env: { BOARDS: env.BOARDS } });
+    const unconfigured = await invoke(`${ORIGIN}/golfapi/v2.3/courses`, {
+      env: { BOARDS: env.BOARDS },
+      headers: { "X-Install-Id": "install-0001" },
+    });
     expect(unconfigured.status).toBe(503);
     expect(await unconfigured.json()).toEqual({ error: "not_configured" });
 
@@ -1022,38 +1027,19 @@ describe("shottrax-share worker", () => {
     expect(monthBody.queued).toBe(true);
   });
 
-  it("applies the IP limit with no install id and across spoofed install ids", async () => {
+  it("applies the IP limit across spoofed install ids", async () => {
     mockGolfApi(async (url) => jsonResponse(coursePayload(url.split("/").pop())));
     const tight = { ...env, GOLFAPI_DEVICE_DAY: "1" };
-    expect((await golfGet("/golfapi/v2.3/courses/ip1", { install: null, env: tight })).status).toBe(200);
-    expect((await golfGet("/golfapi/v2.3/courses/ip2", { install: null, env: tight })).status).toBe(200);
-    const third = await golfGet("/golfapi/v2.3/courses/ip3", { install: null, env: tight });
-    const body = await third.json();
-    expect(third.status).toBe(429);
-    expect(body.reason).toBe("ip_day");
-    expect(body.queued).toBe(true);
-    expect([...kv.keys()].some((key) => key.startsWith("gq:dev:"))).toBe(false);
-    expect(JSON.stringify([...kv.entries()])).not.toContain(CLIENT_IP);
-    expect([...kv.keys()].some((key) => /^gq:ip:[0-9a-f]{64}$/.test(key))).toBe(true);
-
-    kv.clear();
-    edge.clear();
     expect((await golfGet("/golfapi/v2.3/courses/s1", { install: "spoof-aaa", env: tight })).status).toBe(200);
     expect((await golfGet("/golfapi/v2.3/courses/s2", { install: "spoof-bbb", env: tight })).status).toBe(200);
     const spoofed = await golfGet("/golfapi/v2.3/courses/s3", { install: "spoof-ccc", env: tight });
     expect(spoofed.status).toBe(429);
     expect((await spoofed.json()).reason).toBe("ip_day");
-
-    const ignored = await golfGet("/golfapi/v2.3/courses/s4", {
-      env: tight,
-      headers: { "X-Install-Id": "nope", "CF-Connecting-IP": "198.51.100.8" },
-    });
-    expect(ignored.status).toBe(200);
-    expect([...kv.keys()].some((key) => key.includes("nope"))).toBe(false);
-    expect(JSON.stringify([...kv.values()].map((row) => row.value))).not.toContain("198.51.100.8");
+    expect(JSON.stringify([...kv.entries()])).not.toContain(CLIENT_IP);
+    expect([...kv.keys()].some((key) => /^gq:ip:[0-9a-f]{64}$/.test(key))).toBe(true);
   });
 
-  it("accepts the app install id, keys device state on it, and still ignores bad ids", async () => {
+  it("accepts the app install id and keys device state on it", async () => {
     const appId = "id_1790517745797_pfjtwbfa";
     mockGolfApi(async (url) => jsonResponse(coursePayload(url.split("/").pop())));
     expect((await golfGet("/golfapi/v2.3/courses/pebble", { install: appId })).status).toBe(200);
@@ -1074,11 +1060,67 @@ describe("shottrax-share worker", () => {
     fetchMock.mockClear();
     const rejected = ["id_1790", "a".repeat(65), "id_1790517745797_pfjtwbfa!", "id 1790517745797", "id.17905177"];
     for (const [index, bad] of rejected.entries()) {
-      expect((await golfGet(`/golfapi/v2.3/courses/bad${index}`, { install: bad })).status).toBe(200);
+      fetchMock.mockClear();
+      const response = await golfGet(`/golfapi/v2.3/courses/bad${index}`, { install: bad });
+      expect(response.status).toBe(401);
+      expect(await response.json()).toEqual({ error: "install_id_required" });
+      expect(fetchMock).not.toHaveBeenCalled();
       expect(kv.has(`gq:dev:${bad}`)).toBe(false);
       expect(kv.has(`gq:set:dev:${bad}`)).toBe(false);
     }
     expect([...kv.keys()].some((key) => key.startsWith("gq:dev:"))).toBe(false);
+    expect([...kv.keys()].some((key) => key.startsWith("gqueue:"))).toBe(false);
+    expect(stats().blocked.install_id_required).toBe(rejected.length);
+    expect(stats().lookups).toBe(0);
+  });
+
+  it("serves golfapi for the app install id and rejects a missing id before upstream", async () => {
+    const appId = "id_1790517745797_pfjtwbfa";
+    mockGolfApi(async () => jsonResponse(coursePayload("pebble")));
+    kv.set("gapi:course:stored", { value: coursePayload("stored") });
+
+    const missing = await golfGet("/golfapi/v2.3/courses/stored", { install: null });
+    expect(missing.status).toBe(401);
+    expect(await missing.json()).toEqual({ error: "install_id_required" });
+    expect(missing.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(stats()).toMatchObject({
+      lookups: 0,
+      searches: 0,
+      hits: 0,
+      blocked: { install_id_required: 1 },
+    });
+    expect([...kv.keys()].filter((key) => key !== "gapi:course:stored" && !key.startsWith("gq:stats:"))).toEqual([]);
+    expect(kv.has("gqueue:stored")).toBe(false);
+
+    const invalid = await golfGet("/golfapi/v2.3/courses/stored", { install: "nope" });
+    expect(invalid.status).toBe(401);
+    expect(await invalid.json()).toEqual({ error: "install_id_required" });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(stats().blocked.install_id_required).toBe(2);
+    expect(stats().hits).toBe(0);
+
+    const ok = await golfGet("/golfapi/v2.3/courses/pebble", { install: appId });
+    expect(ok.status).toBe(200);
+    expect(ok.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    expect(await ok.json()).toMatchObject({ courseID: "pebble" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    const golfOptions = await invoke(`${ORIGIN}/golfapi/v2.3/courses/pebble`, { method: "OPTIONS" });
+    expect(golfOptions.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    const gcaOptions = await invoke(`${ORIGIN}/gca/v1/courses/14322`, { method: "OPTIONS" });
+    expect(gcaOptions.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    const gcaMissing = await invoke(`${ORIGIN}/gca/v1/nope`);
+    expect(gcaMissing.status).toBe(404);
+    expect(gcaMissing.headers.get("Access-Control-Allow-Origin")).toBeNull();
+
+    await invoke(`${ORIGIN}/boardcors`, { method: "PUT", body: "{\"ok\":1}" });
+    const board = await invoke(`${ORIGIN}/boardcors`);
+    expect(board.status).toBe(200);
+    expect(await board.json()).toEqual({ ok: 1 });
+    expect(board.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    const meta = await invoke(`${ORIGIN}/meta/gca`);
+    expect(meta.headers.get("Access-Control-Allow-Origin")).toBe("*");
   });
 
   it("stops fresh lookups at the global daily cap", async () => {
@@ -1230,9 +1272,13 @@ describe("shottrax-share worker", () => {
     expect(board.status).toBe(405);
     expect(await board.text()).toBe("no");
 
-    const clubs = await invoke(`${ORIGIN}/golfapi/v2.3/clubs`);
+    const clubs = await invoke(`${ORIGIN}/golfapi/v2.3/clubs`, {
+      headers: { "X-Install-Id": "install-0001" },
+    });
     expect(clubs.status).toBe(404);
-    const bare = await invoke(`${ORIGIN}/golfapi/v2.3/courses`);
+    const bare = await invoke(`${ORIGIN}/golfapi/v2.3/courses`, {
+      headers: { "X-Install-Id": "install-0001" },
+    });
     expect(bare.status).toBe(404);
     expect(await bare.json()).toEqual({ error: "unknown_route" });
     expect(fetchMock).not.toHaveBeenCalled();
@@ -1376,6 +1422,7 @@ describe("shottrax-share worker", () => {
       "device_week",
       "floor",
       "global_day",
+      "install_id_required",
       "ip_day",
       "ip_month",
       "ip_week",
@@ -1482,7 +1529,10 @@ describe("shottrax-share worker", () => {
     expect(fetchMock).not.toHaveBeenCalled();
     expect(kv.has("gqueue:abc")).toBe(true);
 
-    const response = await invoke(`${ORIGIN}/golfapi/v2.3/courses/abc`, { env: { GOLFAPI_KEY: "golf-secret" } });
+    const response = await invoke(`${ORIGIN}/golfapi/v2.3/courses/abc`, {
+      env: { GOLFAPI_KEY: "golf-secret" },
+      headers: { "X-Install-Id": "install-0001" },
+    });
     expect(response.status).toBe(503);
     expect(await response.json()).toEqual({ error: "boards_not_configured" });
     expect(fetchMock).not.toHaveBeenCalled();
@@ -2073,7 +2123,8 @@ describe("shottrax-share worker", () => {
     for (const [url, body] of cases) {
       const contentType = body === "not-json" ? "text/plain" : "application/json";
       fetchMock.mockResolvedValue(scorecardResponse(body, 200, contentType));
-      const response = await invoke(url);
+      const headers = url.includes("/golfapi/") ? { "X-Install-Id": "install-0001" } : undefined;
+      const response = await invoke(url, { headers });
       expect(await response.text()).toBe(body);
     }
 
@@ -2130,7 +2181,7 @@ describe("shottrax-share worker", () => {
 
   function gcaStats() {
     const row = kv.get(`gca:stats:${todayKey()}`);
-    return row ? JSON.parse(row.value) : { upstream: 0, rateLimited: 0, stale: 0 };
+    return row ? JSON.parse(row.value) : { upstream: 0, rateLimited: 0, stale: 0, missingInstallId: 0 };
   }
 
   function seedGca(key, body, storedAt) {
@@ -2163,7 +2214,7 @@ describe("shottrax-share worker", () => {
     expect(fetchMock).not.toHaveBeenCalled();
     expect(await edge.get(`${ORIGIN}/gca/v1/courses/14322`).text()).toBe(COURSE_RAW);
     expect(await edge.get(`${ORIGIN}/gca/v1/courses/14322/green-centers`).text()).toBe(GREENS_RAW);
-    expect(gcaStats()).toEqual({ upstream: 0, rateLimited: 0, stale: 0 });
+    expect(gcaStats()).toEqual({ upstream: 0, rateLimited: 0, stale: 0, missingInstallId: 2 });
     expect(presentGcaCourseBody("course", "14322", COURSE_RAW)).toBe(COURSE_RAW);
   });
 
@@ -2201,7 +2252,7 @@ describe("shottrax-share worker", () => {
       "x-ratelimit-reset": "60",
       "ratelimit-remaining": "77",
     });
-    expect(gcaStats()).toEqual({ upstream: 1, rateLimited: 0, stale: 0 });
+    expect(gcaStats()).toEqual({ upstream: 1, rateLimited: 0, stale: 0, missingInstallId: 1 });
 
     edge.clear();
     fetchMock.mockClear();
@@ -2364,7 +2415,7 @@ describe("shottrax-share worker", () => {
     seedGca("gca:course:old", COURSE_RAW, Date.now() - 31 * DAY * 1000);
     const stale = await invoke(`${ORIGIN}/gca/v1/courses/old`);
     expect(stale.headers.get("X-Course-Data-Stale")).toBe("1");
-    expect(gcaStats()).toEqual({ upstream: 3, rateLimited: 2, stale: 1 });
+    expect(gcaStats()).toEqual({ upstream: 3, rateLimited: 2, stale: 1, missingInstallId: 3 });
     expect(kv.get(`gca:stats:${todayKey()}`).opts.expirationTtl).toBe(40 * DAY);
 
     const meta = await invoke(`${ORIGIN}/meta/gca`);
@@ -2379,6 +2430,7 @@ describe("shottrax-share worker", () => {
       upstream: 3,
       rateLimited: 2,
       stale: 1,
+      missingInstallId: 3,
     });
     expect(body.days[29]).toEqual(body.today);
     expect(body.days[0].upstream).toBe(0);
@@ -2412,6 +2464,80 @@ describe("shottrax-share worker", () => {
     const courseDown = await invoke(`${ORIGIN}/gca/v1/courses/14322`, { env: { GOLF_COURSES_API_KEY: "gca-secret" } });
     expect(courseDown.status).toBe(503);
     expect(await courseDown.json()).toEqual({ error: "boards_not_configured" });
+  });
+
+  it("serves GCA without an install id until GCA_REQUIRE_INSTALL_ID is on", async () => {
+    const appId = "id_1790517745797_pfjtwbfa";
+    seedGca("gca:course:14322", COURSE_RAW, Date.now() - 1000);
+    const fromKv = await invoke(`${ORIGIN}/gca/v1/courses/14322`);
+    expect(fromKv.status).toBe(200);
+    expect(await fromKv.text()).toBe(COURSE_RAW);
+    expect(fromKv.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(gcaStats().missingInstallId).toBe(1);
+
+    let kvOps = 0;
+    for (const method of ["get", "getWithMetadata", "put", "delete", "list"]) {
+      const original = env.BOARDS[method].bind(env.BOARDS);
+      env.BOARDS[method] = async (...args) => {
+        kvOps += 1;
+        return original(...args);
+      };
+    }
+    const edgeHit = await invoke(`${ORIGIN}/gca/v1/courses/14322`, {
+      env: { ...env, GCA_REQUIRE_INSTALL_ID: "nope" },
+    });
+    expect(edgeHit.status).toBe(200);
+    expect(await edgeHit.text()).toBe(COURSE_RAW);
+    expect(gcaStats().missingInstallId).toBe(1);
+    expect(kvOps).toBe(0);
+
+    const named = await invoke(`${ORIGIN}/gca/v1/courses/14322`, {
+      headers: { "X-Install-Id": appId },
+    });
+    expect(named.status).toBe(200);
+    expect(gcaStats().missingInstallId).toBe(1);
+
+    mockGca(async () => new Response('{"id":"upstream"}', {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+    const upstream = await invoke(`${ORIGIN}/gca/v1/courses/upstream`);
+    expect(upstream.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(gcaStats().missingInstallId).toBe(2);
+
+    const upstreamId = await invoke(`${ORIGIN}/gca/v1/courses/with-id`, {
+      headers: { "X-Install-Id": appId },
+    });
+    expect(upstreamId.status).toBe(200);
+    expect(gcaStats().missingInstallId).toBe(2);
+
+    const closed = {
+      ...env,
+      GCA_REQUIRE_INSTALL_ID: "true",
+      BOARDS: {
+        async get() { throw new Error("kv read"); },
+        async getWithMetadata() { throw new Error("kv read"); },
+        async put() { throw new Error("kv write"); },
+        async delete() { throw new Error("kv write"); },
+        async list() { throw new Error("kv list"); },
+      },
+    };
+    fetchMock.mockClear();
+    const denied = await invoke(`${ORIGIN}/gca/v1/courses/14322`, { env: closed });
+    expect(denied.status).toBe(401);
+    expect(await denied.json()).toEqual({ error: "install_id_required" });
+    expect(denied.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const allowed = await invoke(`${ORIGIN}/gca/v1/courses/14322`, {
+      env: { ...env, GCA_REQUIRE_INSTALL_ID: "true" },
+      headers: { "X-Install-Id": appId },
+    });
+    expect(allowed.status).toBe(200);
+    expect(await allowed.text()).toBe(COURSE_RAW);
+    expect(gcaStats().missingInstallId).toBe(2);
   });
 
   function expectMagnoliaFilled(json) {
