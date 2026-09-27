@@ -59,7 +59,7 @@ import { GCA_CORRECTIONS, applyGcaScorecardCorrection } from "./gca-corrections.
  * They are counted on their own as allowlistedLookups. The ids are never
  * returned by /meta/golfapi.
  *
- * Identity: header X-Install-Id (8–64 chars of [A-Za-z0-9-], else ignored)
+ * Identity: header X-Install-Id (8–64 chars of [A-Za-z0-9_-], else ignored)
  * and CF-Connecting-IP. Both are enforced when present; the install id is
  * spoofable. IPs are stored only as SHA-256 with a fixed prefix, never raw.
  *
@@ -243,7 +243,7 @@ function readInstallId(request) {
   const raw = request.headers.get("X-Install-Id");
   if (typeof raw !== "string") return null;
   const id = raw.trim();
-  if (!/^[A-Za-z0-9-]{8,64}$/.test(id)) return null;
+  if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) return null;
   return id;
 }
 

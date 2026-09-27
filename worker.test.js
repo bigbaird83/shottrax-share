@@ -1053,6 +1053,34 @@ describe("shottrax-share worker", () => {
     expect(JSON.stringify([...kv.values()].map((row) => row.value))).not.toContain("198.51.100.8");
   });
 
+  it("accepts the app install id, keys device state on it, and still ignores bad ids", async () => {
+    const appId = "id_1790517745797_pfjtwbfa";
+    mockGolfApi(async (url) => jsonResponse(coursePayload(url.split("/").pop())));
+    expect((await golfGet("/golfapi/v2.3/courses/pebble", { install: appId })).status).toBe(200);
+    expect(JSON.parse(kv.get(`gq:dev:${appId}`).value).dayCount).toBe(1);
+    expect(JSON.parse(kv.get(`gq:set:dev:${appId}`).value).courseId).toBe("pebble");
+
+    kv.clear();
+    edge.clear();
+    fetchMock.mockClear();
+    const listed = { ...env, GOLFAPI_ALLOWLIST: appId, GOLFAPI_GLOBAL_DAY: "0" };
+    expect((await golfGet("/golfapi/v2.3/courses/listed", { install: appId, env: listed })).status).toBe(200);
+    expect(stats().allowlistedLookups).toBe(1);
+    expect(stats().lookups).toBe(0);
+    expect([...kv.keys()].some((key) => key.startsWith("gq:ip:"))).toBe(false);
+
+    kv.clear();
+    edge.clear();
+    fetchMock.mockClear();
+    const rejected = ["id_1790", "a".repeat(65), "id_1790517745797_pfjtwbfa!", "id 1790517745797", "id.17905177"];
+    for (const [index, bad] of rejected.entries()) {
+      expect((await golfGet(`/golfapi/v2.3/courses/bad${index}`, { install: bad })).status).toBe(200);
+      expect(kv.has(`gq:dev:${bad}`)).toBe(false);
+      expect(kv.has(`gq:set:dev:${bad}`)).toBe(false);
+    }
+    expect([...kv.keys()].some((key) => key.startsWith("gq:dev:"))).toBe(false);
+  });
+
   it("stops fresh lookups at the global daily cap", async () => {
     mockGolfApi(async (url) => jsonResponse(coursePayload(url.split("/").pop())));
     const capEnv = { ...env, GOLFAPI_GLOBAL_DAY: "1", GOLFAPI_DEVICE_DAY: "5" };
