@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GCA_CORRECTIONS } from "./gca-corrections.js";
-import worker, { osmInflight } from "./worker.js";
+import worker, { osmInflight, presentGcaCourseBody } from "./worker.js";
 
 const ORIGIN = "https://shottrax-share.bcbaird.workers.dev";
 const PRIMARY = "https://overpass-api.de/api/interpreter";
@@ -1199,7 +1199,16 @@ describe("shottrax-share worker", () => {
   });
 
   it("blocks reserved prefixes on public routes and still accepts board and paint keys", async () => {
-    const reserved = ["gq:balance", "gq:stats:2026-01-01", "gapi:course:abc", "gqueue:abc", "osm:v1:secret"];
+    const reserved = [
+      "gq:balance",
+      "gq:stats:2026-01-01",
+      "gapi:course:abc",
+      "gqueue:abc",
+      "osm:v1:secret",
+      "gca:course:14322",
+      "gca:greens:14322",
+      "gca:stats:2026-01-01",
+    ];
     for (const key of reserved) {
       kv.set(key, { value: "keep-me", opts: { expirationTtl: 60 } });
       const encoded = `${ORIGIN}/${encodeURIComponent(key)}`;
@@ -2047,6 +2056,7 @@ describe("shottrax-share worker", () => {
 
     const onlyMismatch = magnoliaScorecard([{ name: "Gold", holes: mismatched }]);
     fetchMock.mockResolvedValue(scorecardResponse(onlyMismatch));
+    kv.delete(`gca:course:${GCA_ID}`);
     const skipped = await invoke(`${ORIGIN}/gca/v1/courses/${GCA_ID}?x=1`);
     expect(await skipped.text()).toBe(onlyMismatch);
   });
@@ -2068,6 +2078,7 @@ describe("shottrax-share worker", () => {
     }
 
     edge.delete(`${ORIGIN}/gca/v1/courses/${GCA_ID}`);
+    kv.delete(`gca:course:${GCA_ID}`);
     fetchMock.mockResolvedValue(scorecardResponse(marked, 403));
     const forbidden = await invoke(`${ORIGIN}/gca/v1/courses/${GCA_ID}`);
     expect(forbidden.status).toBe(403);
@@ -2111,5 +2122,344 @@ describe("shottrax-share worker", () => {
     expect(againJson).toEqual(freshJson);
     expect(againJson.data.scorecard.teeboxes[1].holes.map((hole) => hole.handicap)).toEqual(MAGNOLIA_MEN);
     expect(await edge.get(`${url}?fresh=1`).clone().text()).toBe(raw);
+  });
+
+  const COURSE_RAW = '{"id":14322,"name":"Magnolia","holes":18}';
+  const GREENS_RAW = '{"id":14322,"greens":[{"hole":1,"lat":33.19,"lng":-93.21}]}';
+  const COURSE_NEXT = '{"id":14322,"name":"Magnolia","holes":18,"updated":true}';
+
+  function gcaStats() {
+    const row = kv.get(`gca:stats:${todayKey()}`);
+    return row ? JSON.parse(row.value) : { upstream: 0, rateLimited: 0, stale: 0 };
+  }
+
+  function seedGca(key, body, storedAt) {
+    kv.set(key, {
+      value: body,
+      metadata: { status: 200, storedAt },
+      opts: { expirationTtl: 365 * DAY, metadata: { status: 200, storedAt } },
+    });
+  }
+
+  function mockGca(responder) {
+    fetchMock.mockImplementation(async (url, init) => {
+      expect(init.headers.Authorization).toBe("Bearer gca-secret");
+      expect(init.headers.Accept).toBe("application/json");
+      return responder(String(url), init);
+    });
+  }
+
+  it("serves a fresh GCA KV copy without calling upstream and rewarms the edge cache", async () => {
+    const storedAt = Date.now() - 29 * DAY * 1000;
+    seedGca("gca:course:14322", COURSE_RAW, storedAt);
+    seedGca("gca:greens:14322", GREENS_RAW, storedAt);
+    const course = await invoke(`${ORIGIN}/gca/v1/courses/14322`);
+    expect(course.status).toBe(200);
+    expect(course.headers.get("X-Course-Data-Stale")).toBeNull();
+    expect(await course.text()).toBe(COURSE_RAW);
+    const greens = await invoke(`${ORIGIN}/gca/v1/courses/14322/green-centers`);
+    expect(greens.status).toBe(200);
+    expect(await greens.text()).toBe(GREENS_RAW);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(await edge.get(`${ORIGIN}/gca/v1/courses/14322`).text()).toBe(COURSE_RAW);
+    expect(await edge.get(`${ORIGIN}/gca/v1/courses/14322/green-centers`).text()).toBe(GREENS_RAW);
+    expect(gcaStats()).toEqual({ upstream: 0, rateLimited: 0, stale: 0 });
+    expect(presentGcaCourseBody("course", "14322", COURSE_RAW)).toBe(COURSE_RAW);
+  });
+
+  it("refreshes an old GCA copy on 2xx and serves it stale on 429, 5xx, and timeout", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const storedAt = Date.now() - 30 * DAY * 1000;
+    seedGca("gca:course:14322", COURSE_RAW, storedAt);
+    mockGca(async (url) => {
+      expect(url).toBe("https://golfcoursesapi.com/api/v1/courses/14322?pin=1");
+      return new Response(COURSE_NEXT, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+          "X-RateLimit-Limit": "100",
+          "X-RateLimit-Remaining": "77",
+          "X-RateLimit-Reset": "60",
+          "RateLimit-Remaining": "77",
+        },
+      });
+    });
+    const refreshed = await invoke(`${ORIGIN}/gca/v1/courses/14322?pin=1`);
+    expect(refreshed.status).toBe(200);
+    expect(refreshed.headers.get("X-Course-Data-Stale")).toBeNull();
+    expect(await refreshed.text()).toBe(COURSE_NEXT);
+    expect(kv.get("gca:course:14322").value).toBe(COURSE_NEXT);
+    expect(kv.get("gca:course:14322").metadata).toMatchObject({ status: 200 });
+    expect(kv.get("gca:course:14322").metadata.storedAt).toBeGreaterThan(storedAt);
+    expect(kv.get("gca:course:14322").opts.expirationTtl).toBe(365 * DAY);
+    expect(await edge.get(`${ORIGIN}/gca/v1/courses/14322?pin=1`).text()).toBe(COURSE_NEXT);
+    expect(JSON.parse(log.mock.calls[0][0])).toEqual({
+      route: "course",
+      status: 200,
+      "x-ratelimit-limit": "100",
+      "x-ratelimit-remaining": "77",
+      "x-ratelimit-reset": "60",
+      "ratelimit-remaining": "77",
+    });
+    expect(gcaStats()).toEqual({ upstream: 1, rateLimited: 0, stale: 0 });
+
+    edge.clear();
+    fetchMock.mockClear();
+    log.mockClear();
+    const oldAt = Date.now() - 40 * DAY * 1000;
+    seedGca("gca:course:14322", COURSE_RAW, oldAt);
+    const expectedAge = Math.floor((Date.now() - oldAt) / 1000);
+    mockGca(async () => new Response("slow down", {
+      status: 429,
+      headers: { "Content-Type": "text/plain", "Retry-After": "120" },
+    }));
+    const limited = await invoke(`${ORIGIN}/gca/v1/courses/14322`);
+    expect(limited.status).toBe(200);
+    expect(limited.headers.get("X-Course-Data-Stale")).toBe("1");
+    const age = Number(limited.headers.get("X-Course-Data-Age"));
+    expect(age).toBeGreaterThanOrEqual(expectedAge);
+    expect(age).toBeLessThanOrEqual(expectedAge + 2);
+    expect(await limited.text()).toBe(COURSE_RAW);
+    expect(kv.get("gca:course:14322").value).toBe(COURSE_RAW);
+    expect(kv.get("gca:course:14322").metadata.storedAt).toBe(oldAt);
+    expect(edge.size).toBe(0);
+    expect(JSON.parse(log.mock.calls[0][0])).toMatchObject({ route: "course", status: 429, "retry-after": "120" });
+
+    fetchMock.mockClear();
+    mockGca(async () => new Response("busy", { status: 503, headers: { "Content-Type": "text/plain" } }));
+    const failed = await invoke(`${ORIGIN}/gca/v1/courses/14322`);
+    expect(failed.status).toBe(200);
+    expect(failed.headers.get("X-Course-Data-Stale")).toBe("1");
+    expect(await failed.text()).toBe(COURSE_RAW);
+    expect(kv.get("gca:course:14322").value).toBe(COURSE_RAW);
+    expect(edge.size).toBe(0);
+
+    fetchMock.mockClear();
+    vi.useFakeTimers();
+    try {
+      const timeoutAt = Date.now() - 31 * DAY * 1000;
+      seedGca("gca:greens:14322", GREENS_RAW, timeoutAt);
+      mockGca((url, init) => {
+        expect(url).toBe("https://golfcoursesapi.com/api/v1/courses/14322/green-centers");
+        return new Promise((resolve, reject) => {
+          const fail = () => reject(new Error("The operation was aborted"));
+          if (init.signal?.aborted) fail();
+          else init.signal?.addEventListener("abort", fail, { once: true });
+        });
+      });
+      const pending = invoke(`${ORIGIN}/gca/v1/courses/14322/green-centers`);
+      await vi.advanceTimersByTimeAsync(14_999);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      const timedOut = await pending;
+      expect(timedOut.status).toBe(200);
+      expect(timedOut.headers.get("X-Course-Data-Stale")).toBe("1");
+      expect(timedOut.headers.get("X-Course-Data-Age")).toBe(String(31 * DAY + 15));
+      expect(await timedOut.text()).toBe(GREENS_RAW);
+      expect(kv.get("gca:greens:14322").value).toBe(GREENS_RAW);
+      expect(kv.get("gca:greens:14322").metadata.storedAt).toBe(timeoutAt);
+    } finally {
+      vi.useRealTimers();
+      log.mockRestore();
+    }
+  });
+
+  it("passes Retry-After on a GCA 429 when nothing is stored and never stores errors", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    mockGca(async () => new Response("slow down", {
+      status: 429,
+      headers: { "Content-Type": "text/plain", "Retry-After": "45" },
+    }));
+    const limited = await invoke(`${ORIGIN}/gca/v1/courses/14322`);
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get("Retry-After")).toBe("45");
+    expect(limited.headers.get("Cache-Control")).toBe("no-store");
+    expect(await limited.json()).toEqual({ error: "rate_limited" });
+    expect(kv.has("gca:course:14322")).toBe(false);
+    expect(JSON.parse(log.mock.calls[0][0])).toMatchObject({ route: "course", status: 429, "retry-after": "45" });
+
+    fetchMock.mockClear();
+    mockGca(async () => new Response("slow down", { status: 429, headers: { "Content-Type": "text/plain" } }));
+    const fallback = await invoke(`${ORIGIN}/gca/v1/courses/14322`);
+    expect(fallback.status).toBe(429);
+    expect(fallback.headers.get("Retry-After")).toBe("30");
+    expect(await fallback.json()).toEqual({ error: "rate_limited" });
+    expect(kv.has("gca:course:14322")).toBe(false);
+
+    fetchMock.mockClear();
+    mockGca(async () => new Response("busy", { status: 502, headers: { "Content-Type": "text/plain" } }));
+    const failed = await invoke(`${ORIGIN}/gca/v1/courses/14322`);
+    expect(failed.status).toBe(502);
+    expect(await failed.text()).toBe("busy");
+    expect(kv.has("gca:course:14322")).toBe(false);
+    expect(edge.size).toBe(0);
+
+    fetchMock.mockClear();
+    mockGca(async () => {
+      throw new Error("network");
+    });
+    const thrown = await invoke(`${ORIGIN}/gca/v1/courses/14322`);
+    expect(thrown.status).toBe(502);
+    expect(await thrown.json()).toEqual({ error: "upstream_unreachable" });
+    expect(kv.has("gca:course:14322")).toBe(false);
+
+    fetchMock.mockClear();
+    mockGca(async () => new Response("missing", { status: 404, headers: { "Content-Type": "text/plain" } }));
+    const missing = await invoke(`${ORIGIN}/gca/v1/courses/99999`);
+    expect(missing.status).toBe(404);
+    expect(await missing.text()).toBe("missing");
+    expect(kv.has("gca:course:99999")).toBe(false);
+    fetchMock.mockClear();
+    const missingAgain = await invoke(`${ORIGIN}/gca/v1/courses/99999`);
+    expect(missingAgain.status).toBe(404);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(kv.has("gca:course:99999")).toBe(false);
+
+    const courseKeys = [...kv.keys()].filter((key) => key.startsWith("gca:course:") || key.startsWith("gca:greens:"));
+    expect(courseKeys).toEqual([]);
+    expect(gcaStats().rateLimited).toBe(2);
+    expect(gcaStats().stale).toBe(0);
+    expect(gcaStats().upstream).toBe(5);
+    log.mockRestore();
+  });
+
+  it("leaves GCA search on the edge cache and out of the course store", async () => {
+    mockGca(async (url) => {
+      expect(url).toBe("https://golfcoursesapi.com/api/v1/courses?q=magnolia");
+      return new Response('{"courses":[{"id":"m"}]}', {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    const search = await invoke(`${ORIGIN}/gca/v1/courses?q=magnolia`);
+    expect(search.status).toBe(200);
+    expect(await search.json()).toEqual({ courses: [{ id: "m" }] });
+    fetchMock.mockClear();
+    const again = await invoke(`${ORIGIN}/gca/v1/courses?q=magnolia`);
+    expect(again.status).toBe(200);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect([...kv.keys()].filter((key) => key.startsWith("gca:course:") || key.startsWith("gca:greens:"))).toEqual([]);
+
+    edge.clear();
+    mockGca(async () => new Response("slow down", {
+      status: 429,
+      headers: { "Content-Type": "text/plain", "Retry-After": "9" },
+    }));
+    const limited = await invoke(`${ORIGIN}/gca/v1/courses?q=other`);
+    expect(limited.status).toBe(429);
+    expect(await limited.text()).toBe("slow down");
+    expect(kv.has("gca:course:other")).toBe(false);
+    expect([...kv.keys()].some((key) => key.startsWith("gq:"))).toBe(false);
+  });
+
+  it("counts GCA upstream calls, 429s, and stale serves for /meta/gca", async () => {
+    mockGca(async (url) => {
+      if (url.endsWith("/courses/fresh")) {
+        return new Response('{"id":"fresh"}', { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return new Response("no", { status: 429, headers: { "Retry-After": "30" } });
+    });
+    expect((await invoke(`${ORIGIN}/gca/v1/courses/fresh`)).status).toBe(200);
+    expect((await invoke(`${ORIGIN}/gca/v1/courses/missing`)).status).toBe(429);
+    seedGca("gca:course:old", COURSE_RAW, Date.now() - 31 * DAY * 1000);
+    const stale = await invoke(`${ORIGIN}/gca/v1/courses/old`);
+    expect(stale.headers.get("X-Course-Data-Stale")).toBe("1");
+    expect(gcaStats()).toEqual({ upstream: 3, rateLimited: 2, stale: 1 });
+    expect(kv.get(`gca:stats:${todayKey()}`).opts.expirationTtl).toBe(40 * DAY);
+
+    const meta = await invoke(`${ORIGIN}/meta/gca`);
+    expect(meta.status).toBe(200);
+    expect(meta.headers.get("Cache-Control")).toBe("no-store");
+    const body = await meta.json();
+    expect(body.refreshDays).toBe(30);
+    expect(Number.isNaN(Date.parse(body.generatedAt))).toBe(false);
+    expect(body.days).toHaveLength(30);
+    expect(body.today).toEqual({
+      date: todayKey(),
+      upstream: 3,
+      rateLimited: 2,
+      stale: 1,
+    });
+    expect(body.days[29]).toEqual(body.today);
+    expect(body.days[0].upstream).toBe(0);
+    const text = JSON.stringify(body);
+    expect(text).not.toContain("gca-secret");
+    expect(text).not.toContain("Bearer");
+
+    const overridden = await invoke(`${ORIGIN}/meta/gca`, { env: { ...env, GCA_REFRESH_DAYS: "7" } });
+    expect((await overridden.json()).refreshDays).toBe(7);
+    const invalid = await invoke(`${ORIGIN}/meta/gca`, { env: { ...env, GCA_REFRESH_DAYS: "nope" } });
+    expect((await invalid.json()).refreshDays).toBe(30);
+
+    const weekEnv = { ...env, GCA_REFRESH_DAYS: "1" };
+    seedGca("gca:course:week", COURSE_RAW, Date.now() - 2 * 60 * 60 * 1000);
+    fetchMock.mockClear();
+    const stillFresh = await invoke(`${ORIGIN}/gca/v1/courses/week`, { env: weekEnv });
+    expect(stillFresh.status).toBe(200);
+    expect(fetchMock).not.toHaveBeenCalled();
+    seedGca("gca:course:week", COURSE_RAW, Date.now() - 2 * DAY * 1000);
+    edge.clear();
+    mockGca(async () => new Response(COURSE_NEXT, { status: 200, headers: { "Content-Type": "application/json" } }));
+    const due = await invoke(`${ORIGIN}/gca/v1/courses/week`, { env: weekEnv });
+    expect(due.status).toBe(200);
+    expect(await due.text()).toBe(COURSE_NEXT);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    const post = await invoke(`${ORIGIN}/meta/gca`, { method: "PUT", body: "{}" });
+    expect(post.status).toBe(405);
+    const down = await invoke(`${ORIGIN}/meta/gca`, { env: {} });
+    expect(down.status).toBe(503);
+    const courseDown = await invoke(`${ORIGIN}/gca/v1/courses/14322`, { env: { GOLF_COURSES_API_KEY: "gca-secret" } });
+    expect(courseDown.status).toBe(503);
+    expect(await courseDown.json()).toEqual({ error: "boards_not_configured" });
+  });
+
+  function expectMagnoliaFilled(json) {
+    expect(json.data.scorecard.teeboxes).toHaveLength(3);
+    for (const tee of json.data.scorecard.teeboxes) {
+      expect(tee.holes.map((hole) => hole.handicap)).toEqual(MAGNOLIA_MEN);
+      expect(tee.holes.map((hole) => hole.handicap_women)).toEqual(MAGNOLIA_WOMEN);
+    }
+    expect(json.data.scorecard.corrections).toEqual({
+      source: MAGNOLIA_SOURCE,
+      fields: ["handicap", "handicap_women"],
+    });
+  }
+
+  it("fills Magnolia stroke indexes from a fresh KV copy and leaves that copy raw", async () => {
+    const raw = upstreamMagnolia();
+    seedGca(`gca:course:${GCA_ID}`, raw, Date.now() - 2 * DAY * 1000);
+    const response = await invoke(`${ORIGIN}/gca/v1/courses/${GCA_ID}`);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Course-Data-Stale")).toBeNull();
+    expectMagnoliaFilled(await response.json());
+    expect(kv.get(`gca:course:${GCA_ID}`).value).toBe(raw);
+    expect(await edge.get(`${ORIGIN}/gca/v1/courses/${GCA_ID}`).text()).toBe(raw);
+  });
+
+  it("fills Magnolia stroke indexes when a stale KV copy is served on 429", async () => {
+    const raw = upstreamMagnolia();
+    seedGca(`gca:course:${GCA_ID}`, raw, Date.now() - 40 * DAY * 1000);
+    fetchMock.mockResolvedValue(new Response("slow down", {
+      status: 429,
+      headers: { "Content-Type": "text/plain", "Retry-After": "30" },
+    }));
+    const response = await invoke(`${ORIGIN}/gca/v1/courses/${GCA_ID}`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Course-Data-Stale")).toBe("1");
+    expectMagnoliaFilled(await response.json());
+    expect(kv.get(`gca:course:${GCA_ID}`).value).toBe(raw);
+    expect(edge.size).toBe(0);
+  });
+
+  it("stores the raw Magnolia upstream body in KV", async () => {
+    const raw = upstreamMagnolia();
+    fetchMock.mockResolvedValue(scorecardResponse(raw));
+    const response = await invoke(`${ORIGIN}/gca/v1/courses/${GCA_ID}`);
+    expectMagnoliaFilled(await response.json());
+    expect(kv.get(`gca:course:${GCA_ID}`).value).toBe(raw);
+    expect(kv.get(`gca:course:${GCA_ID}`).value).not.toContain("corrections");
+    expect(await edge.get(`${ORIGIN}/gca/v1/courses/${GCA_ID}`).text()).toBe(raw);
   });
 });

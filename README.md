@@ -2,9 +2,9 @@
 
 Cloudflare Worker for ShotTraxx live boards and the course paint cache. It also proxies golf course vendor reads so the phone never holds a vendor key, and it fetches OpenStreetMap golf overlays once per location so phones do not call Overpass themselves.
 
-Live boards stay `GET` / `PUT` on a single path segment in the `BOARDS` KV namespace. Paint cache keys start with `id:` or `name:`. Keys that start with `osm:`, `gq:`, `gapi:`, or `gqueue:` are reserved.
+Live boards stay `GET` / `PUT` on a single path segment in the `BOARDS` KV namespace. Paint cache keys start with `id:` or `name:`. Keys that start with `osm:`, `gq:`, `gapi:`, `gqueue:`, or `gca:` are reserved.
 
-If `env.BOARDS` is not bound, board routes, overlay lookups, and golfapi reads return `503` `{ "error": "boards_not_configured" }` instead of throwing. The GCA proxy does not use that namespace.
+If `env.BOARDS` is not bound, board routes, overlay lookups, golfapi reads, and GCA course reads (`courses/{id}`, `courses/{id}/green-centers`) return `503` `{ "error": "boards_not_configured" }` instead of throwing. GCA search still proxies without that namespace.
 
 Merging to `main` deploys this Worker automatically through Cloudflare Workers Builds. A hand `wrangler deploy` is not required. The Workers Builds check fails immediately on every branch other than `main`. That failure is a Cloudflare branch-build setting, not a problem in this repo. After the merge build finishes, verify with the Magnolia curl below.
 
@@ -14,11 +14,15 @@ Merging to `main` deploys this Worker automatically through Cloudflare Workers B
 
 Board and paint-cache keys are stored only while that binding is present on the live Worker. If it is missing, those routes return `503` `{ "error": "boards_not_configured" }`.
 
-`GET`, `PUT`, and `DELETE` for a reserved prefix return `400` and do not read or write KV, so a board request cannot read, replace, or reset an overlay, a golfapi counter, a stored course, or the refill queue. Paint keys (`id:`, `name:`) and ordinary board codes are unchanged.
+`GET`, `PUT`, and `DELETE` for a reserved prefix return `400` and do not read or write KV, so a board request cannot read, replace, or reset an overlay, a golfapi counter, a stored course, a GCA copy, or the refill queue. Paint keys (`id:`, `name:`) and ordinary board codes are unchanged.
 
 ## Golf vendor proxy
 
-GCA reads are cached at the edge for 24 hours. Upstream status codes pass through unchanged.
+GCA search (`GET /gca/v1/courses?...`) is cached at the edge for 24 hours. Its upstream status passes through unchanged, and it is not written to KV.
+
+`courses/{id}` and `courses/{id}/green-centers` also keep a durable copy in `BOARDS` for 365 days. Keys are `gca:course:{id}` and `gca:greens:{id}`. The value is the raw upstream body. Metadata is `{ "status": 200, "storedAt": <ms> }`. The edge cache is checked first, then KV. A copy younger than `GCA_REFRESH_DAYS` (default 30) is served without calling upstream, and that response re-warms the edge cache. An older copy is refreshed: a 2xx overwrites KV and the edge cache; a 429, 5xx, timeout, or thrown fetch serves the stored body with `X-Course-Data-Stale: 1` and `X-Course-Data-Age` (seconds since `storedAt`) and does not store the error. With no copy, a 429 is `{ "error": "rate_limited" }` plus `Retry-After` (the upstream value, or 30). A 404 is not stored in KV. A miss 404 may sit in the edge cache for 5 minutes. `presentGcaCourseBody` is the only response-time body transform. The Magnolia scorecard correction runs there once, on an edge hit, a fresh upstream read, a fresh KV serve, and a stale serve. KV and the edge cache keep the raw body.
+
+Upstream calls, 429s, and stale serves are counted per UTC day at `gca:stats:YYYY-MM-DD` (40-day TTL). `GET /meta/gca` returns `refreshDays`, today's counts, and the last 30 UTC days. A 429, or any upstream response that carries `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-reset`, `ratelimit-*`, or `retry-after`, is one `console.log` JSON line with `route`, `status`, and those header values. `GCA_REFRESH_DAYS` is an optional Worker var. Invalid values keep 30. No new secrets.
 
 Golfapi is paid. One lookup is one set: a search plus `courses/{id}` plus `coordinates/{id}`. The set is counted on its first fresh upstream call and stays open for 15 minutes, separately for the device and for the IP (`gq:set:`). A fresh search opens the set and counts 1. A fresh course or coordinates call for the first course id in that window counts nothing extra. If the search was a cache hit, the later course call opens the set and counts 1. A different course id opens a new set and counts again. Cache hits never count. Course and coordinates bodies are stored in KV for a year (`gapi:course:`, `gapi:coord:`) and served free to everyone. Successful searches are stored for 30 days (`gapi:search:`) so a repeat of that query is free. The app searches with `name` (golfapi.io ignores `q` and filters on `name`). A search is valid when `name` is non-empty, or, when `name` is absent, when `q` is. The store key and queue token use that value, so older `q`-only keys still match a `q`-only request. The original query string is forwarded and replayed, including `name=`. Any other `/golfapi/` path is `404`. A 200 with no course data, or an error body, is not stored and is not edge-cached.
 
