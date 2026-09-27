@@ -6,7 +6,7 @@ import { GCA_CORRECTIONS, applyGcaScorecardCorrection } from "./gca-corrections.
  * as live-board codes. The phone sends no vendor key; secrets stay on this Worker.
  *
  *   GET /gca/v1/courses[/{id}[/green-centers]]  → golfcoursesapi.com/api/v1/
- *   GET /golfapi/v2.3/courses?q=                → golfapi.io/api/v2.3/  (search)
+ *   GET /golfapi/v2.3/courses?name=             → golfapi.io/api/v2.3/  (search; else q=)
  *   GET /golfapi/v2.3/courses/{id}              → golfapi.io/api/v2.3/
  *   GET /golfapi/v2.3/coordinates/{id}          → golfapi.io/api/v2.3/
  *   GET /meta/golfapi                           → quota snapshot, no secrets
@@ -39,7 +39,9 @@ import { GCA_CORRECTIONS, applyGcaScorecardCorrection } from "./gca-corrections.
  * A 200 with no course data, or an error body, is not stored and is not
  * edge-cached. A 24h gq:empty: marker stops a retry of that empty answer from
  * calling upstream again. Successful searches are stored for 30 days (gapi:search:)
- * so a queued search is free the next time.
+ * so a queued search is free the next time. The store key is the normalized
+ * name when that param is non-empty, otherwise q. The original query string
+ * is sent upstream and replayed from the queue, so a name= search stays name=.
  *
  * Defaults, overridden by [vars] in wrangler.toml. Non-integers, negatives,
  * and blanks keep the default. IP limits default to twice the device limits
@@ -57,7 +59,7 @@ import { GCA_CORRECTIONS, applyGcaScorecardCorrection } from "./gca-corrections.
  * They are counted on their own as allowlistedLookups. The ids are never
  * returned by /meta/golfapi.
  *
- * Identity: header X-Install-Id (8–64 chars of [A-Za-z0-9-], else ignored)
+ * Identity: header X-Install-Id (8–64 chars of [A-Za-z0-9_-], else ignored)
  * and CF-Connecting-IP. Both are enforced when present; the install id is
  * spoofable. IPs are stored only as SHA-256 with a fixed prefix, never raw.
  *
@@ -241,7 +243,7 @@ function readInstallId(request) {
   const raw = request.headers.get("X-Install-Id");
   if (typeof raw !== "string") return null;
   const id = raw.trim();
-  if (!/^[A-Za-z0-9-]{8,64}$/.test(id)) return null;
+  if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) return null;
   return id;
 }
 
@@ -282,10 +284,22 @@ function safeGolfapiId(raw) {
   return id;
 }
 
+/**
+ * golfapi.io ignores `q` and filters on `name`. The app sends `name`.
+ * `q` stays valid so older clients and stored gapi:search: keys still match.
+ * A non-empty name wins; a blank name falls through to q.
+ */
+function golfapiSearchQuery(url) {
+  const name = url.searchParams.get("name");
+  if (typeof name === "string" && name.trim() !== "") return name;
+  const q = url.searchParams.get("q");
+  if (typeof q === "string" && q.trim() !== "") return q;
+  return null;
+}
+
 function parseGolfapiRest(rest, url) {
   if (rest === "courses") {
-    const q = url.searchParams.get("q");
-    if (typeof q !== "string" || q.trim() === "") return null;
+    if (golfapiSearchQuery(url) == null) return null;
     return { kind: "search" };
   }
   let match = /^courses\/([^/]+)$/.exec(rest);
@@ -860,7 +874,7 @@ async function commitSets(boards, ident, devPlan, ipPlan, now) {
 }
 
 async function handleGolfapiSearch({ url, env, ctx, cors, boards, now, periods, limits, installId, ipHash, allowlisted }) {
-  const normalized = normalizeName(url.searchParams.get("q"));
+  const normalized = normalizeName(golfapiSearchQuery(url));
   if (!normalized) return golfJson(404, { error: "unknown_route" }, cors);
   const token = await searchToken(normalized);
   const storeKey = `gapi:search:${token}`;
@@ -1196,6 +1210,7 @@ async function drainGolfapiQueue(env) {
     const record = parseQueueRecord(await boards.get(name));
     if (name.startsWith("gqueue:q:")) {
       const token = name.slice("gqueue:q:".length);
+      // Original query string. The app sends name=; older rows used q=.
       const searchOk = record.search.startsWith("?") && !/[\r\n#]/.test(record.search);
       const tokenOk = /^[0-9a-f]{64}$/.test(token) && token === await searchToken(record.q);
       if (!tokenOk || record.q !== normalizeName(record.q) || !searchOk) {
