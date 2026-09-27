@@ -1,3 +1,5 @@
+import { GCA_CORRECTIONS, applyGcaScorecardCorrection } from "./gca-corrections.js";
+
 /**
  * Golf vendor proxy, inlined from ShotTraxx worker-golf-proxy.js.
  * Runs before board-key parsing so /gca/... and /golfapi/... are never stored
@@ -10,6 +12,10 @@
  *   GET /meta/golfapi                           → quota snapshot, no secrets
  *
  * Any other /golfapi/ path is 404. The API key is the GOLFAPI_KEY secret only.
+ *
+ * Successful JSON for a listed `/gca/v1/courses/{id}` is filled from
+ * gca-corrections.js after an edge-cache hit and after a fresh upstream read.
+ * Search, list, green-centers, and golfapi bodies are returned unchanged.
  *
  * OSM overlay proxy also runs before board-key parsing. The Worker builds the
  * Overpass query itself (clients never send Overpass QL):
@@ -1292,6 +1298,54 @@ function matchGolfVendor(pathname) {
   return null;
 }
 
+/** Listed GCA course detail only. Search, green-centers, and golfapi stay null. */
+function gcaListedCourseId(hit) {
+  if (hit.vendor !== GOLF_VENDORS.gca) return null;
+  const match = /^courses\/([^/]+)$/.exec(hit.rest);
+  if (!match || !Object.hasOwn(GCA_CORRECTIONS, match[1])) return null;
+  return match[1];
+}
+
+function isJsonContentType(value) {
+  const media = String(value ?? "").split(";")[0].trim().toLowerCase();
+  return media === "application/json" || media.endsWith("+json");
+}
+
+function replayGolfBody(response, raw) {
+  return new Response(raw, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
+/**
+ * Fill a listed course body on the way out. The edge cache keeps the upstream
+ * bytes, so a body stored before this layer still gets the correction.
+ */
+async function finishGolfCourse(response, courseId) {
+  if (!courseId) return response;
+  if (response.status < 200 || response.status >= 300) return response;
+  if (!isJsonContentType(response.headers.get("Content-Type"))) return response;
+
+  const raw = await response.text();
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    return replayGolfBody(response, raw);
+  }
+  if (!applyGcaScorecardCorrection(payload, courseId)) return replayGolfBody(response, raw);
+
+  const headers = new Headers(response.headers);
+  headers.delete("Content-Length");
+  return new Response(JSON.stringify(payload), {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 /**
  * Response for a golf proxy route, or null so the caller falls through to
  * share-board GET/PUT /{code}.
@@ -1309,12 +1363,13 @@ async function handleGolfProxy(request, env, ctx, cors) {
     return handleGolfapi(request, url, hit.rest, env, ctx, cors);
   }
 
+  const courseId = gcaListedCourseId(hit);
   const upstreamUrl = `${hit.vendor.upstream}${hit.rest}${url.search}`;
   const cache = typeof caches !== "undefined" ? caches.default : null;
   const cacheKey = new Request(url.toString(), { method: "GET" });
   if (cache) {
     const cached = await cache.match(cacheKey);
-    if (cached) return cached;
+    if (cached) return finishGolfCourse(cached, courseId);
   }
 
   let upstream;
@@ -1341,7 +1396,7 @@ async function handleGolfProxy(request, env, ctx, cors) {
     if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(put);
     else await put;
   }
-  return response;
+  return finishGolfCourse(response, courseId);
 }
 
 /**

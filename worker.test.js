@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { GCA_CORRECTIONS } from "./gca-corrections.js";
 import worker, { osmInflight } from "./worker.js";
 
 const ORIGIN = "https://shottrax-share.bcbaird.workers.dev";
@@ -1760,5 +1761,202 @@ describe("shottrax-share worker", () => {
     expect((await overridden.json()).globalCap).toBe(25);
     const invalid = await invoke(`${ORIGIN}/meta/golfapi`, { env: { ...env, GOLFAPI_GLOBAL_DAY: "nope" } });
     expect((await invalid.json()).globalCap).toBe(100);
+  });
+
+  // Printed Magnolia Country Club card, verified 2026-09-27. Front/back par 36/36.
+  const MAGNOLIA_PAR = [4, 4, 4, 5, 4, 4, 4, 3, 4, 5, 3, 5, 4, 4, 4, 3, 4, 4];
+  const MAGNOLIA_MEN = [17, 9, 1, 13, 3, 5, 15, 11, 7, 16, 18, 14, 10, 2, 4, 12, 8, 6];
+  const MAGNOLIA_WOMEN = [17, 7, 3, 9, 11, 1, 13, 15, 5, 8, 16, 12, 14, 4, 2, 10, 18, 6];
+  const MAGNOLIA_SOURCE = "club scorecard photo, verified 2026-09-27";
+
+  function permutationOf1to18(values) {
+    expect(values).toHaveLength(18);
+    expect([...values].sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
+  }
+
+  function scorecardHoles(overrides = {}) {
+    return MAGNOLIA_PAR.map((par, index) => ({
+      par,
+      yardage: 300 + index,
+      handicap: null,
+      handicap_women: null,
+      ...(overrides[index] ?? {}),
+    }));
+  }
+
+  function magnoliaScorecard(teeboxes) {
+    return JSON.stringify({
+      data: {
+        club_name: "Magnolia Country Club",
+        scorecard: {
+          teeboxes,
+        },
+      },
+    });
+  }
+
+  function upstreamMagnolia() {
+    return magnoliaScorecard([
+      { name: "Gold", course_rating: 73, slope_rating: 127, total_yards: 6780, holes: scorecardHoles() },
+      { name: "Blue", course_rating: 71.5, slope_rating: 124, total_yards: 6455, holes: scorecardHoles() },
+      { name: "White", course_rating: 69, slope_rating: 120, total_yards: 5893, holes: scorecardHoles() },
+    ]);
+  }
+
+  function scorecardResponse(body, status = 200, contentType = "application/json") {
+    return new Response(body, { status, headers: { "Content-Type": contentType } });
+  }
+
+  it("stores Magnolia stroke indexes as permutations of 1..18", () => {
+    const card = GCA_CORRECTIONS[GCA_ID];
+    expect(card.source).toBe(MAGNOLIA_SOURCE);
+    expect(card.par).toEqual(MAGNOLIA_PAR);
+    expect(card.par.slice(0, 9).reduce((sum, par) => sum + par, 0)).toBe(36);
+    expect(card.par.slice(9).reduce((sum, par) => sum + par, 0)).toBe(36);
+    permutationOf1to18(card.handicapMen);
+    permutationOf1to18(card.handicapWomen);
+    expect(card.handicapMen).toEqual(MAGNOLIA_MEN);
+    expect(card.handicapWomen).toEqual(MAGNOLIA_WOMEN);
+  });
+
+  it("fills Magnolia men's and women's stroke index on Gold, Blue, and White", async () => {
+    const raw = upstreamMagnolia();
+    fetchMock.mockResolvedValue(scorecardResponse(raw));
+    const response = await invoke(`${ORIGIN}/gca/v1/courses/${GCA_ID}`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe("application/json");
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=86400");
+    const json = await response.json();
+    expect(json.data.scorecard.teeboxes.map((tee) => tee.name)).toEqual(["Gold", "Blue", "White"]);
+    for (const tee of json.data.scorecard.teeboxes) {
+      expect(tee.holes.map((hole) => hole.par)).toEqual(MAGNOLIA_PAR);
+      expect(tee.holes.map((hole) => hole.handicap)).toEqual(MAGNOLIA_MEN);
+      expect(tee.holes.map((hole) => hole.handicap_women)).toEqual(MAGNOLIA_WOMEN);
+      expect(tee.holes.map((hole) => hole.yardage)).toEqual(MAGNOLIA_PAR.map((_, index) => 300 + index));
+    }
+    expect(json.data.scorecard.teeboxes[0].total_yards).toBe(6780);
+    expect(json.data.scorecard.corrections).toEqual({
+      source: MAGNOLIA_SOURCE,
+      fields: ["handicap", "handicap_women"],
+    });
+    expect(await edge.get(`${ORIGIN}/gca/v1/courses/${GCA_ID}`).clone().text()).toBe(raw);
+  });
+
+  it("does not overwrite an upstream par, handicap, or handicap_women", async () => {
+    const raw = magnoliaScorecard([
+      {
+        name: "Gold",
+        holes: scorecardHoles({
+          0: { handicap: 9 },
+          1: { handicap_women: 4 },
+          2: { handicap: 0 },
+          3: { par: 0 },
+          4: { par: null },
+        }),
+      },
+    ]);
+    fetchMock.mockResolvedValue(scorecardResponse(raw));
+    const json = await (await invoke(`${ORIGIN}/gca/v1/courses/${GCA_ID}`)).json();
+    const holes = json.data.scorecard.teeboxes[0].holes;
+    expect(holes[0].handicap).toBe(9);
+    expect(holes[0].handicap_women).toBe(MAGNOLIA_WOMEN[0]);
+    expect(holes[0].par).toBe(4);
+    expect(holes[1].handicap_women).toBe(4);
+    expect(holes[1].handicap).toBe(MAGNOLIA_MEN[1]);
+    expect(holes[2].handicap).toBe(0);
+    expect(holes[2].par).toBe(MAGNOLIA_PAR[2]);
+    expect(holes[3].par).toBe(MAGNOLIA_PAR[3]);
+    expect(holes[4].par).toBe(MAGNOLIA_PAR[4]);
+    expect(holes.map((hole) => hole.handicap)).toEqual([9, 9, 0, 13, 3, 5, 15, 11, 7, 16, 18, 14, 10, 2, 4, 12, 8, 6]);
+    expect(json.data.scorecard.corrections).toEqual({
+      source: MAGNOLIA_SOURCE,
+      fields: ["par", "handicap", "handicap_women"],
+    });
+  });
+
+  it("skips a teebox when an upstream par disagrees with the card", async () => {
+    const mismatched = scorecardHoles({ 2: { par: 5 } });
+    const raw = magnoliaScorecard([
+      { name: "Gold", holes: mismatched },
+      { name: "White", holes: scorecardHoles() },
+      { name: "Short", holes: scorecardHoles().slice(0, 9) },
+    ]);
+    fetchMock.mockResolvedValue(scorecardResponse(raw));
+    const json = await (await invoke(`${ORIGIN}/gca/v1/courses/${GCA_ID}`)).json();
+    const [gold, white, short] = json.data.scorecard.teeboxes;
+    expect(gold.holes.map((hole) => hole.par)).toEqual(mismatched.map((hole) => hole.par));
+    expect(gold.holes.every((hole) => hole.handicap == null && hole.handicap_women == null)).toBe(true);
+    expect(white.holes.map((hole) => hole.handicap)).toEqual(MAGNOLIA_MEN);
+    expect(white.holes.map((hole) => hole.handicap_women)).toEqual(MAGNOLIA_WOMEN);
+    expect(short.holes).toHaveLength(9);
+    expect(short.holes.every((hole) => hole.handicap == null)).toBe(true);
+    expect(json.data.scorecard.corrections.fields).toEqual(["handicap", "handicap_women"]);
+
+    const onlyMismatch = magnoliaScorecard([{ name: "Gold", holes: mismatched }]);
+    fetchMock.mockResolvedValue(scorecardResponse(onlyMismatch));
+    const skipped = await invoke(`${ORIGIN}/gca/v1/courses/${GCA_ID}?x=1`);
+    expect(await skipped.text()).toBe(onlyMismatch);
+  });
+
+  it("leaves non-listed ids and green-centers byte-identical", async () => {
+    const marked = '{"data":{"scorecard":{"teeboxes":[{"holes":[{"par":4,"handicap":null,"handicap_women":null}]}] }},"keep":true}';
+    const cases = [
+      [`${ORIGIN}/gca/v1/courses/99999`, marked],
+      [`${ORIGIN}/gca/v1/courses/${GCA_ID}/green-centers`, marked],
+      [`${ORIGIN}/gca/v1/courses?q=magnolia`, marked],
+      [`${ORIGIN}/golfapi/v2.3/courses/${GCA_ID}`, marked],
+      [`${ORIGIN}/gca/v1/courses/${GCA_ID}`, "not-json"],
+    ];
+    for (const [url, body] of cases) {
+      const contentType = body === "not-json" ? "text/plain" : "application/json";
+      fetchMock.mockResolvedValue(scorecardResponse(body, 200, contentType));
+      const response = await invoke(url);
+      expect(await response.text()).toBe(body);
+    }
+
+    edge.delete(`${ORIGIN}/gca/v1/courses/${GCA_ID}`);
+    fetchMock.mockResolvedValue(scorecardResponse(marked, 403));
+    const forbidden = await invoke(`${ORIGIN}/gca/v1/courses/${GCA_ID}`);
+    expect(forbidden.status).toBe(403);
+    expect(await forbidden.text()).toBe(marked);
+
+    edge.set(`${ORIGIN}/gca/v1/courses/99999`, scorecardResponse(marked));
+    edge.set(`${ORIGIN}/gca/v1/courses/${GCA_ID}/green-centers`, scorecardResponse(marked));
+    const calls = fetchMock.mock.calls.length;
+    const cachedCourse = await invoke(`${ORIGIN}/gca/v1/courses/99999`);
+    const cachedGreens = await invoke(`${ORIGIN}/gca/v1/courses/${GCA_ID}/green-centers`);
+    expect(await cachedCourse.text()).toBe(marked);
+    expect(await cachedGreens.text()).toBe(marked);
+    expect(fetchMock.mock.calls.length).toBe(calls);
+  });
+
+  it("corrects a course body that is already in the edge cache", async () => {
+    const raw = upstreamMagnolia();
+    const url = `${ORIGIN}/gca/v1/courses/${GCA_ID}`;
+    edge.set(url, scorecardResponse(raw, 200, "application/json; charset=utf-8"));
+    const response = await invoke(url);
+    expect(fetchMock).not.toHaveBeenCalled();
+    const json = await response.json();
+    expect(json.data.scorecard.teeboxes).toHaveLength(3);
+    for (const tee of json.data.scorecard.teeboxes) {
+      expect(tee.holes.map((hole) => hole.handicap)).toEqual(MAGNOLIA_MEN);
+      expect(tee.holes.map((hole) => hole.handicap_women)).toEqual(MAGNOLIA_WOMEN);
+    }
+    expect(json.data.scorecard.corrections).toEqual({
+      source: MAGNOLIA_SOURCE,
+      fields: ["handicap", "handicap_women"],
+    });
+    expect(await edge.get(url).clone().text()).toBe(raw);
+
+    fetchMock.mockResolvedValue(scorecardResponse(raw));
+    const fresh = await invoke(`${url}?fresh=1`);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const again = await invoke(`${url}?fresh=1`);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const freshJson = await fresh.json();
+    const againJson = await again.json();
+    expect(againJson).toEqual(freshJson);
+    expect(againJson.data.scorecard.teeboxes[1].holes.map((hole) => hole.handicap)).toEqual(MAGNOLIA_MEN);
+    expect(await edge.get(`${url}?fresh=1`).clone().text()).toBe(raw);
   });
 });
