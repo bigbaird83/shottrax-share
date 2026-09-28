@@ -2630,7 +2630,8 @@ describe("shottrax-share worker", () => {
   });
 
   // Club scorecard PDF golfgreystonecc.com, verified 2026-09-27. Front/back par 36/36.
-  // White hole 18 is par 4 upstream and par 5 on the card, so that teebox is skipped.
+  // The card and the course owner both confirm hole 18 is par 5. Upstream White
+  // lists par 4, and parFixes rewrites that one hole before the stroke index fills.
   const GREYSTONE_ID = "14137";
   const GREYSTONE_PAR = [4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 4, 3, 4, 5, 4, 3, 4, 5];
   const GREYSTONE_MEN = [13, 17, 5, 9, 7, 15, 11, 3, 1, 10, 6, 16, 14, 4, 12, 18, 2, 8];
@@ -2680,31 +2681,39 @@ describe("shottrax-share worker", () => {
     permutationOf1to18(card.handicapWomen);
     expect(card.handicapMen).toEqual(GREYSTONE_MEN);
     expect(card.handicapWomen).toEqual(GREYSTONE_WOMEN);
+    expect(card.parFixes).toEqual([{ tee: "White", hole: 18, from: 4, to: 5 }]);
   });
 
-  it("fills Greystone stroke index on Grey, Blue, and Black and leaves White blank", async () => {
-    const raw = upstreamGreystone();
+  it("fills Greystone stroke index on every tee after correcting White hole 18", async () => {
+    const body = JSON.parse(upstreamGreystone());
+    body.data.scorecard.teeboxes[2].name = "WHITE";
+    body.data.scorecard.teeboxes[2].course_rating = 69.1;
+    body.data.scorecard.teeboxes[2].slope_rating = 122;
+    const raw = JSON.stringify(body);
+    const upstreamWhite = body.data.scorecard.teeboxes[2];
     fetchMock.mockResolvedValue(scorecardResponse(raw));
     const response = await invoke(`${ORIGIN}/gca/v1/courses/${GREYSTONE_ID}`);
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("application/json");
     expect(response.headers.get("Cache-Control")).toBe("public, max-age=300");
     const json = await response.json();
-    expect(json.data.scorecard.teeboxes.map((tee) => tee.name)).toEqual(["Grey", "Blue", "White", "Black"]);
+    expect(json.data.scorecard.teeboxes.map((tee) => tee.name)).toEqual(["Grey", "Blue", "WHITE", "Black"]);
     const [grey, blue, white, black] = json.data.scorecard.teeboxes;
-    for (const tee of [grey, blue, black]) {
+    for (const tee of [grey, blue, white, black]) {
       expect(tee.holes.map((hole) => hole.par)).toEqual(GREYSTONE_PAR);
       expect(tee.holes.map((hole) => hole.handicap)).toEqual(GREYSTONE_MEN);
       expect(tee.holes.map((hole) => hole.handicap_women)).toEqual(GREYSTONE_WOMEN);
       expect(tee.holes.map((hole) => hole.yardage)).toEqual(GREYSTONE_PAR.map((_, index) => 300 + index));
     }
-    const whitePar = GREYSTONE_PAR.map((par, index) => (index === 17 ? 4 : par));
-    expect(white.holes.map((hole) => hole.par)).toEqual(whitePar);
-    expect(white.holes.every((hole) => hole.handicap == null && hole.handicap_women == null)).toBe(true);
-    expect(white.holes.map((hole) => hole.yardage)).toEqual(whitePar.map((_, index) => 300 + index));
+    expect(white.holes[17].par).toBe(5);
+    expect(white.holes.slice(0, 17).map((hole) => hole.par)).toEqual(upstreamWhite.holes.slice(0, 17).map((hole) => hole.par));
+    expect(white.holes.map((hole) => hole.yardage)).toEqual(upstreamWhite.holes.map((hole) => hole.yardage));
+    expect(white.course_rating).toBe(69.1);
+    expect(white.slope_rating).toBe(122);
+    expect(white.total_yards).toBe(6038);
     expect([grey, blue, white, black].map((tee) => tee.total_yards)).toEqual([7051, 6509, 6038, 5451]);
     expect(json.data.scorecard.corrections).toEqual(
-      scorecardCorrection(GREYSTONE_SOURCE, ["handicap", "handicap_women"]),
+      scorecardCorrection(GREYSTONE_SOURCE, ["par", "handicap", "handicap_women"]),
     );
     expect(await edge.get(`${ORIGIN}/gca/v1/courses/${GREYSTONE_ID}`).clone().text()).toBe(raw);
     expect(kv.get(`gca:course:${GREYSTONE_ID}`).value).toBe(raw);
@@ -2740,17 +2749,69 @@ describe("shottrax-share worker", () => {
     expect(blue.holes.map((hole) => hole.handicap_women)).toEqual(GREYSTONE_WOMEN);
     expect(black.holes.map((hole) => hole.handicap)).toEqual(GREYSTONE_MEN);
     expect(black.holes.map((hole) => hole.handicap_women)).toEqual(GREYSTONE_WOMEN);
-    expect(white.holes[17].par).toBe(4);
+    expect(white.holes.map((hole) => hole.par)).toEqual(GREYSTONE_PAR);
+    expect(white.holes[17].par).toBe(5);
+    expect(white.holes.map((hole) => hole.yardage)).toEqual(GREYSTONE_PAR.map((_, index) => 300 + index));
     expect(white.holes[0].handicap).toBe(7);
-    expect(white.holes[0].handicap_women).toBeNull();
-    expect(white.holes[5].handicap).toBeNull();
+    expect(white.holes[0].handicap_women).toBe(GREYSTONE_WOMEN[0]);
+    expect(white.holes[5].handicap).toBe(GREYSTONE_MEN[5]);
     expect(white.holes[5].handicap_women).toBe(2);
-    expect(white.holes.filter((_, index) => index !== 0).every((hole) => hole.handicap == null)).toBe(true);
-    expect(white.holes.filter((_, index) => index !== 5).every((hole) => hole.handicap_women == null)).toBe(true);
+    expect(white.holes.map((hole) => hole.handicap)).toEqual([7, 17, 5, 9, 7, 15, 11, 3, 1, 10, 6, 16, 14, 4, 12, 18, 2, 8]);
+    expect(white.holes.map((hole) => hole.handicap_women)).toEqual([13, 17, 5, 9, 7, 2, 11, 3, 1, 10, 6, 16, 14, 4, 12, 18, 2, 8]);
+    expect(json.data.scorecard.corrections).toEqual(
+      scorecardCorrection(GREYSTONE_SOURCE, ["par", "handicap", "handicap_women"]),
+    );
+    expect(kv.get(`gca:course:${GREYSTONE_ID}`).value).toBe(raw);
+  });
+
+  it("does not change Greystone when White hole 18 is already par 5", async () => {
+    const filled = (pars) => greystoneHoles(pars).map((hole, index) => ({
+      ...hole,
+      handicap: GREYSTONE_MEN[index],
+      handicap_women: GREYSTONE_WOMEN[index],
+    }));
+    const raw = greystoneScorecard([
+      { name: "Grey", course_rating: 73.8, slope_rating: 133, total_yards: 7051, holes: filled(GREYSTONE_PAR) },
+      { name: "Blue", course_rating: 71.6, slope_rating: 128, total_yards: 6509, holes: filled(GREYSTONE_PAR) },
+      { name: "WHITE", course_rating: 69.1, slope_rating: 122, total_yards: 6038, holes: filled(GREYSTONE_PAR) },
+      { name: "Black", course_rating: 67.2, slope_rating: 115, total_yards: 5451, holes: filled(GREYSTONE_PAR) },
+    ]);
+    fetchMock.mockResolvedValue(scorecardResponse(raw));
+    const response = await invoke(`${ORIGIN}/gca/v1/courses/${GREYSTONE_ID}`);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe(raw);
+    expect(kv.get(`gca:course:${GREYSTONE_ID}`).value).toBe(raw);
+  });
+
+  it("skips the Greystone White par fix when hole 18 is neither 4 nor 5", async () => {
+    const whitePar = GREYSTONE_PAR.map((par, index) => (index === 17 ? 3 : par));
+    const body = JSON.parse(greystoneScorecard([
+      { name: "Grey", course_rating: 73.8, slope_rating: 133, total_yards: 7051, holes: greystoneHoles(GREYSTONE_PAR) },
+      { name: "Blue", course_rating: 71.6, slope_rating: 128, total_yards: 6509, holes: greystoneHoles(GREYSTONE_PAR) },
+      { name: "White", course_rating: 69.1, slope_rating: 122, total_yards: 6038, holes: greystoneHoles(whitePar) },
+      { name: "Black", course_rating: 67.2, slope_rating: 115, total_yards: 5451, holes: greystoneHoles(GREYSTONE_PAR) },
+    ]));
+    const raw = JSON.stringify(body);
+    const upstream = body.data.scorecard.teeboxes;
+    fetchMock.mockResolvedValue(scorecardResponse(raw));
+    const json = await (await invoke(`${ORIGIN}/gca/v1/courses/${GREYSTONE_ID}`)).json();
+    const [grey, blue, white, black] = json.data.scorecard.teeboxes;
+    for (const tee of [grey, blue, black]) {
+      expect(tee.holes.map((hole) => hole.par)).toEqual(GREYSTONE_PAR);
+      expect(tee.holes.map((hole) => hole.handicap)).toEqual(GREYSTONE_MEN);
+      expect(tee.holes.map((hole) => hole.handicap_women)).toEqual(GREYSTONE_WOMEN);
+      expect(tee.holes.map((hole) => hole.yardage)).toEqual(GREYSTONE_PAR.map((_, index) => 300 + index));
+    }
+    expect(white.holes.map((hole) => hole.par)).toEqual(whitePar);
+    expect(white.holes[17].par).toBe(3);
+    expect(white.holes.every((hole) => hole.handicap == null && hole.handicap_women == null)).toBe(true);
+    expect(white.holes.map((hole) => hole.yardage)).toEqual(upstream[2].holes.map((hole) => hole.yardage));
+    expect(white.course_rating).toBe(upstream[2].course_rating);
+    expect(white.slope_rating).toBe(upstream[2].slope_rating);
+    expect(white.total_yards).toBe(upstream[2].total_yards);
     expect(json.data.scorecard.corrections).toEqual(
       scorecardCorrection(GREYSTONE_SOURCE, ["handicap", "handicap_women"]),
     );
-    expect(kv.get(`gca:course:${GREYSTONE_ID}`).value).toBe(raw);
   });
 
   // Club scorecard photo, Cypress Creek at Greystone, verified 2026-09-27.
