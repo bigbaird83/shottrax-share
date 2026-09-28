@@ -2359,6 +2359,255 @@ async function handleOsmOverlay(request, env, ctx, cors) {
   }
 }
 
+function finiteNumber(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function hasLatLng(point) {
+  return isPlainObject(point) && finiteNumber(point.lat) && finiteNumber(point.lng);
+}
+
+function holeHasTeeAndGreen(hole) {
+  return isPlainObject(hole) && hasLatLng(hole.tee) && hasLatLng(hole.green);
+}
+
+/** Positive integer hole number already present on a stored hole. */
+function holeNumber(hole) {
+  if (!isPlainObject(hole)) return null;
+  const raw = hole.hole;
+  const n = typeof raw === "number" ? raw : typeof raw === "string" && raw.trim() !== "" ? Number(raw.trim()) : NaN;
+  if (!Number.isInteger(n) || n < 1 || n > 99) return null;
+  return n;
+}
+
+function parsePaintRecord(text) {
+  if (typeof text !== "string" || text === "") return null;
+  try {
+    const value = JSON.parse(text);
+    return isPlainObject(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function emptyPaintField(value) {
+  if (value == null) return true;
+  if (typeof value === "string" && value.trim() === "") return true;
+  if (Array.isArray(value) && value.length === 0) return true;
+  return false;
+}
+
+function numericNumHoles(record) {
+  if (!isPlainObject(record) || record.numHoles == null || record.numHoles === "") return null;
+  const n = typeof record.numHoles === "number" ? record.numHoles : Number(String(record.numHoles).trim());
+  if (!Number.isInteger(n) || n <= 0) return null;
+  return n;
+}
+
+function sameNumHoles(a, b) {
+  const left = numericNumHoles(a);
+  const right = numericNumHoles(b);
+  return left != null && left === right;
+}
+
+/** One entry per hole number. A complete tee+green hole wins over an earlier blank. */
+function indexPaintHoles(holes) {
+  const map = new Map();
+  const order = [];
+  if (!Array.isArray(holes)) return { map, order };
+  for (const hole of holes) {
+    const n = holeNumber(hole);
+    if (n == null) continue;
+    const prev = map.get(n);
+    if (!prev) {
+      map.set(n, hole);
+      order.push(n);
+      continue;
+    }
+    if (!holeHasTeeAndGreen(prev) && holeHasTeeAndGreen(hole)) map.set(n, hole);
+  }
+  return { map, order };
+}
+
+function completeHoleCount(holes) {
+  const { map } = indexPaintHoles(holes);
+  let count = 0;
+  for (const hole of map.values()) {
+    if (holeHasTeeAndGreen(hole)) count += 1;
+  }
+  return count;
+}
+
+function paintHasGaps(record) {
+  const numHoles = numericNumHoles(record);
+  if (numHoles == null) return false;
+  return completeHoleCount(record.holes) < numHoles;
+}
+
+function unionPaintAliases(existing, incoming) {
+  const out = [];
+  const seen = new Set();
+  for (const list of [existing, incoming]) {
+    if (!Array.isArray(list)) continue;
+    for (const item of list) {
+      if (typeof item !== "string") continue;
+      const alias = item.trim();
+      if (!alias || alias.length > 180 || seen.has(alias)) continue;
+      seen.add(alias);
+      out.push(alias);
+    }
+  }
+  return out;
+}
+
+function paintAliasKeys(record, selfKey) {
+  const keys = [];
+  const seen = new Set();
+  if (!Array.isArray(record.aliases)) return keys;
+  for (const item of record.aliases) {
+    if (typeof item !== "string") continue;
+    const alias = item.trim();
+    if (!alias || alias.length > 180 || alias === selfKey || seen.has(alias)) continue;
+    if (!isPaintKey(alias) || isReservedBoardKey(alias)) continue;
+    seen.add(alias);
+    keys.push(alias);
+  }
+  return keys;
+}
+
+/**
+ * Copy holes the base record is missing, or replace a hole that has no tee or
+ * no green. A hole that already has both stays as stored. Hole objects are
+ * moved whole; tee and green are never mixed from two records.
+ */
+function mergePaintHoles(baseHoles, donorHoles) {
+  const { map, order } = indexPaintHoles(baseHoles);
+  const donor = indexPaintHoles(donorHoles);
+  let changed = false;
+  for (const n of donor.order) {
+    const incomingHole = donor.map.get(n);
+    const current = map.get(n);
+    if (!current) {
+      map.set(n, incomingHole);
+      order.push(n);
+      changed = true;
+      continue;
+    }
+    if (holeHasTeeAndGreen(current)) continue;
+    if (JSON.stringify(current) === JSON.stringify(incomingHole)) continue;
+    map.set(n, incomingHole);
+    changed = true;
+  }
+  const holes = order.map((n) => map.get(n));
+  if (Array.isArray(baseHoles)) {
+    for (const hole of baseHoles) {
+      if (isPlainObject(hole) && holeNumber(hole) == null) holes.push(hole);
+    }
+  }
+  return { holes, changed };
+}
+
+/**
+ * Blanks-only merge for a PUT over an existing paint record.
+ * `added` is false when the stored record would not gain a hole, an alias,
+ * or a top-level value that was empty.
+ */
+function mergePaintRecords(existing, incoming) {
+  const base = isPlainObject(existing) ? existing : {};
+  const next = isPlainObject(incoming) ? incoming : {};
+  const merged = { ...base };
+  let fieldsChanged = false;
+  for (const [field, value] of Object.entries(next)) {
+    if (field === "holes" || field === "aliases") continue;
+    if (emptyPaintField(merged[field]) && !emptyPaintField(value)) {
+      merged[field] = value;
+      fieldsChanged = true;
+    }
+  }
+
+  const aliases = unionPaintAliases(base.aliases, next.aliases);
+  const previousAliases = unionPaintAliases(base.aliases, []);
+  const aliasesChanged = aliases.length !== previousAliases.length
+    || aliases.some((alias, index) => alias !== previousAliases[index]);
+  if (aliases.length > 0) merged.aliases = aliases;
+
+  const holeMerge = mergePaintHoles(base.holes, next.holes);
+  const beforeComplete = completeHoleCount(base.holes);
+  const afterComplete = completeHoleCount(holeMerge.holes);
+  const holesChanged = holeMerge.changed && afterComplete >= beforeComplete;
+  if (holesChanged) merged.holes = holeMerge.holes;
+
+  return {
+    record: merged,
+    added: fieldsChanged || aliasesChanged || holesChanged,
+  };
+}
+
+function paintReplaceRequested(request) {
+  const raw = request.headers.get("X-Paint-Replace");
+  return typeof raw === "string" && raw.trim() === "1";
+}
+
+function paintUnchangedResponse(cors) {
+  return new Response(JSON.stringify({ changed: false, message: "nothing changed" }), {
+    status: 200,
+    headers: { ...cors, "Content-Type": "application/json" },
+  });
+}
+
+function paintStoredResponse(body, cors) {
+  return new Response(body, {
+    headers: { ...cors, "Content-Type": "application/json" },
+  });
+}
+
+/**
+ * Older phones PUT a short hole list over a fuller record. Keep every stored
+ * hole that already has a tee and a green. X-Paint-Replace: 1 stores the
+ * body as sent, for an intentional correction.
+ */
+async function putPaintRecord(boards, key, body, ttl, request, cors) {
+  if (paintReplaceRequested(request)) {
+    await boards.put(key, body, { expirationTtl: ttl });
+    return paintStoredResponse(body, cors);
+  }
+  const existingRaw = await boards.get(key);
+  if (!existingRaw) {
+    await boards.put(key, body, { expirationTtl: ttl });
+    return paintStoredResponse(body, cors);
+  }
+  const existing = parsePaintRecord(existingRaw);
+  const incoming = parsePaintRecord(body);
+  if (!existing || !incoming) return paintUnchangedResponse(cors);
+  const { record, added } = mergePaintRecords(existing, incoming);
+  if (!added || completeHoleCount(record.holes) < completeHoleCount(existing.holes)) {
+    return paintUnchangedResponse(cors);
+  }
+  const stored = JSON.stringify(record);
+  await boards.put(key, stored, { expirationTtl: ttl });
+  return paintStoredResponse(stored, cors);
+}
+
+/** Read-only fill. Alias holes are copied only when numHoles matches. */
+async function paintGetBody(boards, key, raw) {
+  const record = parsePaintRecord(raw);
+  if (!record || !paintHasGaps(record)) return raw;
+  const aliases = paintAliasKeys(record, key).slice(0, 3);
+  if (aliases.length === 0) return raw;
+  let current = record;
+  let changed = false;
+  for (const alias of aliases) {
+    const other = parsePaintRecord(await boards.get(alias));
+    if (!other || !sameNumHoles(current, other)) continue;
+    const holeMerge = mergePaintHoles(current.holes, other.holes);
+    if (!holeMerge.changed) continue;
+    if (completeHoleCount(holeMerge.holes) < completeHoleCount(current.holes)) continue;
+    current = { ...current, holes: holeMerge.holes };
+    changed = true;
+  }
+  return changed ? JSON.stringify(current) : raw;
+}
+
 function corsHeaders(pathname) {
   const headers = {
     "Access-Control-Allow-Methods": "GET,PUT,OPTIONS",
@@ -2425,13 +2674,15 @@ export default {
     if (request.method === "GET") {
       const val = await env.BOARDS.get(key);
       if (!val) return new Response("{}", { status: 404, headers: { ...cors, "Content-Type": "application/json" } });
-      return new Response(val, { headers: { ...cors, "Content-Type": "application/json" } });
+      const body = isPaint ? await paintGetBody(env.BOARDS, key, val) : val;
+      return new Response(body, { headers: { ...cors, "Content-Type": "application/json" } });
     }
     if (request.method === "PUT") {
       const body = await request.text();
       if (!body || body.length > 20000) {
         return new Response("bad body", { status: 400, headers: cors });
       }
+      if (isPaint) return putPaintRecord(env.BOARDS, key, body, ttl, request, cors);
       await env.BOARDS.put(key, body, { expirationTtl: ttl });
       return new Response(body, { headers: { ...cors, "Content-Type": "application/json" } });
     }
