@@ -96,7 +96,7 @@ import { handleLivePage, isLiveBoardCode } from "./live-page.js";
  * about one write per second, so a burst can overshoot by 1–2. The global
  * daily cap and the balance floor are the backstop. A Durable Object could
  * make this exact later. Public GET/PUT/DELETE cannot read or write gq:,
- * gapi:, gqueue:, gca:, or osm: keys.
+ * gapi:, gqueue:, gca:, osm:, or cr: keys, or any key that starts with v1.
  *
  * GCA search stays edge-only for 24 hours. courses/{id} and
  * courses/{id}/green-centers keep the raw upstream body in BOARDS for a year
@@ -113,6 +113,51 @@ import { handleLivePage, isLiveBoardCode } from "./live-page.js";
  * missingInstallId is an edge-cache miss with no valid install id. An edge
  * hit does not read or write KV for that count. A valid id is not counted.
  * GCA_REQUIRE_INSTALL_ID is an optional var, default off. No new secrets.
+ *
+ * In-round course/hole problem reports run before the board-key catch-all.
+ * Otherwise the first path segment would be a KV board key: POST /v1/... is
+ * 405 and GET /v1 would read a board named "v1". Any other /v1/* path is
+ * 404 {error:"unknown_route"}.
+ *
+ *   POST /v1/course-reports
+ *   GET  /v1/course-reports                         admin
+ *   GET  /v1/course-reports/{clientReportId}        admin, one record
+ *
+ * POST JSON, 4096 bytes max. 201 {ok:true,id} stores a new report. The same
+ * clientReportId is 200 {ok:true,id,duplicate:true} and does not write again.
+ * Invalid JSON is 400 {error:"invalid_json"}. Larger than 4096 is 413
+ * {error:"too_large"}. A field that can never succeed is 422
+ * {error:"invalid",field}. Unknown top-level fields are ignored. Unknown
+ * reason strings are dropped, not rejected, unless none of the known reasons
+ * remain.
+ *
+ * Required: clientReportId (loose uuid, ≤64), createdAt (ISO, stored as
+ * sent), courseId (1..180), courseName (trimmed, 1..200), holeNumber (1..18),
+ * reasons (non-empty after the known-value filter). Optional: note (≤500),
+ * position, appVersion, buildNumber, platform (each ≤32), paintSource (≤32,
+ * stored lowercased), shown, and header X-Install-Id (≤100, stored as
+ * installId). shown never rejects the report: a non-object becomes null.
+ * par is kept when it is an integer 1..10 and is otherwise null. green and
+ * tee are kept only as a valid lat/lon and are otherwise null.
+ *
+ * BOARDS keys, both TTL 180 days:
+ *   cr:id:<clientReportId>                  dedupe marker; value is the record key
+ *   cr:r:<receivedAt ISO with ms>:<id>      normalized JSON
+ * Server fields on the record: receivedAt, installId, and request.cf.country
+ * when that is present. The raw IP is never stored. New reports are capped
+ * per UTC day at 30 for CF-Connecting-IP and 20 for X-Install-Id when the
+ * header is present. Duplicates do not count. Over the cap is 429
+ * {error:"rate_limited"} plus Retry-After in seconds. Override with
+ * COURSE_REPORTS_IP_DAY and COURSE_REPORTS_DEVICE_DAY. Counters are short-TTL
+ * cr:n: keys and are not atomic.
+ *
+ * Admin GET requires Authorization: Bearer <COURSE_REPORTS_ADMIN_TOKEN>,
+ * compared in constant time. Set it with `wrangler secret put
+ * COURSE_REPORTS_ADMIN_TOKEN`. Unset fails closed: 503 {error:"not_configured"}.
+ * Wrong or missing bearer is 401. Query: since (ISO, key order on receivedAt),
+ * courseId (exact), limit (default 100, max 500), cursor (KV list cursor).
+ * Body is {reports, cursor|null}, oldest first. Unbound BOARDS is 503
+ * {error:"boards_not_configured"} on POST and on admin GET.
  */
 
 const OVERPASS_PRIMARY = "https://overpass-api.de/api/interpreter";
@@ -196,7 +241,7 @@ const GOLFAPI_LATENCY_KINDS = ["search", "course", "coordinates"];
 const GOLFAPI_IP_PREFIX = "shottrax-golfapi-ip-v1:";
 const GOLFAPI_SEARCH_PREFIX = "shottrax-golfapi-search-v1:";
 const GOLFAPI_BALANCE_KEY = "gq:balance";
-const RESERVED_BOARD_PREFIXES = ["osm:", "gq:", "gapi:", "gqueue:", "gca:"];
+const RESERVED_BOARD_PREFIXES = ["osm:", "gq:", "gapi:", "gqueue:", "gca:", "cr:"];
 const GOLFAPI_REASONS = [
   "device_day",
   "device_week",
@@ -211,6 +256,9 @@ const GOLFAPI_REASONS = [
 ];
 
 function isReservedBoardKey(key) {
+  if (typeof key !== "string") return false;
+  // /v1/... must not fall through to a board named "v1", and neither may any other key.
+  if (key.startsWith("v1")) return true;
   return RESERVED_BOARD_PREFIXES.some((prefix) => key.startsWith(prefix));
 }
 
@@ -2608,10 +2656,434 @@ async function paintGetBody(boards, key, raw) {
   return changed ? JSON.stringify(current) : raw;
 }
 
+const COURSE_REPORT_TTL = 60 * 60 * 24 * 180;
+const COURSE_REPORT_BODY_MAX = 4096;
+const COURSE_REPORT_IP_DAY_DEFAULT = 30;
+const COURSE_REPORT_DEVICE_DAY_DEFAULT = 20;
+const COURSE_REPORT_REASONS = new Set([
+  "hole_missing",
+  "green_wrong",
+  "tee_wrong",
+  "wrong_par",
+  "wrong_course",
+  "other",
+]);
+/** 8-4-4-4-12 hex, any version. Case-insensitive. The 64-char cap is a hard ceiling. */
+const COURSE_REPORT_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const COURSE_REPORT_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+function isCourseReportPath(pathname) {
+  return pathname === "/v1/course-reports" || pathname.startsWith("/v1/course-reports/");
+}
+
+function readCourseReportLimits(env) {
+  const source = env || {};
+  return {
+    ipDay: readConfigInt(source.COURSE_REPORTS_IP_DAY) ?? COURSE_REPORT_IP_DAY_DEFAULT,
+    deviceDay: readConfigInt(source.COURSE_REPORTS_DEVICE_DAY) ?? COURSE_REPORT_DEVICE_DAY_DEFAULT,
+  };
+}
+
+function utf8ByteLength(text) {
+  return new TextEncoder().encode(text).length;
+}
+
+function validClientReportId(value) {
+  return typeof value === "string" && value.length <= 64 && COURSE_REPORT_UUID_RE.test(value);
+}
+
+function isIsoDateTime(value) {
+  if (typeof value !== "string" || value.length > 40 || !COURSE_REPORT_ISO_RE.test(value)) return false;
+  return Number.isFinite(Date.parse(value));
+}
+
+function invalidField(field) {
+  return { ok: false, field };
+}
+
+function readOptionalString(payload, field, max) {
+  if (!Object.prototype.hasOwnProperty.call(payload, field) || payload[field] == null) {
+    return { ok: true, present: false };
+  }
+  if (typeof payload[field] !== "string") return invalidField(field);
+  const text = payload[field].trim();
+  if (text.length > max) return invalidField(field);
+  return { ok: true, present: true, value: text };
+}
+
+function parseLatLon(point) {
+  if (!isPlainObject(point) || !finiteNumber(point.lat) || !finiteNumber(point.lon)) return null;
+  if (point.lat < -90 || point.lat > 90 || point.lon < -180 || point.lon > 180) return null;
+  return { lat: point.lat, lon: point.lon };
+}
+
+/**
+ * What the phone displayed. Bad data is the report, so this never fails the
+ * request: a non-object becomes null, a par outside 1..10 becomes null, and
+ * a green or tee that is not a lat/lon becomes null.
+ */
+function normalizeShown(shown) {
+  if (!isPlainObject(shown)) return null;
+  const out = {};
+  if (Object.prototype.hasOwnProperty.call(shown, "par")) {
+    out.par = Number.isInteger(shown.par) && shown.par >= 1 && shown.par <= 10 ? shown.par : null;
+  }
+  for (const name of ["green", "tee"]) {
+    if (!Object.prototype.hasOwnProperty.call(shown, name)) continue;
+    out[name] = parseLatLon(shown[name]);
+  }
+  return out;
+}
+
+/** Client fields only. Server fields are added after this accepts the body. */
+function parseCourseReport(payload) {
+  if (!isPlainObject(payload)) return invalidField("body");
+  if (!validClientReportId(payload.clientReportId)) return invalidField("clientReportId");
+  if (!isIsoDateTime(payload.createdAt)) return invalidField("createdAt");
+  if (typeof payload.courseId !== "string" || payload.courseId.length < 1 || payload.courseId.length > 180) {
+    return invalidField("courseId");
+  }
+  if (typeof payload.courseName !== "string") return invalidField("courseName");
+  const courseName = payload.courseName.trim();
+  if (courseName.length < 1 || courseName.length > 200) return invalidField("courseName");
+  if (!Number.isInteger(payload.holeNumber) || payload.holeNumber < 1 || payload.holeNumber > 18) {
+    return invalidField("holeNumber");
+  }
+  if (!Array.isArray(payload.reasons)) return invalidField("reasons");
+  const reasons = [];
+  const seen = new Set();
+  for (const item of payload.reasons) {
+    if (typeof item !== "string" || !COURSE_REPORT_REASONS.has(item) || seen.has(item)) continue;
+    seen.add(item);
+    reasons.push(item);
+  }
+  if (reasons.length === 0) return invalidField("reasons");
+
+  const record = {
+    clientReportId: payload.clientReportId,
+    createdAt: payload.createdAt,
+    courseId: payload.courseId,
+    courseName,
+    holeNumber: payload.holeNumber,
+    reasons,
+  };
+
+  if (Object.prototype.hasOwnProperty.call(payload, "note") && payload.note != null) {
+    if (typeof payload.note !== "string") return invalidField("note");
+    const note = payload.note.trim();
+    if (note.length > 500) return invalidField("note");
+    record.note = note;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(payload, "position")) {
+    if (payload.position == null) {
+      record.position = null;
+    } else if (!isPlainObject(payload.position)) {
+      return invalidField("position");
+    } else {
+      const point = parseLatLon(payload.position);
+      if (!point) return invalidField("position");
+      let accuracyM = null;
+      if (Object.prototype.hasOwnProperty.call(payload.position, "accuracyM") && payload.position.accuracyM != null) {
+        if (!finiteNumber(payload.position.accuracyM) || payload.position.accuracyM < 0) return invalidField("position");
+        accuracyM = payload.position.accuracyM;
+      }
+      record.position = { lat: point.lat, lon: point.lon, accuracyM };
+    }
+  }
+
+  for (const field of ["appVersion", "buildNumber", "platform"]) {
+    const parsed = readOptionalString(payload, field, 32);
+    if (!parsed.ok) return invalidField(field);
+    if (parsed.present) record[field] = parsed.value;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(payload, "paintSource")) {
+    if (payload.paintSource == null) {
+      record.paintSource = null;
+    } else if (typeof payload.paintSource !== "string") {
+      return invalidField("paintSource");
+    } else {
+      const paintSource = payload.paintSource.trim().toLowerCase();
+      if (paintSource.length > 32) return invalidField("paintSource");
+      record.paintSource = paintSource;
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(payload, "shown")) {
+    record.shown = normalizeShown(payload.shown);
+  }
+
+  return { ok: true, record };
+}
+
+function readCourseReportInstallId(request) {
+  const raw = request.headers.get("X-Install-Id");
+  if (typeof raw !== "string") return { ok: true, id: null };
+  const id = raw.trim();
+  if (!id) return { ok: true, id: null };
+  if (id.length > 100) return { ok: false };
+  return { ok: true, id };
+}
+
+function readRequestCountry(request) {
+  const cf = request && request.cf;
+  if (!cf || typeof cf !== "object") return null;
+  const country = cf.country;
+  if (typeof country !== "string") return null;
+  const code = country.trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(code)) return null;
+  return code;
+}
+
+async function timingSafeEqualText(left, right) {
+  const enc = new TextEncoder();
+  const [aBuf, bBuf] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(String(left))),
+    crypto.subtle.digest("SHA-256", enc.encode(String(right))),
+  ]);
+  const a = new Uint8Array(aBuf);
+  const b = new Uint8Array(bBuf);
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+
+function courseReportsAdminToken(env) {
+  if (!env || typeof env.COURSE_REPORTS_ADMIN_TOKEN !== "string") return "";
+  return env.COURSE_REPORTS_ADMIN_TOKEN.trim();
+}
+
+async function authorizeCourseReports(request, env, cors) {
+  const secret = courseReportsAdminToken(env);
+  if (!secret) return golfJson(503, { error: "not_configured" }, cors);
+  const header = request.headers.get("Authorization");
+  const match = typeof header === "string" ? /^Bearer\s+(\S+)\s*$/i.exec(header) : null;
+  const presented = match ? match[1] : "";
+  const matches = await timingSafeEqualText(secret, presented);
+  if (!match || !matches) return golfJson(401, { error: "unauthorized" }, cors);
+  return null;
+}
+
+function boardsBinding(env) {
+  const boards = env && env.BOARDS;
+  if (!boards || typeof boards.get !== "function" || typeof boards.put !== "function") return null;
+  return boards;
+}
+
+function courseReportMarkerKey(clientReportId) {
+  return `cr:id:${clientReportId}`;
+}
+
+function courseReportRecordKey(receivedAt, clientReportId) {
+  return `cr:r:${receivedAt}:${clientReportId}`;
+}
+
+async function readCourseReportCount(boards, key) {
+  const raw = await boards.get(key);
+  if (typeof raw !== "string" || !raw) return 0;
+  return clampCount(raw);
+}
+
+function courseReportCounterTtl(now) {
+  return Math.max(60, retryAfterFor("course_report", now));
+}
+
+/**
+ * Duplicates are decided before this runs, so a replay does not consume a slot.
+ * KV increments are not atomic; a burst can overshoot by a little.
+ */
+async function courseReportRateLimit(boards, env, request, installId, now, cors) {
+  const limits = readCourseReportLimits(env);
+  const day = now.toISOString().slice(0, 10);
+  const ipHash = await readIpHash(request);
+  const ipKey = ipHash ? `cr:n:ip:${ipHash}:${day}` : null;
+  const devKey = installId ? `cr:n:dev:${installId}:${day}` : null;
+  const ipCount = ipKey ? await readCourseReportCount(boards, ipKey) : 0;
+  const devCount = devKey ? await readCourseReportCount(boards, devKey) : 0;
+  if ((ipKey && ipCount >= limits.ipDay) || (devKey && devCount >= limits.deviceDay)) {
+    const retryAfter = String(retryAfterFor("course_report", now));
+    return {
+      limited: true,
+      response: golfJson(429, { error: "rate_limited" }, cors, { "Retry-After": retryAfter }),
+    };
+  }
+  return {
+    limited: false,
+    async commit() {
+      const ttl = courseReportCounterTtl(now);
+      if (ipKey) await putCounter(boards, ipKey, String(ipCount + 1), { expirationTtl: ttl });
+      if (devKey) await putCounter(boards, devKey, String(devCount + 1), { expirationTtl: ttl });
+    },
+  };
+}
+
+function readReportLimit(raw) {
+  if (raw == null || raw === "") return 100;
+  if (!/^\d+$/.test(raw)) return 100;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1) return 100;
+  return Math.min(500, parsed);
+}
+
+function canonicalSince(raw) {
+  if (raw == null || raw === "") return { ok: true, iso: null };
+  if (!isIsoDateTime(raw)) return { ok: false };
+  return { ok: true, iso: new Date(Date.parse(raw)).toISOString() };
+}
+
+function parseStoredReport(raw) {
+  if (typeof raw !== "string" || !raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return isPlainObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function listCourseReports(boards, { sinceIso, courseId, limit, cursor }) {
+  let pageCursor = cursor || undefined;
+  for (let hop = 0; hop < 20; hop++) {
+    const page = await boards.list({
+      prefix: "cr:r:",
+      limit,
+      ...(pageCursor ? { cursor: pageCursor } : {}),
+    });
+    const keys = (page && Array.isArray(page.keys) ? page.keys : [])
+      .map((entry) => (entry && typeof entry.name === "string" ? entry.name : null))
+      .filter(Boolean)
+      .sort();
+    const complete = !page || page.list_complete !== false || !page.cursor;
+    const last = keys[keys.length - 1];
+    if (sinceIso && last && last < `cr:r:${sinceIso}` && !complete) {
+      pageCursor = page.cursor;
+      continue;
+    }
+    const reports = [];
+    for (const name of keys) {
+      if (sinceIso && name < `cr:r:${sinceIso}`) continue;
+      const record = parseStoredReport(await boards.get(name));
+      if (!record) continue;
+      if (courseId && record.courseId !== courseId) continue;
+      reports.push(record);
+    }
+    // KV is asked for `limit` keys, so this cap only matters if a page is larger.
+    const capped = reports.slice(0, limit);
+    return { reports: capped, cursor: complete ? null : (page.cursor || null) };
+  }
+  return { reports: [], cursor: pageCursor || null };
+}
+
+async function handleCourseReportPost(request, env, cors) {
+  const declared = Number(request.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > COURSE_REPORT_BODY_MAX) {
+    return golfJson(413, { error: "too_large" }, cors);
+  }
+  const raw = await request.text();
+  if (utf8ByteLength(raw) > COURSE_REPORT_BODY_MAX) {
+    return golfJson(413, { error: "too_large" }, cors);
+  }
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    return golfJson(400, { error: "invalid_json" }, cors);
+  }
+  const parsed = parseCourseReport(payload);
+  if (!parsed.ok) return golfJson(422, { error: "invalid", field: parsed.field }, cors);
+  const install = readCourseReportInstallId(request);
+  if (!install.ok) return golfJson(422, { error: "invalid", field: "installId" }, cors);
+
+  const boards = boardsBinding(env);
+  if (!boards) return golfJson(503, { error: "boards_not_configured" }, cors);
+
+  const clientReportId = parsed.record.clientReportId;
+  const markerKey = courseReportMarkerKey(clientReportId);
+  const existing = await boards.get(markerKey);
+  if (existing != null) {
+    return golfJson(200, { ok: true, id: clientReportId, duplicate: true }, cors);
+  }
+
+  const now = new Date();
+  const rate = await courseReportRateLimit(boards, env, request, install.id, now, cors);
+  if (rate.limited) return rate.response;
+
+  const receivedAt = now.toISOString();
+  const recordKey = courseReportRecordKey(receivedAt, clientReportId);
+  const record = {
+    ...parsed.record,
+    receivedAt,
+    installId: install.id,
+  };
+  const country = readRequestCountry(request);
+  if (country) record.country = country;
+  await boards.put(recordKey, JSON.stringify(record), { expirationTtl: COURSE_REPORT_TTL });
+  await boards.put(markerKey, recordKey, { expirationTtl: COURSE_REPORT_TTL });
+  await rate.commit();
+  return golfJson(201, { ok: true, id: clientReportId }, cors);
+}
+
+async function handleCourseReportGetOne(boards, clientReportId, cors) {
+  const marker = await boards.get(courseReportMarkerKey(clientReportId));
+  if (typeof marker !== "string" || !marker.startsWith("cr:r:")) {
+    return golfJson(404, { error: "not_found" }, cors);
+  }
+  const record = parseStoredReport(await boards.get(marker));
+  if (!record) return golfJson(404, { error: "not_found" }, cors);
+  return golfJson(200, record, cors);
+}
+
+async function handleCourseReportsGet(request, url, env, cors, clientReportId) {
+  const denied = await authorizeCourseReports(request, env, cors);
+  if (denied) return denied;
+  const boards = boardsBinding(env);
+  if (!boards) return golfJson(503, { error: "boards_not_configured" }, cors);
+  if (clientReportId) return handleCourseReportGetOne(boards, clientReportId, cors);
+  if (typeof boards.list !== "function") return golfJson(503, { error: "boards_not_configured" }, cors);
+
+  const since = canonicalSince(url.searchParams.get("since"));
+  if (!since.ok) return golfJson(422, { error: "invalid", field: "since" }, cors);
+  const courseId = url.searchParams.get("courseId");
+  const listed = await listCourseReports(boards, {
+    sinceIso: since.iso,
+    courseId: courseId ? courseId : null,
+    limit: readReportLimit(url.searchParams.get("limit")),
+    cursor: url.searchParams.get("cursor"),
+  });
+  return golfJson(200, { reports: listed.reports, cursor: listed.cursor }, cors);
+}
+
+function courseReportIdFromPath(pathname) {
+  const path = pathname.length > 1 && pathname.endsWith("/") ? pathname.slice(0, -1) : pathname;
+  if (path === "/v1/course-reports") return { ok: true, id: null };
+  const rest = path.slice("/v1/course-reports/".length);
+  if (!rest || rest.includes("/")) return { ok: false };
+  let id = rest;
+  try {
+    id = decodeURIComponent(rest);
+  } catch {
+    return { ok: false };
+  }
+  if (!validClientReportId(id)) return { ok: false };
+  return { ok: true, id };
+}
+
+async function handleCourseReports(request, url, env, cors) {
+  const parsed = courseReportIdFromPath(url.pathname);
+  if (!parsed.ok) return golfJson(404, { error: "unknown_route" }, cors);
+  if (request.method === "GET") return handleCourseReportsGet(request, url, env, cors, parsed.id);
+  if (request.method === "POST" && parsed.id == null) return handleCourseReportPost(request, env, cors);
+  return golfJson(405, { error: "method_not_allowed" }, cors);
+}
+
 function corsHeaders(pathname) {
+  const courseReports = isCourseReportPath(pathname);
   const headers = {
-    "Access-Control-Allow-Methods": "GET,PUT,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, X-Install-Id",
+    "Access-Control-Allow-Methods": courseReports ? "GET,POST,OPTIONS" : "GET,PUT,OPTIONS",
+    "Access-Control-Allow-Headers": courseReports
+      ? "Content-Type, X-Install-Id, Authorization"
+      : "Content-Type, X-Install-Id",
   };
   if (!pathname.startsWith("/gca/") && !pathname.startsWith("/golfapi/")) {
     headers["Access-Control-Allow-Origin"] = "*";
@@ -2641,7 +3113,7 @@ export default {
 
     // Live board web page (GET /s/{code}). Only a real board code is read: never a reserved
     // key and never a paint key, so the page cannot show overlay, course-store, GCA, golfapi,
-    // queue, or paint-cache data.
+    // queue, paint-cache, or course-report data.
     const page = await handleLivePage(request, env, {
       loadBoard: (code) => {
         if (!isLiveBoardCode(code) || isReservedBoardKey(code) || isPaintKey(code)) return null;
@@ -2651,13 +3123,22 @@ export default {
     });
     if (page) return page;
 
+    // /v1/course-reports before the board-key catch-all. The first segment of
+    // /v1/... would otherwise be a KV key named "v1" (POST 405, GET reads that board).
+    if (isCourseReportPath(requestUrl.pathname)) {
+      return handleCourseReports(request, requestUrl, env, cors);
+    }
+    if (requestUrl.pathname.startsWith("/v1/")) {
+      return golfJson(404, { error: "unknown_route" }, cors);
+    }
+
     const url = new URL(request.url);
     const key = decodeURIComponent(url.pathname.replace(/^\/+/, "").split("/")[0] || "");
     if (!key || key.length > 180) {
       return new Response("bad key", { status: 400, headers: cors });
     }
-    // Overlay, golfapi counters, the course store, GCA copies, and the refill queue share BOARDS.
-    // Public board routes must not read, replace, or delete those keys.
+    // Overlay, golfapi counters, the course store, GCA copies, the refill queue, and
+    // course reports share BOARDS. Public board routes must not read, replace, or delete those keys.
     if ((request.method === "GET" || request.method === "PUT" || request.method === "DELETE") && isReservedBoardKey(key)) {
       return new Response("bad key", { status: 400, headers: cors });
     }

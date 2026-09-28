@@ -2,7 +2,7 @@
 
 Cloudflare Worker for ShotTraxx live boards and the course paint cache. It also proxies golf course vendor reads so the phone never holds a vendor key, and it fetches OpenStreetMap golf overlays once per location so phones do not call Overpass themselves.
 
-Live boards stay `GET` / `PUT` on a single path segment in the `BOARDS` KV namespace. Paint cache keys start with `id:` or `name:`. Keys that start with `osm:`, `gq:`, `gapi:`, `gqueue:`, or `gca:` are reserved.
+Live boards stay `GET` / `PUT` on a single path segment in the `BOARDS` KV namespace. Paint cache keys start with `id:` or `name:`. Keys that start with `osm:`, `gq:`, `gapi:`, `gqueue:`, `gca:`, or `cr:` are reserved, and so is any key that starts with `v1`.
 
 If `env.BOARDS` is not bound, board routes, overlay lookups, golfapi reads, and GCA course reads (`courses/{id}`, `courses/{id}/green-centers`) return `503` `{ "error": "boards_not_configured" }` instead of throwing. GCA search still proxies without that namespace.
 
@@ -14,7 +14,7 @@ Merging to `main` deploys this Worker automatically through Cloudflare Workers B
 
 Board and paint-cache keys are stored only while that binding is present on the live Worker. If it is missing, those routes return `503` `{ "error": "boards_not_configured" }`.
 
-`GET`, `PUT`, and `DELETE` for a reserved prefix return `400` and do not read or write KV, so a board request cannot read, replace, or reset an overlay, a golfapi counter, a stored course, a GCA copy, or the refill queue. Paint keys (`id:`, `name:`) and ordinary board codes are unchanged.
+`GET`, `PUT`, and `DELETE` for a reserved prefix return `400` and do not read or write KV, so a board request cannot read, replace, or reset an overlay, a golfapi counter, a stored course, a GCA copy, the refill queue, or a course report. Paint keys (`id:`, `name:`) and ordinary board codes are unchanged. A key that starts with `v1` is reserved too, so `GET /v1` cannot read a board.
 
 ## Live board web page
 
@@ -33,6 +33,52 @@ curl -sS -o /dev/null -w "%{http_code} %{content_type}\n" https://shottrax-share
 curl -sS -o /dev/null -w "%{http_code}\n" https://shottrax-share.bcbaird.workers.dev/s/gq:balance
 # 404
 ```
+
+## Course reports
+
+The app queues an in-round "problem with this course/hole" report on the phone and `POST`s it here. `200` and `201` with `{ "ok": true, "id" }` mean the report was accepted (a `200` is a duplicate and is not stored again). The app drops a report only on `400`, `413`, or `422`. Anything else (`404`, `405`, `429`, `5xx`, network) stays queued and is retried. Unknown JSON fields are ignored, so a newer app build can add fields without the report being dropped.
+
+```
+POST /v1/course-reports
+GET  /v1/course-reports                      admin
+GET  /v1/course-reports/{clientReportId}     admin, one record
+```
+
+`POST` body is JSON, at most 4096 bytes. Over that is `413` `{ "error": "too_large" }`. Invalid JSON is `400` `{ "error": "invalid_json" }`. A field that can never succeed is `422` `{ "error": "invalid", "field" }`. Any other `/v1/*` path is `404` `{ "error": "unknown_route" }`. This route is matched before the board-key catch-all.
+
+| Field | Rule |
+|---|---|
+| `clientReportId` | Required. Loose uuid (`8-4-4-4-12` hex, any version), at most 64 characters. Idempotency key. |
+| `createdAt` | Required ISO-8601 timestamp. Stored as sent. Not used for ordering. |
+| `courseId` | Required string, 1–180 characters. Same key as the paint cache (`id:…` or `name:…`). |
+| `courseName` | Required string. Trimmed, then 1–200 characters. |
+| `holeNumber` | Required integer, 1–18. |
+| `reasons` | Required non-empty array. Allowed: `hole_missing`, `green_wrong`, `tee_wrong`, `wrong_par`, `wrong_course`, `other`. Unknown values are dropped and duplicates collapse. If none remain, `422`. |
+| `note` | Optional string. Trimmed, max 500. |
+| `position` | `null` or `{ lat, lon, accuracyM }`. Finite `lat` −90..90, `lon` −180..180, `accuracyM` ≥ 0 or `null`. |
+| `appVersion`, `buildNumber`, `platform` | Optional strings, each max 32. |
+| `paintSource` | Optional string or `null`, max 32. Any value is accepted and stored lowercased. |
+| `shown` | Optional. Never rejected. A non-object is stored as `null`. `par` is kept when it is an integer 1–10 and is otherwise `null`. `green` and `tee` are kept only as a valid `{ lat, lon }` and are otherwise `null`. |
+| `X-Install-Id` | Optional header, max 100 characters. Stored as `installId`. |
+
+A new report is `201` `{ "ok": true, "id": "<clientReportId>" }`. The same id again is `200` `{ "ok": true, "id", "duplicate": true }` and does not write. Both KV keys live 180 days:
+
+- `cr:id:<clientReportId>` — dedupe marker. The value is the record key.
+- `cr:r:<receivedAt ISO with milliseconds>:<clientReportId>` — the normalized JSON, plus `receivedAt`, `installId`, and `country` from `request.cf.country` when Cloudflare sends it. The raw IP is not stored.
+
+New reports (not duplicates) are limited per UTC day: 30 per `CF-Connecting-IP`, and 20 per `X-Install-Id` when that header is present. Over the limit is `429` `{ "error": "rate_limited" }` with `Retry-After` in seconds, which the app retries. Override the caps with `COURSE_REPORTS_IP_DAY` and `COURSE_REPORTS_DEVICE_DAY` (see the comments in `wrangler.toml`). If `BOARDS` is unbound the response is `503` `{ "error": "boards_not_configured" }`.
+
+Admin `GET` requires `Authorization: Bearer <token>`. The token is compared in constant time. Wrong or missing is `401`. If the secret is unset the route fails closed with `503` `{ "error": "not_configured" }`. Set it on the Worker (do not commit it):
+
+```
+wrangler secret put COURSE_REPORTS_ADMIN_TOKEN
+```
+
+Query params: `since` (ISO timestamp; reports with an earlier `receivedAt` are skipped using key order), `courseId` (exact match), `limit` (default 100, max 500), `cursor` (pass the previous KV list cursor back). The body is `{ "reports": [ ... ], "cursor": "<cursor or null>" }`, oldest first. `GET /v1/course-reports/<clientReportId>` returns that one record, or `404` `{ "error": "not_found" }`.
+
+CORS for this route allows `GET,POST,OPTIONS` and the `Authorization` header. Other routes are unchanged.
+
+Merging to `main` deploys this Worker. The admin list stays closed until `COURSE_REPORTS_ADMIN_TOKEN` is set. Do not put that token in `wrangler.toml`.
 
 ## Golf vendor proxy
 
