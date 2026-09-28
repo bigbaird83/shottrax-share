@@ -41,6 +41,17 @@ export const GCA_CORRECTIONS = {
     handicapMen: [17, 9, 1, 13, 3, 5, 15, 11, 7, 16, 18, 14, 10, 2, 4, 12, 8, 6],
     handicapWomen: [17, 7, 3, 9, 11, 1, 13, 15, 5, 8, 16, 12, 14, 4, 2, 10, 18, 6],
   },
+  // Greystone (Mountain Springs), Greystone Country Club, Cabot AR. Club scorecard
+  // PDF, verified 2026-09-27. Par 36/36 = 72. Card lists Grey 7051, Blue 6509,
+  // White 6038, Black 5451, Red 5218. Men's Hdcp matches the Red Hdcp row.
+  // Upstream GCA lists White hole 18 as par 4 while the card has par 5, so the
+  // existing par-agreement check will leave the White teebox unfilled.
+  "14137": {
+    source: "club scorecard PDF golfgreystonecc.com (greystone_scorecard.pdf), verified 2026-09-27",
+    par: [4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 4, 3, 4, 5, 4, 3, 4, 5],
+    handicapMen: [13, 17, 5, 9, 7, 15, 11, 3, 1, 10, 6, 16, 14, 4, 12, 18, 2, 8],
+    handicapWomen: [13, 17, 5, 9, 7, 15, 11, 3, 1, 10, 6, 16, 14, 4, 12, 18, 2, 8],
+  },
 };
 
 for (const [id, entry] of Object.entries(GCA_CORRECTIONS)) {
