@@ -2933,4 +2933,253 @@ describe("shottrax-share worker", () => {
     const skipped = await invoke(`${ORIGIN}/gca/v1/courses/${CYPRESS_ID}?x=1`);
     expect(await skipped.text()).toBe(onlyMismatch);
   });
+
+  function paintUrl(key) {
+    return `${ORIGIN}/${encodeURIComponent(key)}`;
+  }
+
+  function paintPoint(lat, lng) {
+    return { lat, lng };
+  }
+
+  function paintHole(hole, lat, extra = {}) {
+    const row = {
+      hole,
+      tee: paintPoint(lat, -93.2),
+      green: paintPoint(lat + 0.01, -93.19),
+      par: 4,
+      yards: 300 + hole,
+    };
+    return { ...row, ...extra };
+  }
+
+  function paintRecord(key, holes, extra = {}) {
+    return {
+      v: 1,
+      key,
+      aliases: extra.aliases ?? [],
+      source: extra.source ?? "opengolf",
+      name: extra.name ?? "Brittany",
+      city: extra.city ?? "Rogers",
+      numHoles: extra.numHoles ?? 9,
+      nineByTwo: extra.nineByTwo ?? false,
+      fetchedAt: extra.fetchedAt ?? "2026-01-01T00:00:00.000Z",
+      ...("fillAttemptedAt" in extra ? { fillAttemptedAt: extra.fillAttemptedAt } : {}),
+      holes,
+    };
+  }
+
+  function holesByNumber(holes) {
+    return Object.fromEntries(holes.map((hole) => [hole.hole, hole]));
+  }
+
+  function countedComplete(holes) {
+    const seen = new Set();
+    let count = 0;
+    for (const hole of holes) {
+      if (!hole?.tee || !hole?.green) continue;
+      if (!Number.isFinite(hole.tee.lat) || !Number.isFinite(hole.green.lat)) continue;
+      if (seen.has(hole.hole)) continue;
+      seen.add(hole.hole);
+      count += 1;
+    }
+    return count;
+  }
+
+  const BRITTANY_ID = "id:local:opengolf:11111111-2222-4333-8444-555555555555";
+  const BRITTANY_NAME = "name:brittany|rogers|ar";
+
+  it("keeps a 9-hole Brittany record when a 5-hole partial is PUT", async () => {
+    const existingHoles = Array.from({ length: 9 }, (_, index) => paintHole(index + 1, 33 + index * 0.01));
+    const existing = paintRecord(BRITTANY_ID, existingHoles, { aliases: [BRITTANY_NAME] });
+    kv.set(BRITTANY_ID, { value: JSON.stringify(existing), opts: { expirationTtl: 365 * DAY } });
+
+    const partial = paintRecord(BRITTANY_ID, [
+      paintHole(2, 10.02),
+      paintHole(3, 10.03),
+      paintHole(4, 10.04),
+      paintHole(5, 10.05),
+      paintHole(15, 10.15),
+    ], {
+      aliases: [BRITTANY_NAME],
+      name: "Wrong",
+      city: "",
+      numHoles: 5,
+      fetchedAt: "2026-09-01T00:00:00.000Z",
+    });
+    const response = await invoke(paintUrl(BRITTANY_ID), { method: "PUT", body: JSON.stringify(partial) });
+    expect(response.status).toBe(200);
+    const stored = JSON.parse(kv.get(BRITTANY_ID).value);
+    const byHole = holesByNumber(stored.holes);
+    for (let hole = 1; hole <= 9; hole += 1) {
+      expect(byHole[hole].tee.lat).toBe(existingHoles[hole - 1].tee.lat);
+      expect(byHole[hole].green.lng).toBe(existingHoles[hole - 1].green.lng);
+    }
+    expect(byHole[15].tee.lat).toBe(10.15);
+    expect(countedComplete(stored.holes)).toBe(10);
+    expect(stored.numHoles).toBe(9);
+    expect(stored.name).toBe("Brittany");
+    expect(stored.city).toBe("Rogers");
+    expect(stored.fetchedAt).toBe("2026-01-01T00:00:00.000Z");
+    expect(stored.aliases).toEqual([BRITTANY_NAME]);
+    expect(JSON.parse(await response.text())).toEqual(stored);
+  });
+
+  it("fills a blank hole on PUT and leaves complete holes alone", async () => {
+    const existingHoles = Array.from({ length: 9 }, (_, index) => paintHole(index + 1, 33 + index * 0.01));
+    existingHoles[6] = { hole: 7, tee: paintPoint(33.06, -93.2), par: 3, yards: 160 };
+    const existing = paintRecord(BRITTANY_ID, existingHoles, { city: "", aliases: [BRITTANY_NAME] });
+    kv.set(BRITTANY_ID, { value: JSON.stringify(existing), opts: { expirationTtl: 365 * DAY } });
+
+    const incomingHole = paintHole(7, 41.07, { par: 5, yards: 510, source: "name" });
+    const partial = paintRecord(BRITTANY_ID, [paintHole(2, 12), incomingHole], {
+      aliases: [BRITTANY_NAME],
+      city: "Rogers",
+    });
+    const response = await invoke(paintUrl(BRITTANY_ID), { method: "PUT", body: JSON.stringify(partial) });
+    expect(response.status).toBe(200);
+    const stored = JSON.parse(kv.get(BRITTANY_ID).value);
+    const byHole = holesByNumber(stored.holes);
+    expect(byHole[2].tee.lat).toBe(existingHoles[1].tee.lat);
+    expect(byHole[7]).toEqual(incomingHole);
+    expect(countedComplete(stored.holes)).toBe(9);
+    expect(stored.city).toBe("Rogers");
+    expect(stored.name).toBe("Brittany");
+    expect(JSON.parse(await response.text())).toEqual(stored);
+  });
+
+  it("skips a paint PUT that adds nothing", async () => {
+    const existingHoles = Array.from({ length: 9 }, (_, index) => paintHole(index + 1, 33 + index * 0.01));
+    const existing = paintRecord(BRITTANY_ID, existingHoles, { aliases: [BRITTANY_NAME] });
+    const row = { value: JSON.stringify(existing), opts: { expirationTtl: 365 * DAY } };
+    kv.set(BRITTANY_ID, row);
+    const partial = paintRecord(BRITTANY_ID, [2, 3, 4, 5].map((hole) => paintHole(hole, 10 + hole)), {
+      aliases: [BRITTANY_NAME],
+      name: "Other",
+      numHoles: 5,
+    });
+    const response = await invoke(paintUrl(BRITTANY_ID), { method: "PUT", body: JSON.stringify(partial) });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ changed: false, message: "nothing changed" });
+    expect(kv.get(BRITTANY_ID)).toBe(row);
+  });
+
+  it("stores the incoming paint record when X-Paint-Replace is 1", async () => {
+    const existingHoles = Array.from({ length: 9 }, (_, index) => paintHole(index + 1, 33 + index * 0.01));
+    kv.set(BRITTANY_ID, {
+      value: JSON.stringify(paintRecord(BRITTANY_ID, existingHoles, { aliases: [BRITTANY_NAME] })),
+      opts: { expirationTtl: 365 * DAY },
+    });
+    const partial = paintRecord(BRITTANY_ID, [2, 3, 4, 5, 15].map((hole) => paintHole(hole, 10 + hole / 100)), {
+      aliases: [BRITTANY_NAME],
+      numHoles: 9,
+    });
+    const body = JSON.stringify(partial);
+    const response = await invoke(paintUrl(BRITTANY_ID), {
+      method: "PUT",
+      body,
+      headers: { "X-Paint-Replace": "1" },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe(body);
+    expect(kv.get(BRITTANY_ID).value).toBe(body);
+    expect(countedComplete(JSON.parse(kv.get(BRITTANY_ID).value).holes)).toBe(5);
+  });
+
+  it("fills paint gaps from an alias on GET and does not write", async () => {
+    const partialHoles = [2, 3, 4, 5, 15].map((hole) => paintHole(hole, 33 + hole * 0.01));
+    const nameHoles = Array.from({ length: 9 }, (_, index) => paintHole(index + 1, 40 + index * 0.01));
+    const extraKey = "name:brittany|extra|ar";
+    const ignoredKey = "id:local:opengolf:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const unreadKey = "name:brittany|unread|ar";
+    const stored = paintRecord(BRITTANY_ID, partialHoles, {
+      aliases: [BRITTANY_NAME, extraKey, ignoredKey, unreadKey],
+      numHoles: 9,
+    });
+    const row = { value: JSON.stringify(stored), opts: { expirationTtl: 365 * DAY } };
+    kv.set(BRITTANY_ID, row);
+    kv.set(BRITTANY_NAME, {
+      value: JSON.stringify(paintRecord(BRITTANY_NAME, nameHoles, { numHoles: 9, aliases: [BRITTANY_ID] })),
+      opts: { expirationTtl: 365 * DAY },
+    });
+    kv.set(extraKey, { value: "not-json", opts: { expirationTtl: 365 * DAY } });
+    kv.set(ignoredKey, {
+      value: JSON.stringify(paintRecord(ignoredKey, [paintHole(12, 50.12)], { numHoles: 18 })),
+      opts: { expirationTtl: 365 * DAY },
+    });
+    kv.set(unreadKey, {
+      value: JSON.stringify(paintRecord(unreadKey, [paintHole(12, 51.12)], { numHoles: 9 })),
+      opts: { expirationTtl: 365 * DAY },
+    });
+    const gets = [];
+    const read = env.BOARDS.get.bind(env.BOARDS);
+    env.BOARDS.get = async (key) => {
+      gets.push(key);
+      return read(key);
+    };
+
+    const response = await invoke(paintUrl(BRITTANY_ID));
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    const byHole = holesByNumber(body.holes);
+    for (const hole of [2, 3, 4, 5, 15]) {
+      expect(byHole[hole].tee.lat).toBe(33 + hole * 0.01);
+    }
+    for (const hole of [1, 6, 7, 8, 9]) {
+      expect(byHole[hole].tee.lat).toBe(40 + (hole - 1) * 0.01);
+    }
+    expect(byHole[12]).toBeUndefined();
+    expect(body.numHoles).toBe(9);
+    expect(body.name).toBe("Brittany");
+    expect(body.aliases).toEqual(stored.aliases);
+    expect(countedComplete(body.holes)).toBe(10);
+    expect(kv.get(BRITTANY_ID)).toBe(row);
+    expect(gets).toEqual([BRITTANY_ID, BRITTANY_NAME, extraKey, ignoredKey]);
+  });
+
+  it("returns a gappy paint record unchanged when it has no aliases", async () => {
+    const stored = paintRecord(BRITTANY_ID, [paintHole(1, 33.01), paintHole(2, 33.02)], { aliases: [], numHoles: 9 });
+    delete stored.aliases;
+    const raw = JSON.stringify(stored);
+    const row = { value: raw, opts: { expirationTtl: 365 * DAY } };
+    kv.set(BRITTANY_ID, row);
+    const gets = [];
+    const read = env.BOARDS.get.bind(env.BOARDS);
+    env.BOARDS.get = async (key) => {
+      gets.push(key);
+      return read(key);
+    };
+    const response = await invoke(paintUrl(BRITTANY_ID));
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe(raw);
+    expect(gets).toEqual([BRITTANY_ID]);
+    expect(kv.get(BRITTANY_ID)).toBe(row);
+  });
+
+  it("ignores an alias paint record with a different numHoles", async () => {
+    const partialHoles = [2, 3, 4, 5, 15].map((hole) => paintHole(hole, 33 + hole * 0.01));
+    const stored = paintRecord(BRITTANY_ID, partialHoles, { aliases: [BRITTANY_NAME], numHoles: 9 });
+    const raw = JSON.stringify(stored);
+    const row = { value: raw, opts: { expirationTtl: 365 * DAY } };
+    kv.set(BRITTANY_ID, row);
+    const eighteen = Array.from({ length: 18 }, (_, index) => paintHole(index + 1, 40 + index * 0.01));
+    kv.set(BRITTANY_NAME, {
+      value: JSON.stringify(paintRecord(BRITTANY_NAME, eighteen, { numHoles: 18 })),
+      opts: { expirationTtl: 365 * DAY },
+    });
+    const response = await invoke(paintUrl(BRITTANY_ID));
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe(raw);
+    expect(kv.get(BRITTANY_ID)).toBe(row);
+    expect(kv.get(BRITTANY_NAME).value).toContain('"numHoles":18');
+  });
+
+  it("still replaces a live board when the same key is PUT twice", async () => {
+    const first = await invoke(`${ORIGIN}/round1`, { method: "PUT", body: '{"hole":1}' });
+    expect(first.status).toBe(200);
+    const second = await invoke(`${ORIGIN}/round1`, { method: "PUT", body: '{"hole":2}' });
+    expect(second.status).toBe(200);
+    expect(await second.text()).toBe('{"hole":2}');
+    expect(kv.get("round1").value).toBe('{"hole":2}');
+  });
 });
