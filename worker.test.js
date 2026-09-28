@@ -3277,6 +3277,7 @@ describe("shottrax-share worker", () => {
     expect(kv.get(recordKey).opts).toEqual({ expirationTtl: REPORT_TTL });
     expect(JSON.stringify([...kv.entries()])).not.toContain(REPORT_IP);
     expect(stored.courseId).toHaveLength(180);
+    expect(stored.shown).toEqual({ par: 4, green: { lat: 33.2, lon: -93.1 }, tee: null });
 
     const options = await invoke(`${ORIGIN}/v1/course-reports`, { method: "OPTIONS" });
     expect(options.headers.get("Access-Control-Allow-Methods")).toBe("GET,POST,OPTIONS");
@@ -3284,6 +3285,31 @@ describe("shottrax-share worker", () => {
     const boardOptions = await invoke(`${ORIGIN}/round1`, { method: "OPTIONS" });
     expect(boardOptions.headers.get("Access-Control-Allow-Methods")).toBe("GET,PUT,OPTIONS");
     expect(boardOptions.headers.get("Access-Control-Allow-Headers")).toBe("Content-Type, X-Install-Id");
+  });
+
+  it("stores a malformed shown display instead of rejecting the report", async () => {
+    const created = await postReport(reportBody({
+      shown: { par: 0, green: "x" },
+    }));
+    expect(created.status).toBe(201);
+    const stored = JSON.parse(kv.get(reportRecords()[0]).value);
+    expect(stored.shown).toEqual({ par: null, green: null });
+
+    const notAnObject = await postReport(reportBody({
+      clientReportId: REPORT_ID_2,
+      shown: [],
+    }));
+    expect(notAnObject.status).toBe(201);
+    const cleared = JSON.parse(kv.get(reportRecords().find((key) => key.endsWith(REPORT_ID_2))).value);
+    expect(cleared.shown).toBeNull();
+
+    const kept = await postReport(reportBody({
+      clientReportId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      shown: { par: 10, green: { lat: 0, lon: 0 }, tee: { lat: 91, lon: 0 } },
+    }));
+    expect(kept.status).toBe(201);
+    const wide = JSON.parse(kv.get(reportRecords().find((key) => key.endsWith("cccccccc-cccc-4ccc-8ccc-cccccccccccc"))).value);
+    expect(wide.shown).toEqual({ par: 10, green: { lat: 0, lon: 0 }, tee: null });
   });
 
   it("returns 200 for a duplicate course report and does not write again", async () => {
@@ -3358,11 +3384,6 @@ describe("shottrax-share worker", () => {
       ["platform long", reportBody({ platform: "p".repeat(33) }), "platform"],
       ["paintSource long", reportBody({ paintSource: "s".repeat(33) }), "paintSource"],
       ["paintSource type", reportBody({ paintSource: 1 }), "paintSource"],
-      ["shown par low", reportBody({ shown: { par: 2 } }), "shown"],
-      ["shown par high", reportBody({ shown: { par: 7 } }), "shown"],
-      ["shown green", reportBody({ shown: { green: { lat: 91, lon: 0 } } }), "shown"],
-      ["shown tee", reportBody({ shown: { tee: "nope" } }), "shown"],
-      ["shown type", reportBody({ shown: [] }), "shown"],
     ];
     for (const [label, body, field] of cases) {
       const response = await postReport(body);

@@ -58,7 +58,7 @@ GET  /v1/course-reports/{clientReportId}     admin, one record
 | `position` | `null` or `{ lat, lon, accuracyM }`. Finite `lat` −90..90, `lon` −180..180, `accuracyM` ≥ 0 or `null`. |
 | `appVersion`, `buildNumber`, `platform` | Optional strings, each max 32. |
 | `paintSource` | Optional string or `null`, max 32. Any value is accepted and stored lowercased. |
-| `shown` | Optional `{ par, green, tee }` for what the app displayed. `par` is an integer 3–6 or `null`. `green` and `tee` are `{ lat, lon }` or `null`. |
+| `shown` | Optional. Never rejected. A non-object is stored as `null`. `par` is kept when it is an integer 1–10 and is otherwise `null`. `green` and `tee` are kept only as a valid `{ lat, lon }` and are otherwise `null`. |
 | `X-Install-Id` | Optional header, max 100 characters. Stored as `installId`. |
 
 A new report is `201` `{ "ok": true, "id": "<clientReportId>" }`. The same id again is `200` `{ "ok": true, "id", "duplicate": true }` and does not write. Both KV keys live 180 days:

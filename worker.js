@@ -136,7 +136,9 @@ import { handleLivePage, isLiveBoardCode } from "./live-page.js";
  * reasons (non-empty after the known-value filter). Optional: note (≤500),
  * position, appVersion, buildNumber, platform (each ≤32), paintSource (≤32,
  * stored lowercased), shown, and header X-Install-Id (≤100, stored as
- * installId).
+ * installId). shown never rejects the report: a non-object becomes null.
+ * par is kept when it is an integer 1..10 and is otherwise null. green and
+ * tee are kept only as a valid lat/lon and are otherwise null.
  *
  * BOARDS keys, both TTL 180 days:
  *   cr:id:<clientReportId>                  dedupe marker; value is the record key
@@ -2715,6 +2717,24 @@ function parseLatLon(point) {
   return { lat: point.lat, lon: point.lon };
 }
 
+/**
+ * What the phone displayed. Bad data is the report, so this never fails the
+ * request: a non-object becomes null, a par outside 1..10 becomes null, and
+ * a green or tee that is not a lat/lon becomes null.
+ */
+function normalizeShown(shown) {
+  if (!isPlainObject(shown)) return null;
+  const out = {};
+  if (Object.prototype.hasOwnProperty.call(shown, "par")) {
+    out.par = Number.isInteger(shown.par) && shown.par >= 1 && shown.par <= 10 ? shown.par : null;
+  }
+  for (const name of ["green", "tee"]) {
+    if (!Object.prototype.hasOwnProperty.call(shown, name)) continue;
+    out[name] = parseLatLon(shown[name]);
+  }
+  return out;
+}
+
 /** Client fields only. Server fields are added after this accepts the body. */
 function parseCourseReport(payload) {
   if (!isPlainObject(payload)) return invalidField("body");
@@ -2791,30 +2811,7 @@ function parseCourseReport(payload) {
   }
 
   if (Object.prototype.hasOwnProperty.call(payload, "shown")) {
-    if (payload.shown == null) {
-      record.shown = null;
-    } else if (!isPlainObject(payload.shown)) {
-      return invalidField("shown");
-    } else {
-      const shown = {};
-      if (Object.prototype.hasOwnProperty.call(payload.shown, "par")) {
-        if (payload.shown.par == null) shown.par = null;
-        else if (!Number.isInteger(payload.shown.par) || payload.shown.par < 3 || payload.shown.par > 6) {
-          return invalidField("shown");
-        } else shown.par = payload.shown.par;
-      }
-      for (const name of ["green", "tee"]) {
-        if (!Object.prototype.hasOwnProperty.call(payload.shown, name)) continue;
-        if (payload.shown[name] == null) {
-          shown[name] = null;
-          continue;
-        }
-        const point = parseLatLon(payload.shown[name]);
-        if (!point) return invalidField("shown");
-        shown[name] = point;
-      }
-      record.shown = shown;
-    }
+    record.shown = normalizeShown(payload.shown);
   }
 
   return { ok: true, record };
