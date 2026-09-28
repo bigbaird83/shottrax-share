@@ -214,6 +214,11 @@ function isReservedBoardKey(key) {
   return RESERVED_BOARD_PREFIXES.some((prefix) => key.startsWith(prefix));
 }
 
+/** Course paint cache keys share BOARDS with live boards. */
+function isPaintKey(key) {
+  return key.startsWith("id:") || key.startsWith("name:");
+}
+
 function readConfigInt(value) {
   if (typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 1_000_000) return value;
   if (typeof value === "string" && /^\d+$/.test(value.trim())) {
@@ -2385,11 +2390,12 @@ export default {
     const osm = await handleOsmOverlay(request, env, ctx, cors);
     if (osm) return osm;
 
-    // Live board web page (GET /s/{code}). Only a real board code is read, and never a
-    // reserved key, so the page cannot show overlay, course-store, GCA, or golfapi data.
+    // Live board web page (GET /s/{code}). Only a real board code is read: never a reserved
+    // key and never a paint key, so the page cannot show overlay, course-store, GCA, golfapi,
+    // queue, or paint-cache data.
     const page = await handleLivePage(request, env, {
       loadBoard: (code) => {
-        if (!isLiveBoardCode(code) || isReservedBoardKey(code)) return null;
+        if (!isLiveBoardCode(code) || isReservedBoardKey(code) || isPaintKey(code)) return null;
         const boards = env && env.BOARDS;
         return boards && typeof boards.get === "function" ? boards.get(code) : null;
       },
@@ -2406,7 +2412,7 @@ export default {
     if ((request.method === "GET" || request.method === "PUT" || request.method === "DELETE") && isReservedBoardKey(key)) {
       return new Response("bad key", { status: 400, headers: cors });
     }
-    const isPaint = key.startsWith("id:") || key.startsWith("name:");
+    const isPaint = isPaintKey(key);
     const ttl = isPaint ? 60 * 60 * 24 * 365 : 60 * 60 * 24 * 7;
     // Unbound BOARDS throws and Cloudflare turns that into error 1101.
     // Golf and OSM routes already returned above, so this only covers board keys.

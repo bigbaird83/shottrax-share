@@ -23,7 +23,7 @@ Board and paint-cache keys are stored only while that binding is present on the 
 - Only a six-character board code from the app's alphabet is read. Anything else under `/s/` is a `404` page, and the route also refuses reserved keys, so it never reads or shows overlay, golfapi, course-store, GCA, refill-queue, or paint (`id:` / `name:`) data.
 - A valid code with nothing stored yet (or `BOARDS` unbound) gets a "Waiting for the first hole" page that keeps polling.
 - Every stored string is HTML-escaped (anyone can `PUT` a board). Scripts and styles run under a per-request CSP nonce, and `connect-src` is `'self'`.
-- `STORE_LIVE` (var, default off). Leave it unset until ShotTraxx™ is live in the App Store. Off shows "Open in ShotTraxx™" (`shottrax:///s/{code}`) only. `"true"` adds the Safari App Store banner and a "Track your own round" card with the 14-day Pro trial. Set it under `[vars]` in `wrangler.toml` (the automatic `main` deploy uses that file). `APP_STORE_ID` overrides the App Store id (`6812944398`).
+- `STORE_LIVE` (var, default off). Leave it unset until ShotTraxx™ is live in the App Store. Off shows "Open in ShotTraxx™" (`shottrax:///s/{code}`) only. `"true"` adds the Safari App Store banner and a "Track your own round" card with "Get ShotTraxx™ on the App Store". "Open in ShotTraxx™" shows either way: the app has no associated domain, so tapping the web link opens Safari even for people who have the app. The page makes no trial offer; that comes back with the paywall's real terms. Set it under `[vars]` in `wrangler.toml` (the automatic `main` deploy uses that file). `APP_STORE_ID` overrides the App Store id (`6812944398`).
 
 Check after merge (any six-character code; an unknown one shows the waiting page):
 

@@ -15,8 +15,9 @@
  * page can never show overlay, course-store, GCA, or golfapi counter data.
  *
  * STORE_LIVE (Worker var, default off): "true" once ShotTraxx™ is live in the
- * App Store. Off hides the Safari App Store banner, the "Track your own round"
- * card, and the trial line. "Open in ShotTraxx™" shows either way.
+ * App Store. Off hides the Safari App Store banner and the "Track your own round"
+ * card. "Open in ShotTraxx™" shows either way: the app has no associated domain,
+ * so a tap on the web link opens Safari even for people who have the app.
  */
 
 export const APP_STORE_ID = "6812944398";
@@ -485,7 +486,7 @@ export function renderLivePage({ code, board, nowMs, storeLive = false, appStore
   const offer = storeLive
     ? `<section class="cta">
 <h2>Track your own round</h2>
-<p>ShotTraxx™ marks every shot with your phone's GPS, learns your real club distances, and shows where you lose strokes. Try every Pro feature free for 14 days.</p>
+<p>ShotTraxx™ marks every shot with your phone's GPS, learns your real club distances, and shows where you lose strokes.</p>
 <a class="btn primary" href="${esc(appUrl)}">Get ShotTraxx™ on the App Store</a>
 <a class="btn ghost" href="${esc(deepLink)}">Already have it? Open in ShotTraxx™</a>
 </section>`

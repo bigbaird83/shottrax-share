@@ -136,7 +136,7 @@ describe("live board page: HTML", () => {
     expect(script).not.toMatch(/<\//);
   });
 
-  it("STORE_LIVE off (default): no App Store banner, offer card, or trial; Open in ShotTraxx™ stays", () => {
+  it("STORE_LIVE off (default): no App Store banner or offer card; Open in ShotTraxx™ stays", () => {
     const html = page();
     expect(html).toMatch(/<title>Live · Greystone CC<\/title>/);
     expect(html).toMatch(/property="og:description" content="E thru 2 · On hole 3"/);
@@ -150,11 +150,11 @@ describe("live board page: HTML", () => {
     expect(html).not.toMatch(/lat|lng|geolocation/i);
   });
 
-  it("STORE_LIVE on: banner, offer card with the trial, and both buttons", () => {
+  it("STORE_LIVE on: banner, offer card, and both buttons; never a trial line", () => {
     const html = page({}, { storeLive: true });
     expect(html).toMatch(/name="apple-itunes-app" content="app-id=6812944398, app-argument=shottrax:\/\/\/s\/BK3MCQ"/);
     expect(html).toMatch(/Track your own round/);
-    expect(html).toMatch(/free for 14 days/);
+    expect(html).not.toMatch(/14 days|free|trial/i);
     expect(html).toMatch(/href="https:\/\/apps\.apple\.com\/app\/id6812944398">Get ShotTraxx™ on the App Store</);
     expect(html).toMatch(/Already have it\? Open in ShotTraxx™</);
   });
