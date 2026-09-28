@@ -21,7 +21,10 @@ crons = ["0 8 * * *"]
 #   wrangler secret put GOLFAPI_ALLOWLIST
 # The value is comma-separated install ids. Those phones skip device, IP, search,
 # and the global cap. The balance floor still applies.
+# Live board page (GET /s/{code}). Leave STORE_LIVE unset until ShotTraxx is live in
+# the App Store; "true" adds the App Store banner and the App Store card. See README.
 # [vars]
+# STORE_LIVE = "true"
 # GOLFAPI_DEVICE_DAY = "3"
 # GOLFAPI_DEVICE_WEEK = "10"
 # GOLFAPI_DEVICE_MONTH = "20"
