@@ -42,3 +42,10 @@ crons = ["0 8 * * *"]
 # the header on GCA, so turning this on would reject them. While it is off,
 # those calls are counted as missingInstallId on GET /meta/gca.
 # GCA_REQUIRE_INSTALL_ID = "true"
+# In-round course/hole reports (POST /v1/course-reports). Defaults are 30 new
+# reports per IP per UTC day and 20 per X-Install-Id. Invalid values keep the defaults.
+# COURSE_REPORTS_IP_DAY = "30"
+# COURSE_REPORTS_DEVICE_DAY = "20"
+# Admin GET /v1/course-reports is a secret, not a var. Leave it unset until the
+# list should open; unset fails closed with 503. Do not commit the token.
+#   wrangler secret put COURSE_REPORTS_ADMIN_TOKEN

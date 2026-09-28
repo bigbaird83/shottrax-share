@@ -119,11 +119,13 @@ describe("shottrax-share worker", () => {
     delete globalThis.caches;
   });
 
-  async function invoke(url, { method = "GET", body, env: envOverride, ctx, headers } = {}) {
+  async function invoke(url, { method = "GET", body, env: envOverride, ctx, headers, cf } = {}) {
     const waits = [];
     const execCtx = ctx === undefined ? { waitUntil(promise) { waits.push(promise); } } : ctx;
+    const request = new Request(url, { method, body, headers });
+    if (cf) Object.defineProperty(request, "cf", { value: cf });
     const response = await worker.fetch(
-      new Request(url, { method, body, headers }),
+      request,
       envOverride === undefined ? env : envOverride,
       execCtx,
     );
@@ -1250,6 +1252,10 @@ describe("shottrax-share worker", () => {
       "gca:course:14322",
       "gca:greens:14322",
       "gca:stats:2026-01-01",
+      "v1",
+      "v1board",
+      "cr:id:secret",
+      "cr:r:2026-01-01T00:00:00.000Z:secret",
     ];
     for (const key of reserved) {
       kv.set(key, { value: "keep-me", opts: { expirationTtl: 60 } });
@@ -3181,5 +3187,357 @@ describe("shottrax-share worker", () => {
     expect(second.status).toBe(200);
     expect(await second.text()).toBe('{"hole":2}');
     expect(kv.get("round1").value).toBe('{"hole":2}');
+  });
+
+  const REPORT_ID = "A1B2C3D4-E5F6-4789-8ABC-DEF012345678";
+  const REPORT_ID_2 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const REPORT_IP = "203.0.113.44";
+  const REPORT_TTL = 180 * DAY;
+
+  function reportBody(overrides = {}, omit = []) {
+    const body = {
+      clientReportId: REPORT_ID,
+      createdAt: "2026-09-28T18:16:00Z",
+      courseId: "id:14322",
+      courseName: "Magnolia",
+      holeNumber: 7,
+      reasons: ["green_wrong"],
+      ...overrides,
+    };
+    for (const key of omit) delete body[key];
+    return body;
+  }
+
+  function postReport(body, { headers, env: envOverride, raw, cf } = {}) {
+    return invoke(`${ORIGIN}/v1/course-reports`, {
+      method: "POST",
+      body: raw == null ? JSON.stringify(body) : raw,
+      headers: { "Content-Type": "application/json", "CF-Connecting-IP": REPORT_IP, ...headers },
+      env: envOverride,
+      cf,
+    });
+  }
+
+  function reportRecords() {
+    return [...kv.keys()].filter((key) => key.startsWith("cr:r:")).sort();
+  }
+
+  it("stores a new course report and ignores unknown fields and reasons", async () => {
+    const created = await postReport(reportBody({
+      courseId: "id:" + "c".repeat(177),
+      courseName: "  Magnolia  ",
+      reasons: ["nope", "green_wrong", "green_wrong", "other", "made_up"],
+      note: "  pin is in the bunker  ",
+      position: { lat: 33.19, lon: -93.2, accuracyM: 5, extra: true },
+      appVersion: "1.2.3",
+      buildNumber: "88",
+      platform: "ios",
+      paintSource: "  GCA  ",
+      shown: { par: 4, green: { lat: 33.2, lon: -93.1, extra: 1 }, tee: null, ignored: true },
+      futureField: { ok: true },
+    }), {
+      headers: { "X-Install-Id": "dev-1" },
+      cf: { country: "us" },
+    });
+    expect(created.status).toBe(201);
+    expect(await created.json()).toEqual({ ok: true, id: REPORT_ID });
+    expect(created.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect(created.headers.get("Content-Type")).toContain("application/json");
+
+    const keys = reportRecords();
+    expect(keys).toHaveLength(1);
+    const recordKey = keys[0];
+    const stored = JSON.parse(kv.get(recordKey).value);
+    expect(recordKey).toBe(`cr:r:${stored.receivedAt}:${REPORT_ID}`);
+    expect(stored.receivedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    expect(stored.createdAt).toBe("2026-09-28T18:16:00Z");
+    expect(stored).toEqual({
+      clientReportId: REPORT_ID,
+      createdAt: "2026-09-28T18:16:00Z",
+      courseId: "id:" + "c".repeat(177),
+      courseName: "Magnolia",
+      holeNumber: 7,
+      reasons: ["green_wrong", "other"],
+      note: "pin is in the bunker",
+      position: { lat: 33.19, lon: -93.2, accuracyM: 5 },
+      appVersion: "1.2.3",
+      buildNumber: "88",
+      platform: "ios",
+      paintSource: "gca",
+      shown: { par: 4, green: { lat: 33.2, lon: -93.1 }, tee: null },
+      receivedAt: stored.receivedAt,
+      installId: "dev-1",
+      country: "US",
+    });
+    expect(kv.get(`cr:id:${REPORT_ID}`)).toEqual({
+      value: recordKey,
+      opts: { expirationTtl: REPORT_TTL },
+      metadata: null,
+    });
+    expect(kv.get(recordKey).opts).toEqual({ expirationTtl: REPORT_TTL });
+    expect(JSON.stringify([...kv.entries()])).not.toContain(REPORT_IP);
+    expect(stored.courseId).toHaveLength(180);
+
+    const options = await invoke(`${ORIGIN}/v1/course-reports`, { method: "OPTIONS" });
+    expect(options.headers.get("Access-Control-Allow-Methods")).toBe("GET,POST,OPTIONS");
+    expect(options.headers.get("Access-Control-Allow-Headers")).toBe("Content-Type, X-Install-Id, Authorization");
+    const boardOptions = await invoke(`${ORIGIN}/round1`, { method: "OPTIONS" });
+    expect(boardOptions.headers.get("Access-Control-Allow-Methods")).toBe("GET,PUT,OPTIONS");
+    expect(boardOptions.headers.get("Access-Control-Allow-Headers")).toBe("Content-Type, X-Install-Id");
+  });
+
+  it("returns 200 for a duplicate course report and does not write again", async () => {
+    const first = await postReport(reportBody(), { headers: { "X-Install-Id": "dev-1" } });
+    expect(first.status).toBe(201);
+    const before = new Map(kv);
+    const again = await postReport(reportBody({
+      note: "a different note must not replace the stored report",
+      holeNumber: 3,
+    }), { headers: { "X-Install-Id": "dev-1" } });
+    expect(again.status).toBe(200);
+    expect(await again.json()).toEqual({ ok: true, id: REPORT_ID, duplicate: true });
+    expect(kv.size).toBe(before.size);
+    for (const [key, row] of before) {
+      expect(kv.get(key)).toEqual(row);
+    }
+    expect(reportRecords()).toHaveLength(1);
+  });
+
+  it("rejects course report JSON that cannot be parsed with 400", async () => {
+    const bad = await postReport(null, { raw: "{" });
+    expect(bad.status).toBe(400);
+    expect(await bad.json()).toEqual({ error: "invalid_json" });
+    const empty = await postReport(null, { raw: "" });
+    expect(empty.status).toBe(400);
+    expect(kv.size).toBe(0);
+
+    const boundary = await postReport(null, { raw: "x".repeat(4096) });
+    expect(boundary.status).toBe(400);
+    expect(kv.size).toBe(0);
+  });
+
+  it("rejects an oversized course report with 413", async () => {
+    const over = await postReport(null, { raw: "x".repeat(4097) });
+    expect(over.status).toBe(413);
+    expect(await over.json()).toEqual({ error: "too_large" });
+    expect(kv.size).toBe(0);
+  });
+
+  it("returns 422 for each invalid course report field and drops nothing", async () => {
+    const cases = [
+      ["clientReportId missing", reportBody({}, ["clientReportId"]), "clientReportId"],
+      ["clientReportId bad", reportBody({ clientReportId: "not-a-uuid" }), "clientReportId"],
+      ["clientReportId long", reportBody({ clientReportId: `${"a".repeat(65)}` }), "clientReportId"],
+      ["createdAt missing", reportBody({}, ["createdAt"]), "createdAt"],
+      ["createdAt bad", reportBody({ createdAt: "yesterday" }), "createdAt"],
+      ["createdAt date only", reportBody({ createdAt: "2026-09-28" }), "createdAt"],
+      ["courseId missing", reportBody({}, ["courseId"]), "courseId"],
+      ["courseId empty", reportBody({ courseId: "" }), "courseId"],
+      ["courseId long", reportBody({ courseId: `id:${"a".repeat(178)}` }), "courseId"],
+      ["courseName missing", reportBody({}, ["courseName"]), "courseName"],
+      ["courseName blank", reportBody({ courseName: "   " }), "courseName"],
+      ["courseName long", reportBody({ courseName: "a".repeat(201) }), "courseName"],
+      ["holeNumber missing", reportBody({}, ["holeNumber"]), "holeNumber"],
+      ["holeNumber zero", reportBody({ holeNumber: 0 }), "holeNumber"],
+      ["holeNumber high", reportBody({ holeNumber: 19 }), "holeNumber"],
+      ["holeNumber fraction", reportBody({ holeNumber: 1.5 }), "holeNumber"],
+      ["holeNumber string", reportBody({ holeNumber: "7" }), "holeNumber"],
+      ["reasons missing", reportBody({}, ["reasons"]), "reasons"],
+      ["reasons empty", reportBody({ reasons: [] }), "reasons"],
+      ["reasons unknown", reportBody({ reasons: ["not_a_reason"] }), "reasons"],
+      ["reasons type", reportBody({ reasons: "green_wrong" }), "reasons"],
+      ["note long", reportBody({ note: "n".repeat(501) }), "note"],
+      ["note type", reportBody({ note: 12 }), "note"],
+      ["position lat", reportBody({ position: { lat: 90.1, lon: 0, accuracyM: 1 } }), "position"],
+      ["position lon", reportBody({ position: { lat: 0, lon: -180.1, accuracyM: 1 } }), "position"],
+      ["position accuracy", reportBody({ position: { lat: 0, lon: 0, accuracyM: -1 } }), "position"],
+      ["position type", reportBody({ position: "here" }), "position"],
+      ["position lat null", reportBody({ position: { lat: null, lon: 0, accuracyM: 1 } }), "position"],
+      ["appVersion long", reportBody({ appVersion: "a".repeat(33) }), "appVersion"],
+      ["buildNumber long", reportBody({ buildNumber: "b".repeat(33) }), "buildNumber"],
+      ["platform long", reportBody({ platform: "p".repeat(33) }), "platform"],
+      ["paintSource long", reportBody({ paintSource: "s".repeat(33) }), "paintSource"],
+      ["paintSource type", reportBody({ paintSource: 1 }), "paintSource"],
+      ["shown par low", reportBody({ shown: { par: 2 } }), "shown"],
+      ["shown par high", reportBody({ shown: { par: 7 } }), "shown"],
+      ["shown green", reportBody({ shown: { green: { lat: 91, lon: 0 } } }), "shown"],
+      ["shown tee", reportBody({ shown: { tee: "nope" } }), "shown"],
+      ["shown type", reportBody({ shown: [] }), "shown"],
+    ];
+    for (const [label, body, field] of cases) {
+      const response = await postReport(body);
+      expect(response.status, label).toBe(422);
+      expect(await response.json(), label).toEqual({ error: "invalid", field });
+    }
+    const longInstall = await postReport(reportBody(), {
+      headers: { "X-Install-Id": "i".repeat(101) },
+    });
+    expect(longInstall.status).toBe(422);
+    expect(await longInstall.json()).toEqual({ error: "invalid", field: "installId" });
+    expect(kv.size).toBe(0);
+  });
+
+  it("returns 429 after the IP daily limit with Retry-After", async () => {
+    for (let n = 0; n < 30; n += 1) {
+      const id = `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
+      const response = await postReport(reportBody({ clientReportId: id }));
+      expect(response.status, id).toBe(201);
+    }
+    const limited = await postReport(reportBody({ clientReportId: REPORT_ID_2 }));
+    expect(limited.status).toBe(429);
+    expect(await limited.json()).toEqual({ error: "rate_limited" });
+    const retryAfter = Number(limited.headers.get("Retry-After"));
+    const now = new Date();
+    const expected = Math.max(1, Math.ceil((Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1) - now.getTime()) / 1000));
+    expect(retryAfter).toBeGreaterThan(0);
+    expect(Math.abs(retryAfter - expected)).toBeLessThanOrEqual(2);
+    expect(reportRecords()).toHaveLength(30);
+    const counter = [...kv.keys()].find((key) => key.startsWith("cr:n:ip:"));
+    expect(counter).toBeTruthy();
+    expect(kv.get(counter).value).toBe("30");
+    expect(counter).not.toContain(REPORT_IP);
+  });
+
+  it("does not count a duplicate toward the IP or device daily cap", async () => {
+    env.COURSE_REPORTS_IP_DAY = "1";
+    env.COURSE_REPORTS_DEVICE_DAY = "1";
+    const headers = { "X-Install-Id": "dev-1" };
+    expect((await postReport(reportBody(), { headers })).status).toBe(201);
+    const replay = await postReport(reportBody({ note: "ignored" }), { headers });
+    expect(replay.status).toBe(200);
+    expect((await replay.json()).duplicate).toBe(true);
+    const blocked = await postReport(reportBody({ clientReportId: REPORT_ID_2 }), { headers });
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers.get("Retry-After")).toMatch(/^\d+$/);
+    const replayWhileLimited = await postReport(reportBody(), { headers });
+    expect(replayWhileLimited.status).toBe(200);
+    expect(reportRecords()).toEqual([expect.stringContaining(REPORT_ID)]);
+    expect([...kv.keys()].filter((key) => key.startsWith("cr:n:")).map((key) => kv.get(key).value)).toEqual(["1", "1"]);
+  });
+
+  it("caps new course reports per install id from COURSE_REPORTS_DEVICE_DAY", async () => {
+    env.COURSE_REPORTS_DEVICE_DAY = "1";
+    env.COURSE_REPORTS_IP_DAY = "nope";
+    const first = await postReport(reportBody(), { headers: { "X-Install-Id": "phone-a" } });
+    expect(first.status).toBe(201);
+    const second = await postReport(reportBody({ clientReportId: REPORT_ID_2 }), {
+      headers: { "X-Install-Id": "phone-a" },
+    });
+    expect(second.status).toBe(429);
+    const otherDevice = await postReport(reportBody({
+      clientReportId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    }), { headers: { "X-Install-Id": "phone-b" } });
+    expect(otherDevice.status).toBe(201);
+    expect(reportRecords()).toHaveLength(2);
+  });
+
+  it("rejects board GET and PUT of v1 and cr: keys and unknown /v1 routes", async () => {
+    kv.set("v1", { value: "board-secret", opts: { expirationTtl: 60 } });
+    kv.set("cr:id:secret", { value: "cr:r:secret", opts: { expirationTtl: 60 } });
+    for (const key of ["v1", "cr:id:secret"]) {
+      const url = `${ORIGIN}/${encodeURIComponent(key)}`;
+      for (const method of ["GET", "PUT"]) {
+        const response = await invoke(url, { method, body: method === "PUT" ? "{}" : undefined });
+        expect(response.status, `${method} ${key}`).toBe(400);
+        expect(await response.text(), `${method} ${key}`).toBe("bad key");
+      }
+    }
+    expect(kv.get("v1").value).toBe("board-secret");
+    expect(kv.get("cr:id:secret").value).toBe("cr:r:secret");
+
+    const unknown = await invoke(`${ORIGIN}/v1/nope`, { method: "POST", body: "{}" });
+    expect(unknown.status).toBe(404);
+    expect(await unknown.json()).toEqual({ error: "unknown_route" });
+    const put = await invoke(`${ORIGIN}/v1/course-reports`, { method: "PUT", body: "{}" });
+    expect(put.status).toBe(405);
+    expect(await put.json()).toEqual({ error: "method_not_allowed" });
+    expect(kv.has("v1/course-reports")).toBe(false);
+
+    const unbound = await postReport(reportBody(), { env: {} });
+    expect(unbound.status).toBe(503);
+    expect(await unbound.json()).toEqual({ error: "boards_not_configured" });
+  });
+
+  it("serves admin course reports only with the bearer token", async () => {
+    const closed = await invoke(`${ORIGIN}/v1/course-reports`);
+    expect(closed.status).toBe(503);
+    expect(await closed.json()).toEqual({ error: "not_configured" });
+    const closedOne = await invoke(`${ORIGIN}/v1/course-reports/${REPORT_ID}`);
+    expect(closedOne.status).toBe(503);
+
+    env.COURSE_REPORTS_ADMIN_TOKEN = "admin-secret";
+    const missing = await invoke(`${ORIGIN}/v1/course-reports`);
+    expect(missing.status).toBe(401);
+    expect(await missing.json()).toEqual({ error: "unauthorized" });
+    const wrong = await invoke(`${ORIGIN}/v1/course-reports`, {
+      headers: { Authorization: "Bearer wrong-token" },
+    });
+    expect(wrong.status).toBe(401);
+    const notBearer = await invoke(`${ORIGIN}/v1/course-reports/${REPORT_ID}`, {
+      headers: { Authorization: "Basic admin-secret" },
+    });
+    expect(notBearer.status).toBe(401);
+
+    const oldId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const oldKey = `cr:r:2020-01-01T00:00:00.000Z:${oldId}`;
+    const oldRecord = {
+      clientReportId: oldId,
+      createdAt: "2020-01-01T00:00:00Z",
+      courseId: "id:old",
+      courseName: "Old Course",
+      holeNumber: 1,
+      reasons: ["hole_missing"],
+      receivedAt: "2020-01-01T00:00:00.000Z",
+      installId: null,
+    };
+    kv.set(oldKey, { value: JSON.stringify(oldRecord), opts: { expirationTtl: REPORT_TTL } });
+    kv.set(`cr:id:${oldId}`, { value: oldKey, opts: { expirationTtl: REPORT_TTL } });
+    const created = await postReport(reportBody({ courseId: "name:magnolia", courseName: "Magnolia" }));
+    expect(created.status).toBe(201);
+
+    function adminGet(path) {
+      return invoke(`${ORIGIN}${path}`, { headers: { Authorization: "Bearer admin-secret" } });
+    }
+
+    const listed = await adminGet("/v1/course-reports?since=2024-01-01T00:00:00Z&courseId=name:magnolia");
+    expect(listed.status).toBe(200);
+    const page = await listed.json();
+    expect(page.cursor).toBeNull();
+    expect(page.reports).toHaveLength(1);
+    expect(page.reports[0].clientReportId).toBe(REPORT_ID);
+    expect(page.reports[0].courseId).toBe("name:magnolia");
+
+    const onlyOld = await adminGet("/v1/course-reports?courseId=id:old");
+    expect((await onlyOld.json()).reports).toEqual([oldRecord]);
+    const none = await adminGet("/v1/course-reports?since=2024-01-01T00:00:00.000Z&courseId=id:old");
+    expect(await none.json()).toEqual({ reports: [], cursor: null });
+
+    const all = await adminGet("/v1/course-reports");
+    const allBody = await all.json();
+    expect(allBody.reports.map((row) => row.clientReportId)).toEqual([oldId, REPORT_ID]);
+
+    const one = await adminGet(`/v1/course-reports/${oldId}`);
+    expect(one.status).toBe(200);
+    expect(await one.json()).toEqual(oldRecord);
+    const absent = await adminGet(`/v1/course-reports/${REPORT_ID_2}`);
+    expect(absent.status).toBe(404);
+    expect(await absent.json()).toEqual({ error: "not_found" });
+
+    const seen = [];
+    env.BOARDS.list = async (opts) => {
+      seen.push(opts);
+      return { keys: [{ name: oldKey }], list_complete: false, cursor: "next-cursor" };
+    };
+    const passed = await adminGet("/v1/course-reports?limit=9999&cursor=page-2");
+    expect(seen[0]).toEqual({ prefix: "cr:r:", limit: 500, cursor: "page-2" });
+    expect((await passed.json()).cursor).toBe("next-cursor");
+    const defaults = [];
+    env.BOARDS.list = async (opts) => {
+      defaults.push(opts);
+      return { keys: [], list_complete: true };
+    };
+    await adminGet("/v1/course-reports?limit=0");
+    expect(defaults[0].limit).toBe(100);
+    expect(defaults[0].cursor).toBeUndefined();
   });
 });
