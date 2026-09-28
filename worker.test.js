@@ -1980,6 +1980,11 @@ describe("shottrax-share worker", () => {
   const MAGNOLIA_MEN = [17, 9, 1, 13, 3, 5, 15, 11, 7, 16, 18, 14, 10, 2, 4, 12, 8, 6];
   const MAGNOLIA_WOMEN = [17, 7, 3, 9, 11, 1, 13, 15, 5, 8, 16, 12, 14, 4, 2, 10, 18, 6];
   const MAGNOLIA_SOURCE = "club scorecard photo, verified 2026-09-27";
+  const SCORECARD_VERSION = "2026-09-27";
+
+  function scorecardCorrection(source, fields, mode = "fill") {
+    return { source, fields, mode, version: SCORECARD_VERSION };
+  }
 
   function permutationOf1to18(values) {
     expect(values).toHaveLength(18);
@@ -2021,6 +2026,8 @@ describe("shottrax-share worker", () => {
 
   it("stores Magnolia stroke indexes as permutations of 1..18", () => {
     const card = GCA_CORRECTIONS[GCA_ID];
+    expect(card.mode ?? "fill").toBe("fill");
+    expect(card.version).toBe(SCORECARD_VERSION);
     expect(card.source).toBe(MAGNOLIA_SOURCE);
     expect(card.par).toEqual(MAGNOLIA_PAR);
     expect(card.par.slice(0, 9).reduce((sum, par) => sum + par, 0)).toBe(36);
@@ -2047,10 +2054,9 @@ describe("shottrax-share worker", () => {
       expect(tee.holes.map((hole) => hole.yardage)).toEqual(MAGNOLIA_PAR.map((_, index) => 300 + index));
     }
     expect(json.data.scorecard.teeboxes[0].total_yards).toBe(6780);
-    expect(json.data.scorecard.corrections).toEqual({
-      source: MAGNOLIA_SOURCE,
-      fields: ["handicap", "handicap_women"],
-    });
+    expect(json.data.scorecard.corrections).toEqual(
+      scorecardCorrection(MAGNOLIA_SOURCE, ["handicap", "handicap_women"]),
+    );
     expect(await edge.get(`${ORIGIN}/gca/v1/courses/${GCA_ID}`).clone().text()).toBe(raw);
   });
 
@@ -2080,10 +2086,9 @@ describe("shottrax-share worker", () => {
     expect(holes[3].par).toBe(MAGNOLIA_PAR[3]);
     expect(holes[4].par).toBe(MAGNOLIA_PAR[4]);
     expect(holes.map((hole) => hole.handicap)).toEqual([9, 9, 0, 13, 3, 5, 15, 11, 7, 16, 18, 14, 10, 2, 4, 12, 8, 6]);
-    expect(json.data.scorecard.corrections).toEqual({
-      source: MAGNOLIA_SOURCE,
-      fields: ["par", "handicap", "handicap_women"],
-    });
+    expect(json.data.scorecard.corrections).toEqual(
+      scorecardCorrection(MAGNOLIA_SOURCE, ["par", "handicap", "handicap_women"]),
+    );
   });
 
   it("skips a teebox when an upstream par disagrees with the card", async () => {
@@ -2102,7 +2107,9 @@ describe("shottrax-share worker", () => {
     expect(white.holes.map((hole) => hole.handicap_women)).toEqual(MAGNOLIA_WOMEN);
     expect(short.holes).toHaveLength(9);
     expect(short.holes.every((hole) => hole.handicap == null)).toBe(true);
-    expect(json.data.scorecard.corrections.fields).toEqual(["handicap", "handicap_women"]);
+    expect(json.data.scorecard.corrections).toEqual(
+      scorecardCorrection(MAGNOLIA_SOURCE, ["handicap", "handicap_women"]),
+    );
 
     const onlyMismatch = magnoliaScorecard([{ name: "Gold", holes: mismatched }]);
     fetchMock.mockResolvedValue(scorecardResponse(onlyMismatch));
@@ -2157,10 +2164,9 @@ describe("shottrax-share worker", () => {
       expect(tee.holes.map((hole) => hole.handicap)).toEqual(MAGNOLIA_MEN);
       expect(tee.holes.map((hole) => hole.handicap_women)).toEqual(MAGNOLIA_WOMEN);
     }
-    expect(json.data.scorecard.corrections).toEqual({
-      source: MAGNOLIA_SOURCE,
-      fields: ["handicap", "handicap_women"],
-    });
+    expect(json.data.scorecard.corrections).toEqual(
+      scorecardCorrection(MAGNOLIA_SOURCE, ["handicap", "handicap_women"]),
+    );
     expect(await edge.get(url).clone().text()).toBe(raw);
 
     fetchMock.mockResolvedValue(scorecardResponse(raw));
@@ -2581,10 +2587,9 @@ describe("shottrax-share worker", () => {
       expect(tee.holes.map((hole) => hole.handicap)).toEqual(MAGNOLIA_MEN);
       expect(tee.holes.map((hole) => hole.handicap_women)).toEqual(MAGNOLIA_WOMEN);
     }
-    expect(json.data.scorecard.corrections).toEqual({
-      source: MAGNOLIA_SOURCE,
-      fields: ["handicap", "handicap_women"],
-    });
+    expect(json.data.scorecard.corrections).toEqual(
+      scorecardCorrection(MAGNOLIA_SOURCE, ["handicap", "handicap_women"]),
+    );
   }
 
   it("fills Magnolia stroke indexes from a fresh KV copy and leaves that copy raw", async () => {
@@ -2665,6 +2670,8 @@ describe("shottrax-share worker", () => {
 
   it("stores Greystone stroke indexes as permutations of 1..18", () => {
     const card = GCA_CORRECTIONS[GREYSTONE_ID];
+    expect(card.mode ?? "fill").toBe("fill");
+    expect(card.version).toBe(SCORECARD_VERSION);
     expect(card.source).toBe(GREYSTONE_SOURCE);
     expect(card.par).toEqual(GREYSTONE_PAR);
     expect(card.par.slice(0, 9).reduce((sum, par) => sum + par, 0)).toBe(36);
@@ -2696,10 +2703,9 @@ describe("shottrax-share worker", () => {
     expect(white.holes.every((hole) => hole.handicap == null && hole.handicap_women == null)).toBe(true);
     expect(white.holes.map((hole) => hole.yardage)).toEqual(whitePar.map((_, index) => 300 + index));
     expect([grey, blue, white, black].map((tee) => tee.total_yards)).toEqual([7051, 6509, 6038, 5451]);
-    expect(json.data.scorecard.corrections).toEqual({
-      source: GREYSTONE_SOURCE,
-      fields: ["handicap", "handicap_women"],
-    });
+    expect(json.data.scorecard.corrections).toEqual(
+      scorecardCorrection(GREYSTONE_SOURCE, ["handicap", "handicap_women"]),
+    );
     expect(await edge.get(`${ORIGIN}/gca/v1/courses/${GREYSTONE_ID}`).clone().text()).toBe(raw);
     expect(kv.get(`gca:course:${GREYSTONE_ID}`).value).toBe(raw);
     expect(kv.get(`gca:course:${GREYSTONE_ID}`).value).not.toContain("corrections");
@@ -2741,10 +2747,129 @@ describe("shottrax-share worker", () => {
     expect(white.holes[5].handicap_women).toBe(2);
     expect(white.holes.filter((_, index) => index !== 0).every((hole) => hole.handicap == null)).toBe(true);
     expect(white.holes.filter((_, index) => index !== 5).every((hole) => hole.handicap_women == null)).toBe(true);
-    expect(json.data.scorecard.corrections).toEqual({
-      source: GREYSTONE_SOURCE,
-      fields: ["handicap", "handicap_women"],
-    });
+    expect(json.data.scorecard.corrections).toEqual(
+      scorecardCorrection(GREYSTONE_SOURCE, ["handicap", "handicap_women"]),
+    );
     expect(kv.get(`gca:course:${GREYSTONE_ID}`).value).toBe(raw);
+  });
+
+  // Club scorecard photo, Cypress Creek at Greystone, verified 2026-09-27.
+  // Upstream copied the Mountain Springs index onto every tee. White is "White/ Middle".
+  const CYPRESS_ID = "14229";
+  const CYPRESS_PAR = [4, 4, 5, 3, 4, 4, 5, 4, 3, 4, 5, 4, 3, 4, 4, 3, 4, 5];
+  const CYPRESS_UPPER = [11, 9, 1, 17, 5, 13, 7, 3, 15, 16, 6, 2, 14, 10, 4, 12, 8, 18];
+  const CYPRESS_LOWER = [7, 9, 3, 17, 11, 13, 1, 5, 15, 18, 4, 6, 12, 10, 2, 16, 14, 8];
+  const MOUNTAIN_SPRINGS_INDEX = [13, 17, 5, 9, 7, 15, 11, 3, 1, 10, 6, 16, 14, 4, 12, 18, 2, 8];
+  const CYPRESS_SOURCE = "club scorecard photo (Cypress Creek at Greystone), verified 2026-09-27";
+
+  function cypressHoles(pars, handicap, handicapWomen = handicap) {
+    return pars.map((par, index) => ({
+      par,
+      yardage: 280 + index,
+      handicap: handicap[index],
+      handicap_women: handicapWomen[index],
+    }));
+  }
+
+  function cypressTee(name, rating, slope, yards, pars = CYPRESS_PAR, handicap = MOUNTAIN_SPRINGS_INDEX, handicapWomen = handicap) {
+    return {
+      name,
+      course_rating: rating,
+      slope_rating: slope,
+      total_yards: yards,
+      holes: cypressHoles(pars, handicap, handicapWomen),
+    };
+  }
+
+  function teeScorecardIdentity(tee) {
+    return JSON.stringify({
+      name: tee.name,
+      course_rating: tee.course_rating,
+      slope_rating: tee.slope_rating,
+      total_yards: tee.total_yards,
+      holes: tee.holes.map((hole) => ({ par: hole.par, yardage: hole.yardage })),
+    });
+  }
+
+  it("stores Cypress Creek stroke rows as permutations of 1..18", () => {
+    const card = GCA_CORRECTIONS[CYPRESS_ID];
+    expect(card.mode).toBe("override");
+    expect(card.version).toBe(SCORECARD_VERSION);
+    expect(card.source).toBe(CYPRESS_SOURCE);
+    expect(card.par).toEqual(CYPRESS_PAR);
+    expect(card.par.slice(0, 9).reduce((sum, par) => sum + par, 0)).toBe(36);
+    expect(card.par.slice(9).reduce((sum, par) => sum + par, 0)).toBe(36);
+    permutationOf1to18(card.rows.upper);
+    permutationOf1to18(card.rows.lower);
+    expect(card.rows.upper).toEqual(CYPRESS_UPPER);
+    expect(card.rows.lower).toEqual(CYPRESS_LOWER);
+    expect(card.teeRows).toEqual({ Gold: "upper", Blue: "upper", White: "upper", Black: "lower" });
+  });
+
+  it("overrides the copied Cypress Creek stroke index and leaves other tees and fields unchanged", async () => {
+    const unmappedMen = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18];
+    const unmappedWomen = [18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
+    const mismatchedPar = CYPRESS_PAR.map((par, index) => (index === 17 ? 4 : par));
+    const teeboxes = [
+      cypressTee("Gold/Championship", 74.5, 135, 7392),
+      cypressTee("Blue/Back", 72.1, 130, 6820),
+      cypressTee("White/ Middle", 69.8, 126, 6303),
+      cypressTee("Black/Senior", 65.6, 113, 5218),
+      cypressTee("Green/Forward", 64.4, 110, 5218, CYPRESS_PAR, unmappedMen, unmappedWomen),
+      cypressTee("Gold/Mismatch", 74.5, 135, 7392, mismatchedPar),
+    ];
+    teeboxes[0].holes[0].par = 0;
+    const raw = JSON.stringify({
+      data: {
+        club_name: "Greystone Country Club",
+        scorecard: { teeboxes },
+      },
+    });
+    const before = JSON.parse(raw).data.scorecard.teeboxes;
+    fetchMock.mockResolvedValue(scorecardResponse(raw));
+    const response = await invoke(`${ORIGIN}/gca/v1/courses/${CYPRESS_ID}`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=300");
+    const json = await response.json();
+    const tees = json.data.scorecard.teeboxes;
+    expect(tees.map((tee) => tee.name)).toEqual(before.map((tee) => tee.name));
+    for (let i = 0; i < tees.length; i++) {
+      expect(teeScorecardIdentity(tees[i])).toBe(teeScorecardIdentity(before[i]));
+    }
+    const [gold, blue, white, black, green, mismatch] = tees;
+    for (const tee of [gold, blue, white]) {
+      expect(tee.holes.map((hole) => hole.handicap)).toEqual(CYPRESS_UPPER);
+      expect(tee.holes.map((hole) => hole.handicap_women)).toEqual(CYPRESS_UPPER);
+    }
+    expect(gold.holes[0].par).toBe(0);
+    expect(black.holes.map((hole) => hole.handicap)).toEqual(CYPRESS_LOWER);
+    expect(black.holes.map((hole) => hole.handicap_women)).toEqual(CYPRESS_LOWER);
+    expect(black.course_rating).toBe(65.6);
+    expect(black.slope_rating).toBe(113);
+    expect(black.total_yards).toBe(5218);
+    expect(green.holes.map((hole) => hole.handicap)).toEqual(unmappedMen);
+    expect(green.holes.map((hole) => hole.handicap_women)).toEqual(unmappedWomen);
+    expect(mismatch.holes.map((hole) => hole.par)).toEqual(mismatchedPar);
+    expect(mismatch.holes.map((hole) => hole.handicap)).toEqual(MOUNTAIN_SPRINGS_INDEX);
+    expect(mismatch.holes.map((hole) => hole.handicap_women)).toEqual(MOUNTAIN_SPRINGS_INDEX);
+    expect(json.data.scorecard.corrections).toEqual(
+      scorecardCorrection(CYPRESS_SOURCE, ["handicap", "handicap_women"], "override"),
+    );
+    expect(await edge.get(`${ORIGIN}/gca/v1/courses/${CYPRESS_ID}`).clone().text()).toBe(raw);
+    expect(kv.get(`gca:course:${CYPRESS_ID}`).value).toBe(raw);
+    expect(kv.get(`gca:course:${CYPRESS_ID}`).value).not.toContain("corrections");
+
+    const onlyMismatch = JSON.stringify({
+      data: {
+        scorecard: {
+          teeboxes: [cypressTee("Gold/Championship", 74.5, 135, 7392, mismatchedPar)],
+        },
+      },
+    });
+    fetchMock.mockResolvedValue(scorecardResponse(onlyMismatch));
+    kv.delete(`gca:course:${CYPRESS_ID}`);
+    edge.delete(`${ORIGIN}/gca/v1/courses/${CYPRESS_ID}`);
+    const skipped = await invoke(`${ORIGIN}/gca/v1/courses/${CYPRESS_ID}?x=1`);
+    expect(await skipped.text()).toBe(onlyMismatch);
   });
 });

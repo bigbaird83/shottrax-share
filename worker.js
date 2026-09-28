@@ -14,7 +14,7 @@ import { applyGcaScorecardCorrection } from "./gca-corrections.js";
  *
  * Any other /golfapi/ path is 404. The API key is the GOLFAPI_KEY secret only.
  *
- * Successful JSON for a listed `/gca/v1/courses/{id}` is filled from
+ * Successful JSON for a listed `/gca/v1/courses/{id}` is corrected from
  * gca-corrections.js in presentGcaCourseBody, once, on the way out: an
  * edge-cache hit, a fresh upstream read, a fresh KV copy, and a stale KV copy.
  * Search, list, green-centers, and golfapi bodies are returned unchanged.
@@ -1510,7 +1510,7 @@ function logGcaRateLimit(kind, status, headers) {
 /**
  * Only response-time transform for a durable GCA body. Called once per
  * client response. KV and the edge cache keep the raw upstream bytes.
- * Fill-only scorecard corrections run here for courses/{id}.
+ * Scorecard corrections run here for courses/{id}.
  */
 export function presentGcaCourseBody(kind, courseId, rawBody, contentType) {
   if (kind !== "course") return rawBody;
