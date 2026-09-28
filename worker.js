@@ -1,4 +1,5 @@
 import { applyGcaScorecardCorrection } from "./gca-corrections.js";
+import { handleLivePage, isLiveBoardCode } from "./live-page.js";
 
 /**
  * Golf vendor proxy, inlined from ShotTraxx worker-golf-proxy.js.
@@ -2383,6 +2384,17 @@ export default {
 
     const osm = await handleOsmOverlay(request, env, ctx, cors);
     if (osm) return osm;
+
+    // Live board web page (GET /s/{code}). Only a real board code is read, and never a
+    // reserved key, so the page cannot show overlay, course-store, GCA, or golfapi data.
+    const page = await handleLivePage(request, env, {
+      loadBoard: (code) => {
+        if (!isLiveBoardCode(code) || isReservedBoardKey(code)) return null;
+        const boards = env && env.BOARDS;
+        return boards && typeof boards.get === "function" ? boards.get(code) : null;
+      },
+    });
+    if (page) return page;
 
     const url = new URL(request.url);
     const key = decodeURIComponent(url.pathname.replace(/^\/+/, "").split("/")[0] || "");

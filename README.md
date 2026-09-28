@@ -16,6 +16,24 @@ Board and paint-cache keys are stored only while that binding is present on the 
 
 `GET`, `PUT`, and `DELETE` for a reserved prefix return `400` and do not read or write KV, so a board request cannot read, replace, or reset an overlay, a golfapi counter, a stored course, a GCA copy, or the refill queue. Paint keys (`id:`, `name:`) and ordinary board codes are unchanged.
 
+## Live board web page
+
+`GET /s/{code}` is an HTML page anyone can open in a browser, no app needed (`live-page.js`). The ShotTraxx™ app shares this link for a live board. The page renders the board stored at `{code}` in `BOARDS` on the Worker, so Messages and WhatsApp previews show the course and score (`Live · Greystone CC` / `E thru 2 · On hole 3`). Then it polls `GET /{code}` every 8 s until the round is final. Scores only: no map, and the page never asks for location.
+
+- Only a six-character board code from the app's alphabet is read. Anything else under `/s/` is a `404` page, and the route also refuses reserved keys, so it never reads or shows overlay, golfapi, course-store, GCA, refill-queue, or paint (`id:` / `name:`) data.
+- A valid code with nothing stored yet (or `BOARDS` unbound) gets a "Waiting for the first hole" page that keeps polling.
+- Every stored string is HTML-escaped (anyone can `PUT` a board). Scripts and styles run under a per-request CSP nonce, and `connect-src` is `'self'`.
+- `STORE_LIVE` (var, default off). Leave it unset until ShotTraxx™ is live in the App Store. Off shows "Open in ShotTraxx™" (`shottrax:///s/{code}`) only. `"true"` adds the Safari App Store banner and a "Track your own round" card with the 14-day Pro trial. Set it under `[vars]` in `wrangler.toml` (the automatic `main` deploy uses that file). `APP_STORE_ID` overrides the App Store id (`6812944398`).
+
+Check after merge (any six-character code; an unknown one shows the waiting page):
+
+```bash
+curl -sS -o /dev/null -w "%{http_code} %{content_type}\n" https://shottrax-share.bcbaird.workers.dev/s/BK3MCQ
+# 200 text/html; charset=utf-8
+curl -sS -o /dev/null -w "%{http_code}\n" https://shottrax-share.bcbaird.workers.dev/s/gq:balance
+# 404
+```
+
 ## Golf vendor proxy
 
 GCA search (`GET /gca/v1/courses?...`) is cached at the edge for 24 hours. Its upstream status passes through unchanged, and it is not written to KV.
