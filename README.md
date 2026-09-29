@@ -36,12 +36,13 @@ curl -sS -o /dev/null -w "%{http_code}\n" https://shottrax-share.bcbaird.workers
 
 ## Course reports
 
-The app queues an in-round "problem with this course/hole" report on the phone and `POST`s it here. `200` and `201` with `{ "ok": true, "id" }` mean the report was accepted (a `200` is a duplicate and is not stored again). The app drops a report only on `400`, `413`, or `422`. Anything else (`404`, `405`, `429`, `5xx`, network) stays queued and is retried. Unknown JSON fields are ignored, so a newer app build can add fields without the report being dropped.
+The app queues an in-round "problem with this course/hole" report on the phone and `POST`s it here. The same endpoint takes a "Map this hole" contribution when a hole has no map. `200` and `201` with `{ "ok": true, "id" }` mean the report was accepted (a `200` is a duplicate and is not stored again). The app drops a report only on `400`, `413`, or `422`. Anything else (`404`, `405`, `429`, `5xx`, network) stays queued and is retried. Unknown JSON fields are ignored, so a newer app build can add fields without the report being dropped.
 
 ```
 POST /v1/course-reports
 GET  /v1/course-reports                      admin
 GET  /v1/course-reports/{clientReportId}     admin, one record
+POST /v1/course-reports/{clientReportId}/review   admin, review a contribution
 ```
 
 `POST` body is JSON, at most 4096 bytes. Over that is `413` `{ "error": "too_large" }`. Invalid JSON is `400` `{ "error": "invalid_json" }`. A field that can never succeed is `422` `{ "error": "invalid", "field" }`. Any other `/v1/*` path is `404` `{ "error": "unknown_route" }`. This route is matched before the board-key catch-all.
@@ -53,32 +54,64 @@ GET  /v1/course-reports/{clientReportId}     admin, one record
 | `courseId` | Required string, 1–180 characters. Same key as the paint cache (`id:…` or `name:…`). |
 | `courseName` | Required string. Trimmed, then 1–200 characters. |
 | `holeNumber` | Required integer, 1–18. |
-| `reasons` | Required non-empty array. Allowed: `hole_missing`, `green_wrong`, `tee_wrong`, `wrong_par`, `wrong_course`, `other`. Unknown values are dropped and duplicates collapse. If none remain, `422`. |
+| `reasons` | Required non-empty array. Allowed: `hole_missing`, `green_wrong`, `tee_wrong`, `wrong_par`, `wrong_course`, `other`, `hole-contribution`. Unknown values are dropped and duplicates collapse. If none remain, `422`. |
 | `note` | Optional string. Trimmed, max 500. |
-| `position` | `null` or `{ lat, lon, accuracyM }`. Finite `lat` −90..90, `lon` −180..180, `accuracyM` ≥ 0 or `null`. |
+| `position` | `null` or `{ lat, lon, accuracyM }`. Finite `lat` −90..90, `lon` −180..180, `accuracyM` ≥ 0 or `null`. This is the GPS fix for "I'm here". |
+| `contribution` | Required when `reasons` includes `hole-contribution`. Ignored on any other report. See below. |
 | `appVersion`, `buildNumber`, `platform` | Optional strings, each max 32. |
 | `paintSource` | Optional string or `null`, max 32. Any value is accepted and stored lowercased. |
 | `shown` | Optional. Never rejected. A non-object is stored as `null`. `par` is kept when it is an integer 1–10 and is otherwise `null`. `green` and `tee` are kept only as a valid `{ lat, lon }` and are otherwise `null`. |
 | `X-Install-Id` | Optional header, max 100 characters. Stored as `installId`. |
 
-A new report is `201` `{ "ok": true, "id": "<clientReportId>" }`. The same id again is `200` `{ "ok": true, "id", "duplicate": true }` and does not write. Both KV keys live 180 days:
+`contribution` when `hole-contribution` is one of the reasons:
+
+| Field | Rule |
+|---|---|
+| `green` | Required `{ lat, lon }`. Same lat/lon rules as `position`. |
+| `greenMethod` | Required. `tap-map` or `im-here`. |
+| `tee` | Optional `{ lat, lon }`. Omit it, or send `null`, when the player did not mark a tee. A present value that is not a lat/lon is `422` with `field` `contribution.tee`. |
+| `tees` | Optional array, at most 8. Each entry is `{ color, lat, lon, method, accuracyM? }`. `color` is a string, trimmed and stored lowercased, 1–24 characters, and unique in the list. `lat` and `lon` use the same rules as `tee`. `method` is `tap-map` or `im-here`. `accuracyM`, when sent, is a finite number ≥ 0. Omit `tees`, or send `null`, and it is ignored. An empty array stores nothing. A non-array, more than 8 entries, or any bad entry is `422` with `field` `contribution.tees`. Stored as `[{ color, lat, lon, method, accuracyM? }]`. The single `tee` field is unchanged. |
+| `par` | Optional integer, 3–6. Omit it, or send `null`, when the player did not enter par. |
+| `contributorEmail` | Optional. Trimmed, max 254 characters, basic `local@domain.tld` shape, stored lowercased. The report JSON does not hold the address. |
+
+A missing or non-object `contribution` is `422` `{ "error": "invalid", "field": "contribution" }`. A bad `green`, `greenMethod`, `tee`, `tees`, `par`, or `contributorEmail` uses `field` `contribution.<name>`. The server does not copy `position` onto `green` and does not fill in a tee, a tees list, or a par the player did not send.
+
+When an address is accepted, the report stores `contribution.hadEmail: true` and the address itself goes to `cr:email:<clientReportId>` with `expirationTtl` of 365 days. KV deletes that key on its own if nobody reviews the report. The `cr:` prefix is reserved, so `GET /cr:email:…` cannot read it. If `createdAt` is already 365 days old or older, the address is not stored. Admin `GET`s copy a live key onto `contribution.contributorEmail`. After the key is gone, those responses still show `hadEmail` and do not show the address.
+
+The phone refuses a bad GPS fix and an implausible hole length. The server still stores the contribution and adds `contribution.hints` for the reviewer. Hints never cause a `422`.
+
+| Hint | When it is set |
+|---|---|
+| `greenToPositionM` | `im-here` and `position` has a lat/lon. Meters, rounded, from the green to that fix. |
+| `positionAccuracyM` | `position.accuracyM` is a number. Copied through. |
+| `poorFix` | Same as `positionAccuracyM`. `true` when accuracy is over 15 meters. |
+| `greenToTeeM` | Both `tee` and `par` were sent. Meters, rounded, from the green to the tee. |
+| `plausibleForPar` | Same as `greenToTeeM`. Inclusive yards: par 3 is 60–280, par 4 is 230–520, par 5 is 400–680. Par 6 has no band, so the flag is `false`. |
+| `tees` | When `tees` were sent, one entry per tee: `{ color, greenToTeeM }`. `greenToTeeM` is meters, rounded, from the green to that tee. `accuracyM` and `poorFix` are included only when that tee sent `accuracyM`. `poorFix` is `true` when that accuracy is over 15 meters. `plausibleForPar` is included only when `par` was sent, using the same inclusive yard bands as the single-tee hint. |
+
+A contribution record also stores `review`: `{ "status": "pending", "reviewedAt": null, "note": null, "usedAt": null, "rewardedAt": null }`.
+
+A new report is `201` `{ "ok": true, "id": "<clientReportId>" }`. The same id again is `200` `{ "ok": true, "id", "duplicate": true }` and does not write. Neither response includes the stored record, so `contributorEmail` and `position` are not echoed to the phone. The report keys live 180 days. The address key lives 365 days:
 
 - `cr:id:<clientReportId>` — dedupe marker. The value is the record key.
-- `cr:r:<receivedAt ISO with milliseconds>:<clientReportId>` — the normalized JSON, plus `receivedAt`, `installId`, and `country` from `request.cf.country` when Cloudflare sends it. The raw IP is not stored.
+- `cr:r:<receivedAt ISO with milliseconds>:<clientReportId>` — the normalized JSON, plus `receivedAt`, `installId`, and `country` from `request.cf.country` when Cloudflare sends it. The raw IP is not stored. The address is not in this JSON.
+- `cr:email:<clientReportId>` — the lowercased address, only when one was accepted and `createdAt` is still inside 365 days. `expirationTtl` is 365 days.
 
-New reports (not duplicates) are limited per UTC day: 30 per `CF-Connecting-IP`, and 20 per `X-Install-Id` when that header is present. Over the limit is `429` `{ "error": "rate_limited" }` with `Retry-After` in seconds, which the app retries. Override the caps with `COURSE_REPORTS_IP_DAY` and `COURSE_REPORTS_DEVICE_DAY` (see the comments in `wrangler.toml`). If `BOARDS` is unbound the response is `503` `{ "error": "boards_not_configured" }`.
+New reports (not duplicates) are limited per UTC day: 30 per `CF-Connecting-IP`, and 20 per `X-Install-Id` when that header is present. Over the limit is `429` `{ "error": "rate_limited" }` with `Retry-After` in seconds, which the app retries. Override the caps with `COURSE_REPORTS_IP_DAY` and `COURSE_REPORTS_DEVICE_DAY` (see the comments in `wrangler.toml`). If `BOARDS` is unbound the response is `503` `{ "error": "boards_not_configured" }`. Review writes do not count toward the cap.
 
-Admin `GET` requires `Authorization: Bearer <token>`. The token is compared in constant time. Wrong or missing is `401`. If the secret is unset the route fails closed with `503` `{ "error": "not_configured" }`. Set it on the Worker (do not commit it):
+Admin `GET` and the review `POST` require `Authorization: Bearer <token>`. The token is compared in constant time. Wrong or missing is `401`. If the secret is unset the route fails closed with `503` `{ "error": "not_configured" }`. Set it on the Worker (do not commit it):
 
 ```
 wrangler secret put COURSE_REPORTS_ADMIN_TOKEN
 ```
 
-Query params: `since` (ISO timestamp; reports with an earlier `receivedAt` are skipped using key order), `courseId` (exact match), `limit` (default 100, max 500), `cursor` (pass the previous KV list cursor back). The body is `{ "reports": [ ... ], "cursor": "<cursor or null>" }`, oldest first. `GET /v1/course-reports/<clientReportId>` returns that one record, or `404` `{ "error": "not_found" }`.
+Query params: `since` (ISO timestamp; reports with an earlier `receivedAt` are skipped using key order), `courseId` (exact match), `reason` (one known reason, for example `hole-contribution`), `status` (`pending`, `approved`, `rejected`, `used`, or `rewarded`), `limit` (default 100, max 500), `cursor` (pass the previous KV list cursor back). An unknown `reason` or `status` is `422`. The body is `{ "reports": [ ... ], "cursor": "<cursor or null>" }`, oldest first. `GET /v1/course-reports/<clientReportId>` returns that one record, or `404` `{ "error": "not_found" }`. `position` is on these admin GETs. `contributorEmail` is on them only while the `cr:email:` key exists.
+
+`POST /v1/course-reports/<clientReportId>/review` body is `{ "status": "approved" | "rejected" | "used" | "rewarded", "note"?: string }`. `note` is optional, trimmed, max 500. Leave it out to keep the previous note. Send `null` or `""` to clear it. Allowed transitions are pending → approved, pending → rejected, approved → used, and used → rewarded. Anything else is `409` `{ "error": "invalid_transition" }`. A missing report is `404`. Moving to `approved` or `rejected` sets `reviewedAt`. Moving to `used` sets `usedAt` and leaves `reviewedAt` as it was. `rewardEligible` is stored `true` only when the new status is `used` and the email key is still present. Moving to `rejected` deletes `cr:email:<clientReportId>` in that same request and leaves `hadEmail`. Moving to `rewarded` sets `rewardedAt`, deletes that same key, and keeps `rewardEligible`. Nothing in this route grants the free month, and nothing writes the paint cache or any course record. Applying an approved hole is a separate manual step. The response is `200` and the updated record, with `contributorEmail` joined in only when the key is still there.
 
 CORS for this route allows `GET,POST,OPTIONS` and the `Authorization` header. Other routes are unchanged.
 
-Merging to `main` deploys this Worker. The admin list stays closed until `COURSE_REPORTS_ADMIN_TOKEN` is set. Do not put that token in `wrangler.toml`.
+Merging to `main` deploys this Worker. The admin list and review stay closed until `COURSE_REPORTS_ADMIN_TOKEN` is set. Do not put that token in `wrangler.toml`.
 
 ## Golf vendor proxy
 
