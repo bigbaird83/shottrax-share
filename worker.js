@@ -122,6 +122,7 @@ import { handleLivePage, isLiveBoardCode } from "./live-page.js";
  *   POST /v1/course-reports
  *   GET  /v1/course-reports                         admin
  *   GET  /v1/course-reports/{clientReportId}        admin, one record
+ *   POST /v1/course-reports/{clientReportId}/review admin, review a contribution
  *
  * POST JSON, 4096 bytes max. 201 {ok:true,id} stores a new report. The same
  * clientReportId is 200 {ok:true,id,duplicate:true} and does not write again.
@@ -129,7 +130,8 @@ import { handleLivePage, isLiveBoardCode } from "./live-page.js";
  * {error:"too_large"}. A field that can never succeed is 422
  * {error:"invalid",field}. Unknown top-level fields are ignored. Unknown
  * reason strings are dropped, not rejected, unless none of the known reasons
- * remain.
+ * remain. The public POST response is only {ok,id} (plus duplicate on a
+ * replay). It does not echo contributorEmail or position.
  *
  * Required: clientReportId (loose uuid, ≤64), createdAt (ISO, stored as
  * sent), courseId (1..180), courseName (trimmed, 1..200), holeNumber (1..18),
@@ -137,8 +139,48 @@ import { handleLivePage, isLiveBoardCode } from "./live-page.js";
  * position, appVersion, buildNumber, platform (each ≤32), paintSource (≤32,
  * stored lowercased), shown, and header X-Install-Id (≤100, stored as
  * installId). shown never rejects the report: a non-object becomes null.
- * par is kept when it is an integer 1..10 and is otherwise null. green and
- * tee are kept only as a valid lat/lon and are otherwise null.
+ * par on shown is kept when it is an integer 1..10 and is otherwise null.
+ * green and tee on shown are kept only as a valid lat/lon and are otherwise
+ * null.
+ *
+ * Known reasons: hole_missing, green_wrong, tee_wrong, wrong_par,
+ * wrong_course, other, hole-contribution. hole-contribution requires a
+ * contribution object. A contribution sent without that reason is ignored.
+ *
+ * contribution:
+ *   green {lat, lon}                    required, via parseLatLon
+ *   greenMethod "tap-map" | "im-here"   required
+ *   tee {lat, lon}                      optional, via parseLatLon
+ *   par                                 optional integer 3..6
+ *   contributorEmail                    optional, trimmed, max 254, basic
+ *                                       email shape, stored lowercased
+ * A bad contribution is 422 {error:"invalid", field} with field "contribution"
+ * or "contribution.<name>". position stays the top-level {lat, lon, accuracyM}
+ * and is the GPS fix for "I'm here". This route does not copy position onto
+ * green and does not invent a tee or a par.
+ *
+ * contribution.hints is stored for review and never causes a 422. The phone
+ * refuses a bad fix or an implausible length. The server only records:
+ *   greenToPositionM    meters, im-here when position has a lat/lon
+ *   positionAccuracyM   position.accuracyM when that is a number
+ *   poorFix             true when that accuracy is over 15
+ *   greenToTeeM         meters, only when tee and par were both sent
+ *   plausibleForPar     same condition. Inclusive yards: par 3 is 60–280,
+ *                       par 4 is 230–520, par 5 is 400–680. Par 6 has no
+ *                       band, so the flag is false.
+ *
+ * A contribution record stores review {status, reviewedAt, note, usedAt}.
+ * status starts as "pending". The other three start null.
+ *
+ * The review POST uses the same bearer token and fails closed the same way.
+ * Body is {status, note?}. status must be "approved", "rejected", or "used".
+ * note is optional, trimmed, max 500. Omit note to keep the previous one.
+ * Allowed transitions: pending→approved, pending→rejected, approved→used.
+ * Anything else is 409 {error:"invalid_transition"}. Moving to used sets
+ * usedAt. rewardEligible is stored true only when the new status is used and
+ * contributorEmail is present. No reward is granted. Nothing here writes the
+ * paint cache or any course record. Applying an approved hole is manual.
+ * A missing report is 404 {error:"not_found"}.
  *
  * BOARDS keys, both TTL 180 days:
  *   cr:id:<clientReportId>                  dedupe marker; value is the record key
@@ -146,18 +188,22 @@ import { handleLivePage, isLiveBoardCode } from "./live-page.js";
  * Server fields on the record: receivedAt, installId, and request.cf.country
  * when that is present. The raw IP is never stored. New reports are capped
  * per UTC day at 30 for CF-Connecting-IP and 20 for X-Install-Id when the
- * header is present. Duplicates do not count. Over the cap is 429
- * {error:"rate_limited"} plus Retry-After in seconds. Override with
- * COURSE_REPORTS_IP_DAY and COURSE_REPORTS_DEVICE_DAY. Counters are short-TTL
- * cr:n: keys and are not atomic.
+ * header is present. Duplicates do not count, and neither do review writes.
+ * Over the cap is 429 {error:"rate_limited"} plus Retry-After in seconds.
+ * Override with COURSE_REPORTS_IP_DAY and COURSE_REPORTS_DEVICE_DAY.
+ * Counters are short-TTL cr:n: keys and are not atomic.
  *
- * Admin GET requires Authorization: Bearer <COURSE_REPORTS_ADMIN_TOKEN>,
- * compared in constant time. Set it with `wrangler secret put
- * COURSE_REPORTS_ADMIN_TOKEN`. Unset fails closed: 503 {error:"not_configured"}.
- * Wrong or missing bearer is 401. Query: since (ISO, key order on receivedAt),
- * courseId (exact), limit (default 100, max 500), cursor (KV list cursor).
- * Body is {reports, cursor|null}, oldest first. Unbound BOARDS is 503
- * {error:"boards_not_configured"} on POST and on admin GET.
+ * Admin GET and the review POST require Authorization: Bearer
+ * <COURSE_REPORTS_ADMIN_TOKEN>, compared in constant time. Set it with
+ * `wrangler secret put COURSE_REPORTS_ADMIN_TOKEN`. Unset fails closed: 503
+ * {error:"not_configured"}. Wrong or missing bearer is 401. Query: since
+ * (ISO, key order on receivedAt), courseId (exact), reason (a known reason),
+ * status (pending, approved, rejected, or used), limit (default 100, max
+ * 500), cursor (KV list cursor). An unknown reason or status is 422. Body is
+ * {reports, cursor|null}, oldest first. Unbound BOARDS is 503
+ * {error:"boards_not_configured"} on POST and on admin GET. contributorEmail
+ * and position are returned on the admin GETs. The review POST returns the
+ * updated record to that same admin caller.
  */
 
 const OVERPASS_PRIMARY = "https://overpass-api.de/api/interpreter";
@@ -2667,7 +2713,20 @@ const COURSE_REPORT_REASONS = new Set([
   "wrong_par",
   "wrong_course",
   "other",
+  "hole-contribution",
 ]);
+const CONTRIBUTION_METHODS = new Set(["tap-map", "im-here"]);
+const REVIEW_STATUSES = new Set(["pending", "approved", "rejected", "used"]);
+const REVIEW_DECISIONS = new Set(["approved", "rejected", "used"]);
+/** Inclusive playing length in yards. Par 6 is accepted and has no band. */
+const PAR_LENGTH_YARDS = {
+  3: [60, 280],
+  4: [230, 520],
+  5: [400, 680],
+};
+const METERS_PER_YARD = 0.9144;
+const POOR_FIX_ACCURACY_M = 15;
+const COURSE_REPORT_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 /** 8-4-4-4-12 hex, any version. Case-insensitive. The 64-char cap is a hard ceiling. */
 const COURSE_REPORT_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const COURSE_REPORT_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
@@ -2733,6 +2792,84 @@ function normalizeShown(shown) {
     out[name] = parseLatLon(shown[name]);
   }
   return out;
+}
+
+function invalidContribution(name) {
+  return invalidField(name ? `contribution.${name}` : "contribution");
+}
+
+/**
+ * Hole map sent by the player. Required only when reasons includes
+ * hole-contribution. Without that reason the object is ignored, including
+ * when it is malformed, so an ordinary problem report still stores.
+ */
+function parseHoleContribution(payload, reasons) {
+  const required = reasons.includes("hole-contribution");
+  if (!required) return { ok: true, present: false };
+  if (!isPlainObject(payload.contribution)) return invalidContribution();
+  const src = payload.contribution;
+  const green = parseLatLon(src.green);
+  if (!green) return invalidContribution("green");
+  if (typeof src.greenMethod !== "string" || !CONTRIBUTION_METHODS.has(src.greenMethod)) {
+    return invalidContribution("greenMethod");
+  }
+  const contribution = { green, greenMethod: src.greenMethod };
+
+  if (Object.prototype.hasOwnProperty.call(src, "tee") && src.tee != null) {
+    const tee = parseLatLon(src.tee);
+    if (!tee) return invalidContribution("tee");
+    contribution.tee = tee;
+  }
+  if (Object.prototype.hasOwnProperty.call(src, "par") && src.par != null) {
+    if (!Number.isInteger(src.par) || src.par < 3 || src.par > 6) return invalidContribution("par");
+    contribution.par = src.par;
+  }
+  if (Object.prototype.hasOwnProperty.call(src, "contributorEmail") && src.contributorEmail != null) {
+    if (typeof src.contributorEmail !== "string") return invalidContribution("contributorEmail");
+    const email = src.contributorEmail.trim().toLowerCase();
+    if (email.length < 1 || email.length > 254 || !COURSE_REPORT_EMAIL_RE.test(email)) {
+      return invalidContribution("contributorEmail");
+    }
+    contribution.contributorEmail = email;
+  }
+  return { ok: true, present: true, contribution };
+}
+
+/**
+ * Review hints only. A poor fix or an implausible length is still stored.
+ * The phone is what refuses those. Missing tee, par, or position omits the
+ * hint that needs it. Coordinates and par are never filled in here.
+ */
+function contributionHints(contribution, position) {
+  const hints = {};
+  const fix = isPlainObject(position) && finiteNumber(position.lat) && finiteNumber(position.lon)
+    ? position
+    : null;
+  if (contribution.greenMethod === "im-here" && fix) {
+    hints.greenToPositionM = Math.round(distanceMeters(
+      contribution.green.lat,
+      contribution.green.lon,
+      fix.lat,
+      fix.lon,
+    ));
+  }
+  if (fix && finiteNumber(fix.accuracyM)) {
+    hints.positionAccuracyM = fix.accuracyM;
+    hints.poorFix = fix.accuracyM > POOR_FIX_ACCURACY_M;
+  }
+  if (contribution.tee && Number.isInteger(contribution.par)) {
+    const meters = distanceMeters(
+      contribution.green.lat,
+      contribution.green.lon,
+      contribution.tee.lat,
+      contribution.tee.lon,
+    );
+    hints.greenToTeeM = Math.round(meters);
+    const band = PAR_LENGTH_YARDS[contribution.par];
+    const yards = meters / METERS_PER_YARD;
+    hints.plausibleForPar = Boolean(band) && yards >= band[0] && yards <= band[1];
+  }
+  return hints;
 }
 
 /** Client fields only. Server fields are added after this accepts the body. */
@@ -2812,6 +2949,14 @@ function parseCourseReport(payload) {
 
   if (Object.prototype.hasOwnProperty.call(payload, "shown")) {
     record.shown = normalizeShown(payload.shown);
+  }
+
+  const contribution = parseHoleContribution(payload, reasons);
+  if (!contribution.ok) return contribution;
+  if (contribution.present) {
+    contribution.contribution.hints = contributionHints(contribution.contribution, record.position);
+    record.contribution = contribution.contribution;
+    record.review = { status: "pending", reviewedAt: null, note: null, usedAt: null };
   }
 
   return { ok: true, record };
@@ -2942,7 +3087,20 @@ function parseStoredReport(raw) {
   }
 }
 
-async function listCourseReports(boards, { sinceIso, courseId, limit, cursor }) {
+function readKnownFilter(raw, allowed) {
+  if (raw == null || raw === "") return { ok: true, value: null };
+  if (!allowed.has(raw)) return { ok: false };
+  return { ok: true, value: raw };
+}
+
+function reportMatchesFilters(record, { courseId, reason, status }) {
+  if (courseId && record.courseId !== courseId) return false;
+  if (reason && !(Array.isArray(record.reasons) && record.reasons.includes(reason))) return false;
+  if (status && !(isPlainObject(record.review) && record.review.status === status)) return false;
+  return true;
+}
+
+async function listCourseReports(boards, { sinceIso, courseId, reason, status, limit, cursor }) {
   let pageCursor = cursor || undefined;
   for (let hop = 0; hop < 20; hop++) {
     const page = await boards.list({
@@ -2965,7 +3123,7 @@ async function listCourseReports(boards, { sinceIso, courseId, limit, cursor }) 
       if (sinceIso && name < `cr:r:${sinceIso}`) continue;
       const record = parseStoredReport(await boards.get(name));
       if (!record) continue;
-      if (courseId && record.courseId !== courseId) continue;
+      if (!reportMatchesFilters(record, { courseId, reason, status })) continue;
       reports.push(record);
     }
     // KV is asked for `limit` keys, so this cap only matters if a page is larger.
@@ -2975,21 +3133,26 @@ async function listCourseReports(boards, { sinceIso, courseId, limit, cursor }) 
   return { reports: [], cursor: pageCursor || null };
 }
 
-async function handleCourseReportPost(request, env, cors) {
+async function readCourseReportPayload(request, cors) {
   const declared = Number(request.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > COURSE_REPORT_BODY_MAX) {
-    return golfJson(413, { error: "too_large" }, cors);
+    return { ok: false, response: golfJson(413, { error: "too_large" }, cors) };
   }
   const raw = await request.text();
   if (utf8ByteLength(raw) > COURSE_REPORT_BODY_MAX) {
-    return golfJson(413, { error: "too_large" }, cors);
+    return { ok: false, response: golfJson(413, { error: "too_large" }, cors) };
   }
-  let payload;
   try {
-    payload = JSON.parse(raw);
+    return { ok: true, payload: JSON.parse(raw) };
   } catch {
-    return golfJson(400, { error: "invalid_json" }, cors);
+    return { ok: false, response: golfJson(400, { error: "invalid_json" }, cors) };
   }
+}
+
+async function handleCourseReportPost(request, env, cors) {
+  const body = await readCourseReportPayload(request, cors);
+  if (!body.ok) return body.response;
+  const payload = body.payload;
   const parsed = parseCourseReport(payload);
   if (!parsed.ok) return golfJson(422, { error: "invalid", field: parsed.field }, cors);
   const install = readCourseReportInstallId(request);
@@ -3024,14 +3187,18 @@ async function handleCourseReportPost(request, env, cors) {
   return golfJson(201, { ok: true, id: clientReportId }, cors);
 }
 
-async function handleCourseReportGetOne(boards, clientReportId, cors) {
+async function loadCourseReport(boards, clientReportId) {
   const marker = await boards.get(courseReportMarkerKey(clientReportId));
-  if (typeof marker !== "string" || !marker.startsWith("cr:r:")) {
-    return golfJson(404, { error: "not_found" }, cors);
-  }
+  if (typeof marker !== "string" || !marker.startsWith("cr:r:")) return null;
   const record = parseStoredReport(await boards.get(marker));
-  if (!record) return golfJson(404, { error: "not_found" }, cors);
-  return golfJson(200, record, cors);
+  if (!record) return null;
+  return { key: marker, record };
+}
+
+async function handleCourseReportGetOne(boards, clientReportId, cors) {
+  const loaded = await loadCourseReport(boards, clientReportId);
+  if (!loaded) return golfJson(404, { error: "not_found" }, cors);
+  return golfJson(200, loaded.record, cors);
 }
 
 async function handleCourseReportsGet(request, url, env, cors, clientReportId) {
@@ -3044,35 +3211,135 @@ async function handleCourseReportsGet(request, url, env, cors, clientReportId) {
 
   const since = canonicalSince(url.searchParams.get("since"));
   if (!since.ok) return golfJson(422, { error: "invalid", field: "since" }, cors);
+  const reason = readKnownFilter(url.searchParams.get("reason"), COURSE_REPORT_REASONS);
+  if (!reason.ok) return golfJson(422, { error: "invalid", field: "reason" }, cors);
+  const status = readKnownFilter(url.searchParams.get("status"), REVIEW_STATUSES);
+  if (!status.ok) return golfJson(422, { error: "invalid", field: "status" }, cors);
   const courseId = url.searchParams.get("courseId");
   const listed = await listCourseReports(boards, {
     sinceIso: since.iso,
     courseId: courseId ? courseId : null,
+    reason: reason.value,
+    status: status.value,
     limit: readReportLimit(url.searchParams.get("limit")),
     cursor: url.searchParams.get("cursor"),
   });
   return golfJson(200, { reports: listed.reports, cursor: listed.cursor }, cors);
 }
 
-function courseReportIdFromPath(pathname) {
-  const path = pathname.length > 1 && pathname.endsWith("/") ? pathname.slice(0, -1) : pathname;
-  if (path === "/v1/course-reports") return { ok: true, id: null };
-  const rest = path.slice("/v1/course-reports/".length);
-  if (!rest || rest.includes("/")) return { ok: false };
-  let id = rest;
+function decodeCourseReportId(raw) {
+  let id = raw;
   try {
-    id = decodeURIComponent(rest);
+    id = decodeURIComponent(raw);
   } catch {
-    return { ok: false };
+    return null;
   }
-  if (!validClientReportId(id)) return { ok: false };
-  return { ok: true, id };
+  return validClientReportId(id) ? id : null;
+}
+
+function courseReportRoute(pathname) {
+  const path = pathname.length > 1 && pathname.endsWith("/") ? pathname.slice(0, -1) : pathname;
+  if (path === "/v1/course-reports") return { ok: true, id: null, action: null };
+  const rest = path.slice("/v1/course-reports/".length);
+  if (!rest) return { ok: false };
+  const parts = rest.split("/");
+  if (parts.length === 1) {
+    const id = decodeCourseReportId(parts[0]);
+    if (!id) return { ok: false };
+    return { ok: true, id, action: null };
+  }
+  if (parts.length === 2 && parts[1] === "review") {
+    const id = decodeCourseReportId(parts[0]);
+    if (!id) return { ok: false };
+    return { ok: true, id, action: "review" };
+  }
+  return { ok: false };
+}
+
+function parseCourseReportReview(payload) {
+  if (!isPlainObject(payload)) return invalidField("body");
+  if (typeof payload.status !== "string" || !REVIEW_DECISIONS.has(payload.status)) {
+    return invalidField("status");
+  }
+  const decision = { ok: true, status: payload.status, noteSet: false, note: null };
+  if (!Object.prototype.hasOwnProperty.call(payload, "note")) return decision;
+  if (payload.note == null) {
+    decision.noteSet = true;
+    return decision;
+  }
+  if (typeof payload.note !== "string") return invalidField("note");
+  const note = payload.note.trim();
+  if (note.length > 500) return invalidField("note");
+  decision.noteSet = true;
+  decision.note = note.length ? note : null;
+  return decision;
+}
+
+function reviewTransitionAllowed(current, next) {
+  if (current === "pending") return next === "approved" || next === "rejected";
+  if (current === "approved") return next === "used";
+  return false;
+}
+
+/**
+ * Records the review decision on the existing cr:r: row. rewardEligible is
+ * the only fulfillment field, and only after used when an email was stored.
+ * This does not call a billing or subscription API.
+ */
+function applyCourseReportReview(record, decision, nowIso) {
+  const previous = isPlainObject(record.review) ? record.review : {};
+  const review = {
+    status: decision.status,
+    reviewedAt: previous.reviewedAt ?? null,
+    note: previous.note ?? null,
+    usedAt: previous.usedAt ?? null,
+  };
+  if (decision.status === "approved" || decision.status === "rejected") {
+    review.reviewedAt = nowIso;
+  }
+  if (decision.status === "used") review.usedAt = nowIso;
+  if (decision.noteSet) review.note = decision.note;
+  record.review = review;
+  if (decision.status === "used") {
+    const email = record.contribution && record.contribution.contributorEmail;
+    if (typeof email === "string" && email.length > 0) record.rewardEligible = true;
+  }
+  return record;
+}
+
+async function handleCourseReportReview(request, env, cors, clientReportId) {
+  const denied = await authorizeCourseReports(request, env, cors);
+  if (denied) return denied;
+  const boards = boardsBinding(env);
+  if (!boards) return golfJson(503, { error: "boards_not_configured" }, cors);
+  const body = await readCourseReportPayload(request, cors);
+  if (!body.ok) return body.response;
+  const decision = parseCourseReportReview(body.payload);
+  if (!decision.ok) return golfJson(422, { error: "invalid", field: decision.field }, cors);
+
+  const loaded = await loadCourseReport(boards, clientReportId);
+  if (!loaded) return golfJson(404, { error: "not_found" }, cors);
+  const current = isPlainObject(loaded.record.review) ? loaded.record.review.status : null;
+  if (!reviewTransitionAllowed(current, decision.status)) {
+    return golfJson(409, { error: "invalid_transition" }, cors);
+  }
+
+  const nowIso = new Date().toISOString();
+  const record = applyCourseReportReview(loaded.record, decision, nowIso);
+  await boards.put(loaded.key, JSON.stringify(record), { expirationTtl: COURSE_REPORT_TTL });
+  return golfJson(200, record, cors);
 }
 
 async function handleCourseReports(request, url, env, cors) {
-  const parsed = courseReportIdFromPath(url.pathname);
+  const parsed = courseReportRoute(url.pathname);
   if (!parsed.ok) return golfJson(404, { error: "unknown_route" }, cors);
-  if (request.method === "GET") return handleCourseReportsGet(request, url, env, cors, parsed.id);
+  if (request.method === "GET") {
+    if (parsed.action) return golfJson(405, { error: "method_not_allowed" }, cors);
+    return handleCourseReportsGet(request, url, env, cors, parsed.id);
+  }
+  if (request.method === "POST" && parsed.action === "review") {
+    return handleCourseReportReview(request, env, cors, parsed.id);
+  }
   if (request.method === "POST" && parsed.id == null) return handleCourseReportPost(request, env, cors);
   return golfJson(405, { error: "method_not_allowed" }, cors);
 }

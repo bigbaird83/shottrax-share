@@ -3561,4 +3561,430 @@ describe("shottrax-share worker", () => {
     expect(defaults[0].limit).toBe(100);
     expect(defaults[0].cursor).toBeUndefined();
   });
+
+  const CONTRIB_TAP = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  const CONTRIB_HERE = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+  const CONTRIB_LONG = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+  const CONTRIB_BARE = "11111111-1111-4111-8111-111111111111";
+  const CONTRIB_REJECT = "22222222-2222-4222-8222-222222222222";
+  const GREEN = { lat: 33.2, lon: -93.1 };
+  const EARTH_M = 6371000;
+  const METERS_PER_YARD = 0.9144;
+
+  function distanceMeters(lat1, lon1, lat2, lon2) {
+    const rad = Math.PI / 180;
+    const dLat = (lat2 - lat1) * rad;
+    const dLon = (lon2 - lon1) * rad;
+    const a = Math.sin(dLat / 2) ** 2
+      + Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLon / 2) ** 2;
+    return EARTH_M * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(Math.max(0, 1 - a)));
+  }
+
+  function pointNorth(point, yards) {
+    const meters = yards * METERS_PER_YARD;
+    const dLat = (meters / EARTH_M) * (180 / Math.PI);
+    return { lat: point.lat + dLat, lon: point.lon };
+  }
+
+  function storedReport(id) {
+    const key = reportRecords().find((name) => name.endsWith(id));
+    expect(key, id).toBeTruthy();
+    return JSON.parse(kv.get(key).value);
+  }
+
+  function holeContribution(overrides = {}) {
+    return {
+      green: { ...GREEN },
+      greenMethod: "tap-map",
+      ...overrides,
+    };
+  }
+
+  function postReview(id, body, headers) {
+    return invoke(`${ORIGIN}/v1/course-reports/${id}/review`, {
+      method: "POST",
+      body: body == null ? undefined : JSON.stringify(body),
+      headers: { "Content-Type": "application/json", ...headers },
+    });
+  }
+
+  it("stores a tap-map contribution and an im-here contribution with review hints", async () => {
+    const tee = pointNorth(GREEN, 350);
+    const tap = await postReport(reportBody({
+      clientReportId: CONTRIB_TAP,
+      reasons: ["hole-contribution", "nope"],
+      position: { lat: 33.19, lon: -93.2, accuracyM: 15 },
+      shown: { par: 0, green: "nope" },
+      contribution: holeContribution({
+        tee,
+        par: 4,
+        contributorEmail: "  Player@Example.COM ",
+        extra: true,
+      }),
+    }));
+    expect(tap.status).toBe(201);
+    expect(await tap.json()).toEqual({ ok: true, id: CONTRIB_TAP });
+    const tapStored = storedReport(CONTRIB_TAP);
+    const teeMeters = Math.round(distanceMeters(GREEN.lat, GREEN.lon, tee.lat, tee.lon));
+    expect(tapStored.reasons).toEqual(["hole-contribution"]);
+    expect(tapStored.shown).toEqual({ par: null, green: null });
+    expect(tapStored.contribution).toEqual({
+      green: GREEN,
+      greenMethod: "tap-map",
+      tee,
+      par: 4,
+      contributorEmail: "player@example.com",
+      hints: {
+        positionAccuracyM: 15,
+        poorFix: false,
+        greenToTeeM: teeMeters,
+        plausibleForPar: true,
+      },
+    });
+    expect(tapStored.contribution.hints.greenToPositionM).toBeUndefined();
+    expect(tapStored.review).toEqual({ status: "pending", reviewedAt: null, note: null, usedAt: null });
+    expect(tapStored.rewardEligible).toBeUndefined();
+    expect(teeMeters).toBeGreaterThan(230 * METERS_PER_YARD);
+    expect(teeMeters).toBeLessThan(520 * METERS_PER_YARD);
+
+    const herePoint = { lat: GREEN.lat + 0.0002, lon: GREEN.lon };
+    const here = await postReport(reportBody({
+      clientReportId: CONTRIB_HERE,
+      reasons: ["hole-contribution"],
+      position: { ...herePoint, accuracyM: 48 },
+      contribution: holeContribution({
+        greenMethod: "im-here",
+        tee: null,
+        par: null,
+        contributorEmail: null,
+      }),
+    }));
+    expect(here.status).toBe(201);
+    const hereStored = storedReport(CONTRIB_HERE);
+    expect(hereStored.contribution).toEqual({
+      green: GREEN,
+      greenMethod: "im-here",
+      hints: {
+        greenToPositionM: Math.round(distanceMeters(GREEN.lat, GREEN.lon, herePoint.lat, herePoint.lon)),
+        positionAccuracyM: 48,
+        poorFix: true,
+      },
+    });
+    expect(hereStored.position).toEqual({ ...herePoint, accuracyM: 48 });
+    expect(hereStored.review.status).toBe("pending");
+
+    const longPar3 = await postReport(reportBody({
+      clientReportId: CONTRIB_LONG,
+      reasons: ["hole-contribution"],
+      contribution: holeContribution({ tee, par: 3 }),
+    }));
+    expect(longPar3.status).toBe(201);
+    const longStored = storedReport(CONTRIB_LONG);
+    expect(longStored.contribution.hints).toEqual({
+      greenToTeeM: teeMeters,
+      plausibleForPar: false,
+    });
+
+    const ignored = await postReport(reportBody({
+      clientReportId: "abababab-abab-4aba-8aba-abababababab",
+      contribution: { contributorEmail: "not-an-email", green: { lat: 1, lon: 2 } },
+    }));
+    expect(ignored.status).toBe(201);
+    const plain = storedReport("abababab-abab-4aba-8aba-abababababab");
+    expect(plain.contribution).toBeUndefined();
+    expect(plain.review).toBeUndefined();
+    expect([...kv.keys()].some((key) => key.startsWith("id:") || key.startsWith("name:") || key.startsWith("gca:"))).toBe(false);
+  });
+
+  it("returns 422 when a hole contribution is missing a green or has a bad email", async () => {
+    const cases = [
+      ["missing contribution", reportBody({ reasons: ["hole-contribution"] }), "contribution"],
+      ["contribution null", reportBody({ reasons: ["hole-contribution"], contribution: null }), "contribution"],
+      ["contribution array", reportBody({ reasons: ["hole-contribution"], contribution: [] }), "contribution"],
+      ["missing green", reportBody({
+        reasons: ["hole-contribution"],
+        contribution: { greenMethod: "tap-map" },
+      }), "contribution.green"],
+      ["green null", reportBody({
+        reasons: ["hole-contribution"],
+        contribution: holeContribution({ green: null }),
+      }), "contribution.green"],
+      ["green out of range", reportBody({
+        reasons: ["hole-contribution"],
+        contribution: holeContribution({ green: { lat: 90.1, lon: 0 } }),
+      }), "contribution.green"],
+      ["greenMethod missing", reportBody({
+        reasons: ["hole-contribution"],
+        contribution: { green: { ...GREEN } },
+      }), "contribution.greenMethod"],
+      ["greenMethod bad", reportBody({
+        reasons: ["hole-contribution"],
+        contribution: holeContribution({ greenMethod: "gps" }),
+      }), "contribution.greenMethod"],
+      ["tee bad", reportBody({
+        reasons: ["hole-contribution"],
+        contribution: holeContribution({ tee: { lat: 0, lon: 181 } }),
+      }), "contribution.tee"],
+      ["par low", reportBody({
+        reasons: ["hole-contribution"],
+        contribution: holeContribution({ par: 2 }),
+      }), "contribution.par"],
+      ["par high", reportBody({
+        reasons: ["hole-contribution"],
+        contribution: holeContribution({ par: 7 }),
+      }), "contribution.par"],
+      ["par fraction", reportBody({
+        reasons: ["hole-contribution"],
+        contribution: holeContribution({ par: 3.5 }),
+      }), "contribution.par"],
+      ["bad email", reportBody({
+        reasons: ["hole-contribution"],
+        contribution: holeContribution({ contributorEmail: "not-an-email" }),
+      }), "contribution.contributorEmail"],
+      ["email shape", reportBody({
+        reasons: ["hole-contribution"],
+        contribution: holeContribution({ contributorEmail: "a@b" }),
+      }), "contribution.contributorEmail"],
+      ["email long", reportBody({
+        reasons: ["hole-contribution"],
+        contribution: holeContribution({ contributorEmail: `${"a".repeat(243)}@example.com` }),
+      }), "contribution.contributorEmail"],
+      ["email type", reportBody({
+        reasons: ["hole-contribution"],
+        contribution: holeContribution({ contributorEmail: 1 }),
+      }), "contribution.contributorEmail"],
+    ];
+    for (const [label, body, field] of cases) {
+      const response = await postReport(body);
+      expect(response.status, label).toBe(422);
+      expect(await response.json(), label).toEqual({ error: "invalid", field });
+    }
+    expect(kv.size).toBe(0);
+  });
+
+  it("does not echo contributorEmail or position on the public course report response", async () => {
+    const email = "player@example.com";
+    const created = await postReport(reportBody({
+      clientReportId: CONTRIB_TAP,
+      reasons: ["hole-contribution"],
+      position: { lat: 33.2, lon: -93.11, accuracyM: 6 },
+      contribution: holeContribution({
+        greenMethod: "im-here",
+        contributorEmail: email,
+      }),
+    }));
+    expect(created.status).toBe(201);
+    const posted = await created.json();
+    expect(posted).toEqual({ ok: true, id: CONTRIB_TAP });
+    expect(JSON.stringify(posted)).not.toContain(email);
+    expect(posted.position).toBeUndefined();
+
+    env.COURSE_REPORTS_ADMIN_TOKEN = "admin-secret";
+    const one = await invoke(`${ORIGIN}/v1/course-reports/${CONTRIB_TAP}`, {
+      headers: { Authorization: "Bearer admin-secret" },
+    });
+    expect(one.status).toBe(200);
+    const record = await one.json();
+    expect(record.contribution.contributorEmail).toBe(email);
+    expect(record.position).toEqual({ lat: 33.2, lon: -93.11, accuracyM: 6 });
+
+    const listed = await invoke(`${ORIGIN}/v1/course-reports?reason=hole-contribution`, {
+      headers: { Authorization: "Bearer admin-secret" },
+    });
+    const page = await listed.json();
+    expect(page.reports).toHaveLength(1);
+    expect(page.reports[0].contribution.contributorEmail).toBe(email);
+    expect(page.reports[0].position.accuracyM).toBe(6);
+  });
+
+  it("returns 200 for a duplicate hole contribution and does not write again", async () => {
+    const first = await postReport(reportBody({
+      clientReportId: CONTRIB_TAP,
+      reasons: ["hole-contribution"],
+      contribution: holeContribution({ contributorEmail: "player@example.com" }),
+    }));
+    expect(first.status).toBe(201);
+    const before = storedReport(CONTRIB_TAP);
+    const again = await postReport(reportBody({
+      clientReportId: CONTRIB_TAP,
+      reasons: ["hole-contribution"],
+      note: "this replay must not replace the stored contribution",
+      contribution: holeContribution({ contributorEmail: "other@example.com", par: 5 }),
+    }));
+    expect(again.status).toBe(200);
+    const replay = await again.json();
+    expect(replay).toEqual({ ok: true, id: CONTRIB_TAP, duplicate: true });
+    expect(JSON.stringify(replay)).not.toContain("example.com");
+    expect(reportRecords()).toHaveLength(1);
+    expect(storedReport(CONTRIB_TAP)).toEqual(before);
+    expect(before.contribution.contributorEmail).toBe("player@example.com");
+  });
+
+  it("reviews a hole contribution through the allowed transitions", async () => {
+    const created = await postReport(reportBody({
+      clientReportId: CONTRIB_TAP,
+      reasons: ["hole-contribution"],
+      contribution: holeContribution({ contributorEmail: "player@example.com", par: 4 }),
+    }));
+    expect(created.status).toBe(201);
+    env.COURSE_REPORTS_ADMIN_TOKEN = "admin-secret";
+    const auth = { Authorization: "Bearer admin-secret" };
+
+    const skipToUsed = await postReview(CONTRIB_TAP, { status: "used" }, auth);
+    expect(skipToUsed.status).toBe(409);
+    expect(await skipToUsed.json()).toEqual({ error: "invalid_transition" });
+    expect(storedReport(CONTRIB_TAP).review.status).toBe("pending");
+
+    const approved = await postReview(CONTRIB_TAP, { status: "approved", note: "  on the green  " }, auth);
+    expect(approved.status).toBe(200);
+    const approvedBody = await approved.json();
+    expect(approvedBody.review.status).toBe("approved");
+    expect(approvedBody.review.note).toBe("on the green");
+    expect(approvedBody.review.reviewedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    expect(approvedBody.review.usedAt).toBeNull();
+    expect(approvedBody.rewardEligible).toBeUndefined();
+    expect(approvedBody.contribution.contributorEmail).toBe("player@example.com");
+
+    const sideways = await postReview(CONTRIB_TAP, { status: "rejected" }, auth);
+    expect(sideways.status).toBe(409);
+    expect(await sideways.json()).toEqual({ error: "invalid_transition" });
+
+    const used = await postReview(CONTRIB_TAP, { status: "used" }, auth);
+    expect(used.status).toBe(200);
+    const usedBody = await used.json();
+    expect(usedBody.review).toEqual({
+      status: "used",
+      reviewedAt: approvedBody.review.reviewedAt,
+      note: "on the green",
+      usedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
+    });
+    expect(usedBody.rewardEligible).toBe(true);
+    expect(storedReport(CONTRIB_TAP).rewardEligible).toBe(true);
+    expect([...kv.keys()].some((key) => key.startsWith("id:") || key.startsWith("name:"))).toBe(false);
+
+    const afterUsed = await postReview(CONTRIB_TAP, { status: "approved" }, auth);
+    expect(afterUsed.status).toBe(409);
+
+    const bare = await postReport(reportBody({
+      clientReportId: CONTRIB_BARE,
+      reasons: ["hole-contribution"],
+      contribution: holeContribution(),
+    }));
+    expect(bare.status).toBe(201);
+    expect((await postReview(CONTRIB_BARE, { status: "approved" }, auth)).status).toBe(200);
+    const bareUsed = await postReview(CONTRIB_BARE, { status: "used" }, auth);
+    expect(bareUsed.status).toBe(200);
+    const bareBody = await bareUsed.json();
+    expect(bareBody.review.status).toBe("used");
+    expect(bareBody.review.usedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(bareBody.rewardEligible).toBeUndefined();
+
+    const rejectCreated = await postReport(reportBody({
+      clientReportId: CONTRIB_REJECT,
+      reasons: ["hole-contribution"],
+      contribution: holeContribution({ contributorEmail: "player@example.com" }),
+    }));
+    expect(rejectCreated.status).toBe(201);
+    const rejected = await postReview(CONTRIB_REJECT, { status: "rejected", note: "wrong green" }, auth);
+    expect(rejected.status).toBe(200);
+    expect((await rejected.json()).review.status).toBe("rejected");
+    const reopen = await postReview(CONTRIB_REJECT, { status: "approved" }, auth);
+    expect(reopen.status).toBe(409);
+    expect(storedReport(CONTRIB_REJECT).rewardEligible).toBeUndefined();
+
+    const plainId = "33333333-3333-4333-8333-333333333333";
+    expect((await postReport(reportBody({ clientReportId: plainId }))).status).toBe(201);
+    const plainReview = await postReview(plainId, { status: "approved" }, auth);
+    expect(plainReview.status).toBe(409);
+    const missing = await postReview(CONTRIB_HERE, { status: "approved" }, auth);
+    expect(missing.status).toBe(404);
+    expect(await missing.json()).toEqual({ error: "not_found" });
+  });
+
+  it("returns 401 for a review without the admin token", async () => {
+    expect((await postReport(reportBody({
+      clientReportId: CONTRIB_TAP,
+      reasons: ["hole-contribution"],
+      contribution: holeContribution(),
+    }))).status).toBe(201);
+
+    const closed = await postReview(CONTRIB_TAP, { status: "approved" });
+    expect(closed.status).toBe(503);
+    expect(await closed.json()).toEqual({ error: "not_configured" });
+
+    env.COURSE_REPORTS_ADMIN_TOKEN = "admin-secret";
+    const missing = await postReview(CONTRIB_TAP, { status: "approved" });
+    expect(missing.status).toBe(401);
+    expect(await missing.json()).toEqual({ error: "unauthorized" });
+    const wrong = await postReview(CONTRIB_TAP, { status: "approved" }, {
+      Authorization: "Bearer wrong-token",
+    });
+    expect(wrong.status).toBe(401);
+    const emptyBody = await invoke(`${ORIGIN}/v1/course-reports/${CONTRIB_TAP}/review`, { method: "POST" });
+    expect(emptyBody.status).toBe(401);
+    expect(storedReport(CONTRIB_TAP).review.status).toBe("pending");
+  });
+
+  it("filters the admin course report list by reason and status", async () => {
+    env.COURSE_REPORTS_ADMIN_TOKEN = "admin-secret";
+    const auth = { Authorization: "Bearer admin-secret" };
+    const plainId = "44444444-4444-4444-8444-444444444444";
+    const pendingId = CONTRIB_TAP;
+    const approvedId = CONTRIB_HERE;
+    expect((await postReport(reportBody({
+      clientReportId: plainId,
+      courseId: "id:14322",
+      reasons: ["green_wrong"],
+    }))).status).toBe(201);
+    expect((await postReport(reportBody({
+      clientReportId: pendingId,
+      courseId: "id:14322",
+      reasons: ["hole-contribution"],
+      contribution: holeContribution(),
+    }))).status).toBe(201);
+    expect((await postReport(reportBody({
+      clientReportId: approvedId,
+      courseId: "name:other",
+      reasons: ["hole-contribution"],
+      contribution: holeContribution({ contributorEmail: "player@example.com" }),
+    }))).status).toBe(201);
+    expect((await postReview(approvedId, { status: "approved" }, auth)).status).toBe(200);
+
+    function adminGet(path) {
+      return invoke(`${ORIGIN}${path}`, { headers: auth });
+    }
+    function idsOf(page) {
+      return page.reports.map((row) => row.clientReportId);
+    }
+
+    const contributions = await adminGet("/v1/course-reports?reason=hole-contribution");
+    expect(contributions.status).toBe(200);
+    const contributionPage = await contributions.json();
+    expect(contributionPage.cursor).toBeNull();
+    expect(idsOf(contributionPage).sort()).toEqual([approvedId, pendingId].sort());
+
+    const pending = await adminGet("/v1/course-reports?status=pending");
+    expect(idsOf(await pending.json())).toEqual([pendingId]);
+
+    const approved = await adminGet("/v1/course-reports?reason=hole-contribution&status=approved");
+    const approvedPage = await approved.json();
+    expect(idsOf(approvedPage)).toEqual([approvedId]);
+    expect(approvedPage.reports[0].review.status).toBe("approved");
+    expect(approvedPage.reports[0].contribution.contributorEmail).toBe("player@example.com");
+
+    const scoped = await adminGet(
+      "/v1/course-reports?since=2020-01-01T00:00:00.000Z&courseId=id:14322&reason=hole-contribution&status=pending",
+    );
+    expect(idsOf(await scoped.json())).toEqual([pendingId]);
+
+    const problems = await adminGet("/v1/course-reports?reason=green_wrong");
+    expect(idsOf(await problems.json())).toEqual([plainId]);
+
+    const badStatus = await adminGet("/v1/course-reports?status=nope");
+    expect(badStatus.status).toBe(422);
+    expect(await badStatus.json()).toEqual({ error: "invalid", field: "status" });
+    const badReason = await adminGet("/v1/course-reports?reason=not-a-reason");
+    expect(badReason.status).toBe(422);
+    expect(await badReason.json()).toEqual({ error: "invalid", field: "reason" });
+  });
 });
