@@ -117,6 +117,8 @@ The photo is stored in KV at `cr:photo:<photoId>` (bytes) with `expirationTtl` o
 
 A report may carry `"photoId": "<uuid>"`. The photo must exist and must have been uploaded by the same `X-Install-Id`, otherwise the report is `422` with `field` `photoId`. The stored report keeps only the id. Admin `GET /v1/course-reports/scorecard-photo/<photoId>` (bearer token) returns the JPEG with `Cache-Control: no-store`. It is the only way to read it.
 
+A `hole-contribution` report that carries a valid `photoId` may leave out both `contribution.green` and `contribution.greenMethod` (a scorecard photo sent from home, with no pins). It is stored with `contribution` holding only what was sent (tees, par, email) plus empty or partial `hints`, and goes to review as `pending` like the others. Hints that need a green (green to tee length, tee plausibility, green versus position) are left out. Without a `photoId`, or with only one of the two green fields, the report is `422` as before. The photo must still exist and be from the same install id.
+
 Moving a review to `rejected` or `rewarded` deletes the photo in the same request and sets `photoDeleted: true` on the report, which keeps `photoId`. A photo on a report that is only `approved` or `used` stays until it expires at 180 days. Nothing is public and nothing here grants the free month.
 
 CORS for this route allows `GET,POST,OPTIONS` and the `Authorization` header. Other routes are unchanged.

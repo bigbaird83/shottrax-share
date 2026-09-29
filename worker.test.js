@@ -4146,6 +4146,56 @@ describe("shottrax-share worker", () => {
       expect((await bad.json()).field).toBe("photoId");
     });
 
+    it("takes a photo-only hole report with no green, and keeps green required otherwise", async () => {
+      const { photoId } = await (await postPhoto(makeJpeg())).json();
+      const headers = { "X-Install-Id": PHOTO_INSTALL };
+      const only = await postReport(
+        reportBody({
+          clientReportId: PHOTO_REPORT,
+          reasons: ["hole-contribution"],
+          contribution: {},
+          partialGap: true,
+          photoId,
+        }),
+        { headers },
+      );
+      expect(only.status).toBe(201);
+      const stored = storedReport(PHOTO_REPORT);
+      expect(stored.photoId).toBe(photoId);
+      expect(stored.contribution).toEqual({ hints: {} });
+      expect(stored.review.status).toBe("pending");
+
+      const noPhoto = await postReport(
+        reportBody({ clientReportId: "88888888-8888-4888-8888-888888888888", reasons: ["hole-contribution"], contribution: {} }),
+        { headers },
+      );
+      expect(noPhoto.status).toBe(422);
+      expect((await noPhoto.json()).field).toBe("contribution.green");
+
+      const half = await postReport(
+        reportBody({
+          clientReportId: "99999999-9999-4999-8999-999999999998",
+          reasons: ["hole-contribution"],
+          contribution: { greenMethod: "tap-map" },
+          photoId,
+        }),
+        { headers },
+      );
+      expect(half.status).toBe(422);
+
+      const withTee = await postReport(
+        reportBody({
+          clientReportId: "99999999-9999-4999-8999-999999999997",
+          reasons: ["hole-contribution"],
+          contribution: { par: 4, tees: [{ color: "white", lat: 33.5, lon: -84.4, method: "tap-map" }] },
+          photoId,
+        }),
+        { headers },
+      );
+      expect(withTee.status).toBe(201);
+      expect(storedReport("99999999-9999-4999-8999-999999999997").contribution.hints.tees).toBeUndefined();
+    });
+
     it("gives the image only to the admin", async () => {
       env.COURSE_REPORTS_ADMIN_TOKEN = "admin-secret";
       const { photoId } = await (await postPhoto(makeJpeg())).json();
