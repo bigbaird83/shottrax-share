@@ -151,6 +151,21 @@ import { handleLivePage, isLiveBoardCode } from "./live-page.js";
  *   green {lat, lon}                    required, via parseLatLon
  *   greenMethod "tap-map" | "im-here"   required
  *   tee {lat, lon}                      optional, via parseLatLon
+ *   tees                                optional array, up to 8. Each entry
+ *                                       is {color, lat, lon, method,
+ *                                       accuracyM?}. color is a string,
+ *                                       trimmed and lowercased, 1..24
+ *                                       characters, unique in the list.
+ *                                       lat/lon via parseLatLon. method is
+ *                                       tap-map or im-here. accuracyM is an
+ *                                       optional finite number >= 0. null or
+ *                                       a missing tees is ignored. An empty
+ *                                       array stores nothing. A non-array,
+ *                                       more than 8, or any bad entry is 422
+ *                                       with field contribution.tees. Stored
+ *                                       as [{color, lat, lon, method,
+ *                                       accuracyM?}]. The single tee still
+ *                                       works.
  *   par                                 optional integer 3..6
  *   contributorEmail                    optional, trimmed, max 254, basic
  *                                       email shape, stored lowercased
@@ -164,7 +179,7 @@ import { handleLivePage, isLiveBoardCode } from "./live-page.js";
  * A bad contribution is 422 {error:"invalid", field} with field "contribution"
  * or "contribution.<name>". position stays the top-level {lat, lon, accuracyM}
  * and is the GPS fix for "I'm here". This route does not copy position onto
- * green and does not invent a tee or a par.
+ * green and does not invent a tee, a tees list, or a par.
  *
  * contribution.hints is stored for review and never causes a 422. The phone
  * refuses a bad fix or an implausible length. The server only records:
@@ -175,6 +190,12 @@ import { handleLivePage, isLiveBoardCode } from "./live-page.js";
  *   plausibleForPar     same condition. Inclusive yards: par 3 is 60–280,
  *                       par 4 is 230–520, par 5 is 400–680. Par 6 has no
  *                       band, so the flag is false.
+ *   tees                when tees were sent, one entry per tee:
+ *                       {color, greenToTeeM}. greenToTeeM is rounded meters
+ *                       from the green to that tee. accuracyM and poorFix
+ *                       (true when accuracy is over 15) only when that tee
+ *                       sent accuracyM. plausibleForPar only when par was
+ *                       sent, using the same yard bands.
  *
  * A contribution record stores review
  * {status, reviewedAt, note, usedAt, rewardedAt}. status starts as "pending".
@@ -2730,6 +2751,8 @@ const COURSE_REPORT_REASONS = new Set([
   "hole-contribution",
 ]);
 const CONTRIBUTION_METHODS = new Set(["tap-map", "im-here"]);
+const CONTRIBUTION_TEES_MAX = 8;
+const CONTRIBUTION_TEE_COLOR_MAX = 24;
 const REVIEW_STATUSES = new Set(["pending", "approved", "rejected", "used", "rewarded"]);
 const REVIEW_DECISIONS = new Set(["approved", "rejected", "used", "rewarded"]);
 /** Inclusive playing length in yards. Par 6 is accepted and has no band. */
@@ -2813,6 +2836,46 @@ function invalidContribution(name) {
 }
 
 /**
+ * One named tee. color is trimmed and lowercased. accuracyM is kept only
+ * when the player sent a finite number >= 0. A null accuracyM is "not sent".
+ */
+function parseContributionTee(entry, colors) {
+  if (!isPlainObject(entry) || typeof entry.color !== "string") return null;
+  const color = entry.color.trim().toLowerCase();
+  if (color.length < 1 || color.length > CONTRIBUTION_TEE_COLOR_MAX || colors.has(color)) return null;
+  const point = parseLatLon(entry);
+  if (!point) return null;
+  if (typeof entry.method !== "string" || !CONTRIBUTION_METHODS.has(entry.method)) return null;
+  const tee = { color, lat: point.lat, lon: point.lon, method: entry.method };
+  if (Object.prototype.hasOwnProperty.call(entry, "accuracyM") && entry.accuracyM != null) {
+    if (!finiteNumber(entry.accuracyM) || entry.accuracyM < 0) return null;
+    tee.accuracyM = entry.accuracyM;
+  }
+  colors.add(color);
+  return tee;
+}
+
+/** null when the list cannot be stored. [] means the player sent an empty list. */
+function parseContributionTees(value) {
+  if (!Array.isArray(value) || value.length > CONTRIBUTION_TEES_MAX) return null;
+  const colors = new Set();
+  const tees = [];
+  for (const entry of value) {
+    const tee = parseContributionTee(entry, colors);
+    if (!tee) return null;
+    tees.push(tee);
+  }
+  return tees;
+}
+
+function yardsPlausibleForPar(meters, par) {
+  const band = PAR_LENGTH_YARDS[par];
+  if (!band) return false;
+  const yards = meters / METERS_PER_YARD;
+  return yards >= band[0] && yards <= band[1];
+}
+
+/**
  * Hole map sent by the player. Required only when reasons includes
  * hole-contribution. Without that reason the object is ignored, including
  * when it is malformed, so an ordinary problem report still stores.
@@ -2834,6 +2897,11 @@ function parseHoleContribution(payload, reasons) {
     if (!tee) return invalidContribution("tee");
     contribution.tee = tee;
   }
+  if (Object.prototype.hasOwnProperty.call(src, "tees") && src.tees != null) {
+    const tees = parseContributionTees(src.tees);
+    if (!tees) return invalidContribution("tees");
+    if (tees.length > 0) contribution.tees = tees;
+  }
   if (Object.prototype.hasOwnProperty.call(src, "par") && src.par != null) {
     if (!Number.isInteger(src.par) || src.par < 3 || src.par > 6) return invalidContribution("par");
     contribution.par = src.par;
@@ -2854,7 +2922,8 @@ function parseHoleContribution(payload, reasons) {
 /**
  * Review hints only. A poor fix or an implausible length is still stored.
  * The phone is what refuses those. Missing tee, par, or position omits the
- * hint that needs it. Coordinates and par are never filled in here.
+ * hint that needs it. A sent tees list adds hints.tees, one entry per tee.
+ * Coordinates and par are never filled in here.
  */
 function contributionHints(contribution, position) {
   const hints = {};
@@ -2881,9 +2950,26 @@ function contributionHints(contribution, position) {
       contribution.tee.lon,
     );
     hints.greenToTeeM = Math.round(meters);
-    const band = PAR_LENGTH_YARDS[contribution.par];
-    const yards = meters / METERS_PER_YARD;
-    hints.plausibleForPar = Boolean(band) && yards >= band[0] && yards <= band[1];
+    hints.plausibleForPar = yardsPlausibleForPar(meters, contribution.par);
+  }
+  if (Array.isArray(contribution.tees) && contribution.tees.length > 0) {
+    hints.tees = contribution.tees.map((tee) => {
+      const meters = distanceMeters(
+        contribution.green.lat,
+        contribution.green.lon,
+        tee.lat,
+        tee.lon,
+      );
+      const hint = { color: tee.color, greenToTeeM: Math.round(meters) };
+      if (finiteNumber(tee.accuracyM)) {
+        hint.accuracyM = tee.accuracyM;
+        hint.poorFix = tee.accuracyM > POOR_FIX_ACCURACY_M;
+      }
+      if (Number.isInteger(contribution.par)) {
+        hint.plausibleForPar = yardsPlausibleForPar(meters, contribution.par);
+      }
+      return hint;
+    });
   }
   return hints;
 }

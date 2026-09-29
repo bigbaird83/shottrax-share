@@ -70,10 +70,11 @@ POST /v1/course-reports/{clientReportId}/review   admin, review a contribution
 | `green` | Required `{ lat, lon }`. Same lat/lon rules as `position`. |
 | `greenMethod` | Required. `tap-map` or `im-here`. |
 | `tee` | Optional `{ lat, lon }`. Omit it, or send `null`, when the player did not mark a tee. A present value that is not a lat/lon is `422` with `field` `contribution.tee`. |
+| `tees` | Optional array, at most 8. Each entry is `{ color, lat, lon, method, accuracyM? }`. `color` is a string, trimmed and stored lowercased, 1–24 characters, and unique in the list. `lat` and `lon` use the same rules as `tee`. `method` is `tap-map` or `im-here`. `accuracyM`, when sent, is a finite number ≥ 0. Omit `tees`, or send `null`, and it is ignored. An empty array stores nothing. A non-array, more than 8 entries, or any bad entry is `422` with `field` `contribution.tees`. Stored as `[{ color, lat, lon, method, accuracyM? }]`. The single `tee` field is unchanged. |
 | `par` | Optional integer, 3–6. Omit it, or send `null`, when the player did not enter par. |
 | `contributorEmail` | Optional. Trimmed, max 254 characters, basic `local@domain.tld` shape, stored lowercased. The report JSON does not hold the address. |
 
-A missing or non-object `contribution` is `422` `{ "error": "invalid", "field": "contribution" }`. A bad `green`, `greenMethod`, `tee`, `par`, or `contributorEmail` uses `field` `contribution.<name>`. The server does not copy `position` onto `green` and does not fill in a tee or a par the player did not send.
+A missing or non-object `contribution` is `422` `{ "error": "invalid", "field": "contribution" }`. A bad `green`, `greenMethod`, `tee`, `tees`, `par`, or `contributorEmail` uses `field` `contribution.<name>`. The server does not copy `position` onto `green` and does not fill in a tee, a tees list, or a par the player did not send.
 
 When an address is accepted, the report stores `contribution.hadEmail: true` and the address itself goes to `cr:email:<clientReportId>` with `expirationTtl` of 365 days. KV deletes that key on its own if nobody reviews the report. The `cr:` prefix is reserved, so `GET /cr:email:…` cannot read it. If `createdAt` is already 365 days old or older, the address is not stored. Admin `GET`s copy a live key onto `contribution.contributorEmail`. After the key is gone, those responses still show `hadEmail` and do not show the address.
 
@@ -86,6 +87,7 @@ The phone refuses a bad GPS fix and an implausible hole length. The server still
 | `poorFix` | Same as `positionAccuracyM`. `true` when accuracy is over 15 meters. |
 | `greenToTeeM` | Both `tee` and `par` were sent. Meters, rounded, from the green to the tee. |
 | `plausibleForPar` | Same as `greenToTeeM`. Inclusive yards: par 3 is 60–280, par 4 is 230–520, par 5 is 400–680. Par 6 has no band, so the flag is `false`. |
+| `tees` | When `tees` were sent, one entry per tee: `{ color, greenToTeeM }`. `greenToTeeM` is meters, rounded, from the green to that tee. `accuracyM` and `poorFix` are included only when that tee sent `accuracyM`. `poorFix` is `true` when that accuracy is over 15 meters. `plausibleForPar` is included only when `par` was sent, using the same inclusive yard bands as the single-tee hint. |
 
 A contribution record also stores `review`: `{ "status": "pending", "reviewedAt": null, "note": null, "usedAt": null, "rewardedAt": null }`.
 

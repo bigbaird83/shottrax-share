@@ -3567,6 +3567,10 @@ describe("shottrax-share worker", () => {
   const CONTRIB_LONG = "ffffffff-ffff-4fff-8fff-ffffffffffff";
   const CONTRIB_BARE = "11111111-1111-4111-8111-111111111111";
   const CONTRIB_REJECT = "22222222-2222-4222-8222-222222222222";
+  const CONTRIB_TEES = "33333333-3333-4333-8333-333333333333";
+  const CONTRIB_TEES_NOPAR = "66666666-6666-4666-8666-666666666666";
+  const CONTRIB_TEES_EMPTY = "44444444-4444-4444-8444-444444444444";
+  const CONTRIB_TEES_NULL = "55555555-5555-4555-8555-555555555555";
   const GREEN = { lat: 33.2, lon: -93.1 };
   const EARTH_M = 6371000;
   const METERS_PER_YARD = 0.9144;
@@ -3772,6 +3776,169 @@ describe("shottrax-share worker", () => {
       expect(await response.json(), label).toEqual({ error: "invalid", field });
     }
     expect(kv.size).toBe(0);
+  });
+
+  function namedTee(overrides = {}) {
+    return {
+      color: "blue",
+      lat: GREEN.lat,
+      lon: GREEN.lon,
+      method: "tap-map",
+      ...overrides,
+    };
+  }
+
+  function teeHint(color, point, { accuracyM, par = 4 } = {}) {
+    const meters = distanceMeters(GREEN.lat, GREEN.lon, point.lat, point.lon);
+    const hint = { color, greenToTeeM: Math.round(meters) };
+    if (accuracyM != null) {
+      hint.accuracyM = accuracyM;
+      hint.poorFix = accuracyM > 15;
+    }
+    if (par != null) {
+      const yards = meters / METERS_PER_YARD;
+      const bands = { 3: [60, 280], 4: [230, 520], 5: [400, 680] };
+      const band = bands[par];
+      hint.plausibleForPar = Boolean(band) && yards >= band[0] && yards <= band[1];
+    }
+    return hint;
+  }
+
+  it("stores several named tees with per-tee accuracy and review hints", async () => {
+    const blue = pointNorth(GREEN, 390 / METERS_PER_YARD);
+    const white = pointNorth(GREEN, 100);
+    const red = pointNorth(GREEN, 400);
+    const created = await postReport(reportBody({
+      clientReportId: CONTRIB_TEES,
+      reasons: ["hole-contribution"],
+      contribution: holeContribution({
+        par: 4,
+        tees: [
+          { color: " Blue ", ...blue, method: "tap-map", accuracyM: 30 },
+          { color: "White", ...white, method: "im-here", accuracyM: 15 },
+          { color: ` ${"C".repeat(24)} `, ...red, method: "tap-map" },
+        ],
+      }),
+    }));
+    expect(created.status).toBe(201);
+    const stored = storedReport(CONTRIB_TEES);
+    const blueMeters = distanceMeters(GREEN.lat, GREEN.lon, blue.lat, blue.lon);
+    expect(blueMeters).toBeGreaterThan(380);
+    expect(blueMeters).toBeLessThan(400);
+    expect(stored.contribution.tees).toEqual([
+      { color: "blue", ...blue, method: "tap-map", accuracyM: 30 },
+      { color: "white", ...white, method: "im-here", accuracyM: 15 },
+      { color: "c".repeat(24), ...red, method: "tap-map" },
+    ]);
+    expect(stored.contribution.tee).toBeUndefined();
+    expect(stored.contribution.hints.tees).toEqual([
+      teeHint("blue", blue, { accuracyM: 30 }),
+      teeHint("white", white, { accuracyM: 15 }),
+      teeHint("c".repeat(24), red),
+    ]);
+    expect(stored.contribution.hints.tees[0].poorFix).toBe(true);
+    expect(stored.contribution.hints.tees[0].plausibleForPar).toBe(true);
+    expect(stored.contribution.hints.tees[1].poorFix).toBe(false);
+    expect(stored.contribution.hints.tees[1].plausibleForPar).toBe(false);
+    expect(stored.contribution.hints.tees[2].accuracyM).toBeUndefined();
+    expect(stored.contribution.hints.tees[2].poorFix).toBeUndefined();
+    expect(stored.contribution.hints.greenToTeeM).toBeUndefined();
+
+    const noPar = await postReport(reportBody({
+      clientReportId: CONTRIB_TEES_NOPAR,
+      reasons: ["hole-contribution"],
+      contribution: holeContribution({
+        tees: [{ color: " Blue ", ...blue, method: "im-here", accuracyM: 30 }],
+      }),
+    }));
+    expect(noPar.status).toBe(201);
+    const noParStored = storedReport(CONTRIB_TEES_NOPAR);
+    expect(noParStored.contribution.tees).toEqual([
+      { color: "blue", ...blue, method: "im-here", accuracyM: 30 },
+    ]);
+    expect(noParStored.contribution.hints.tees).toEqual([
+      teeHint("blue", blue, { accuracyM: 30, par: null }),
+    ]);
+    expect(noParStored.contribution.hints.tees[0].plausibleForPar).toBeUndefined();
+
+    const eightPoints = Array.from({ length: 8 }, (_, index) => pointNorth(GREEN, 300 + index));
+    const eight = await postReport(reportBody({
+      clientReportId: "77777777-7777-4777-8777-777777777777",
+      reasons: ["hole-contribution"],
+      contribution: holeContribution({
+        par: 4,
+        tees: eightPoints.map((point, index) => ({
+          color: `Tee ${index}`,
+          ...point,
+          method: index % 2 === 0 ? "tap-map" : "im-here",
+        })),
+      }),
+    }));
+    expect(eight.status).toBe(201);
+    const eightStored = storedReport("77777777-7777-4777-8777-777777777777");
+    expect(eightStored.contribution.tees).toHaveLength(8);
+    expect(eightStored.contribution.tees.map((tee) => tee.color)).toEqual(
+      eightPoints.map((_, index) => `tee ${index}`),
+    );
+    expect(eightStored.contribution.hints.tees).toHaveLength(8);
+    expect(eightStored.contribution.hints.tees.every((hint) => hint.plausibleForPar === true)).toBe(true);
+  });
+
+  it("returns 422 with field contribution.tees for a bad tees list", async () => {
+    const valid = namedTee();
+    const cases = [
+      ["not an array", { tees: { ...valid } }],
+      ["nine entries", {
+        tees: Array.from({ length: 9 }, (_, index) => namedTee({ color: `tee-${index}` })),
+      }],
+      ["entry not an object", { tees: [null] }],
+      ["missing color", { tees: [namedTee({ color: undefined })] }],
+      ["blank color", { tees: [namedTee({ color: "   " })] }],
+      ["25-char color", { tees: [namedTee({ color: "a".repeat(25) })] }],
+      ["duplicate color differing by case", {
+        tees: [namedTee({ color: "Blue" }), namedTee({ color: "BLUE", lat: GREEN.lat + 0.001 })],
+      }],
+      ["lat 91", { tees: [namedTee({ lat: 91 })] }],
+      ["bad method", { tees: [namedTee({ method: "gps" })] }],
+      ["negative accuracy", { tees: [namedTee({ accuracyM: -1 })] }],
+      ["accuracy as a string", { tees: [namedTee({ accuracyM: "30" })] }],
+    ];
+    for (const [label, contribution] of cases) {
+      const response = await postReport(reportBody({
+        reasons: ["hole-contribution"],
+        contribution: holeContribution(contribution),
+      }));
+      expect(response.status, label).toBe(422);
+      expect(await response.json(), label).toEqual({ error: "invalid", field: "contribution.tees" });
+    }
+    expect(kv.size).toBe(0);
+  });
+
+  it("returns 201 and stores no tees when the tees array is empty or null", async () => {
+    const empty = await postReport(reportBody({
+      clientReportId: CONTRIB_TEES_EMPTY,
+      reasons: ["hole-contribution"],
+      contribution: holeContribution({ tees: [], tee: pointNorth(GREEN, 350), par: 4 }),
+    }));
+    expect(empty.status).toBe(201);
+    const emptyStored = storedReport(CONTRIB_TEES_EMPTY);
+    expect(emptyStored.contribution.tees).toBeUndefined();
+    expect(emptyStored.contribution.hints.tees).toBeUndefined();
+    expect(emptyStored.contribution.tee).toEqual(pointNorth(GREEN, 350));
+    expect(emptyStored.contribution.hints.greenToTeeM).toEqual(expect.any(Number));
+
+    const absent = await postReport(reportBody({
+      clientReportId: CONTRIB_TEES_NULL,
+      reasons: ["hole-contribution"],
+      contribution: holeContribution({ tees: null }),
+    }));
+    expect(absent.status).toBe(201);
+    const absentStored = storedReport(CONTRIB_TEES_NULL);
+    expect(absentStored.contribution).toEqual({
+      green: GREEN,
+      greenMethod: "tap-map",
+      hints: {},
+    });
   });
 
   it("does not echo contributorEmail or position on the public course report response", async () => {
