@@ -109,6 +109,16 @@ Query params: `since` (ISO timestamp; reports with an earlier `receivedAt` are s
 
 `POST /v1/course-reports/<clientReportId>/review` body is `{ "status": "approved" | "rejected" | "used" | "rewarded", "note"?: string }`. `note` is optional, trimmed, max 500. Leave it out to keep the previous note. Send `null` or `""` to clear it. Allowed transitions are pending → approved, pending → rejected, approved → used, and used → rewarded. Anything else is `409` `{ "error": "invalid_transition" }`. A missing report is `404`. Moving to `approved` or `rejected` sets `reviewedAt`. Moving to `used` sets `usedAt` and leaves `reviewedAt` as it was. `rewardEligible` is stored `true` only when the new status is `used` and the email key is still present. Moving to `rejected` deletes `cr:email:<clientReportId>` in that same request and leaves `hadEmail`. Moving to `rewarded` sets `rewardedAt`, deletes that same key, and keeps `rewardEligible`. Nothing in this route grants the free month, and nothing writes the paint cache or any course record. Applying an approved hole is a separate manual step. The response is `200` and the updated record, with `contributorEmail` joined in only when the key is still there.
 
+### Scorecard photo
+
+`POST /v1/course-reports/scorecard-photo` takes the raw JPEG as the body. It needs `X-Install-Id` (otherwise `422` with `field` `installId`). A body over 2 MB is `413` `{ "error": "too_large" }`. Anything that is not a well-formed JPEG is `415` `{ "error": "not_jpeg" }`. The Worker removes the EXIF/XMP (APP1), IPTC (APP13) and comment segments before it stores the file, and keeps the rest so colors do not change. It answers `201` `{ "ok": true, "photoId": "<uuid>" }`. The phone should still shrink the picture and re-encode it as a JPEG, which also drops the GPS tags. Photos use the same daily caps as reports (30 per IP and 20 per install id, same env vars) but on their own counters, so a photo upload does not use up a report.
+
+The photo is stored in KV at `cr:photo:<photoId>` (bytes) with `expirationTtl` of 180 days, the same as the report. Metadata holds `installId`, `bytes` and `uploadedAt`. A photo that is never attached to a report just expires. The `cr:` prefix is reserved, so no public board route can read it.
+
+A report may carry `"photoId": "<uuid>"`. The photo must exist and must have been uploaded by the same `X-Install-Id`, otherwise the report is `422` with `field` `photoId`. The stored report keeps only the id. Admin `GET /v1/course-reports/scorecard-photo/<photoId>` (bearer token) returns the JPEG with `Cache-Control: no-store`. It is the only way to read it.
+
+Moving a review to `rejected` or `rewarded` deletes the photo in the same request and sets `photoDeleted: true` on the report, which keeps `photoId`. A photo on a report that is only `approved` or `used` stays until it expires at 180 days. Nothing is public and nothing here grants the free month.
+
 CORS for this route allows `GET,POST,OPTIONS` and the `Authorization` header. Other routes are unchanged.
 
 Merging to `main` deploys this Worker. The admin list and review stay closed until `COURSE_REPORTS_ADMIN_TOKEN` is set. Do not put that token in `wrangler.toml`.

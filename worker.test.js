@@ -98,9 +98,12 @@ describe("shottrax-share worker", () => {
           const row = kv.get(key);
           return row ? row.value : null;
         },
-        async getWithMetadata(key) {
+        async getWithMetadata(key, type) {
           const row = kv.get(key);
           if (!row) return { value: null, metadata: null };
+          if (type === "arrayBuffer" && row.value instanceof Uint8Array) {
+            return { value: row.value.slice().buffer, metadata: row.metadata ?? null };
+          }
           return { value: row.value, metadata: row.metadata ?? null };
         },
         async put(key, value, opts) {
@@ -4011,6 +4014,205 @@ describe("shottrax-share worker", () => {
     expect(plain.contribution).toBeUndefined();
     expect(plain.review).toBeUndefined();
     expect([...kv.keys()].some((key) => key.startsWith("id:") || key.startsWith("name:") || key.startsWith("gca:"))).toBe(false);
+  });
+
+  describe("scorecard photo", () => {
+    const PHOTO_URL = `${ORIGIN}/v1/course-reports/scorecard-photo`;
+    const PHOTO_REPORT = "77777777-7777-4777-8777-777777777777";
+    const PHOTO_INSTALL = "install-photo-1";
+
+    function segment(marker, payload) {
+      const length = payload.length + 2;
+      return [0xff, marker, length >> 8, length & 0xff, ...payload];
+    }
+
+    function makeJpeg({ exif = true, extra = [] } = {}) {
+      const bytes = [
+        0xff, 0xd8,
+        ...segment(0xe0, [0x4a, 0x46, 0x49, 0x46, 0x00, 1, 1, 0, 0, 1, 0, 1, 0, 0]),
+        ...(exif ? segment(0xe1, [0x45, 0x78, 0x69, 0x66, 0x00, 0x00, 1, 2, 3, 4, 5, 6]) : []),
+        ...(exif ? segment(0xed, [0x50, 0x68, 0x6f, 0x74, 0x6f]) : []),
+        ...(exif ? segment(0xfe, [0x68, 0x69]) : []),
+        ...segment(0xdb, new Array(65).fill(7)),
+        ...extra,
+        ...segment(0xda, [1, 1, 0, 0, 63, 0]),
+        0x12, 0x34, 0xff, 0x00, 0x56,
+        0xff, 0xd9,
+      ];
+      return new Uint8Array(bytes);
+    }
+
+    function hasMarker(bytes, marker) {
+      for (let i = 0; i < bytes.length - 1; i++) {
+        if (bytes[i] === 0xff && bytes[i + 1] === marker) return true;
+      }
+      return false;
+    }
+
+    function postPhoto(body, { headers } = {}) {
+      return invoke(PHOTO_URL, {
+        method: "POST",
+        body,
+        headers: {
+          "Content-Type": "image/jpeg",
+          "X-Install-Id": PHOTO_INSTALL,
+          "CF-Connecting-IP": REPORT_IP,
+          ...headers,
+        },
+      });
+    }
+
+    it("stores a JPEG without EXIF, XMP, IPTC or comment segments", async () => {
+      const res = await postPhoto(makeJpeg());
+      expect(res.status).toBe(201);
+      const { photoId } = await res.json();
+      expect(photoId).toMatch(/^[0-9a-f-]{36}$/);
+      const row = kv.get(`cr:photo:${photoId}`);
+      expect(row.opts.expirationTtl).toBe(REPORT_TTL);
+      const stored = row.value;
+      expect(stored[0]).toBe(0xff);
+      expect(stored[1]).toBe(0xd8);
+      expect(stored[stored.length - 2]).toBe(0xff);
+      expect(stored[stored.length - 1]).toBe(0xd9);
+      for (const marker of [0xe1, 0xed, 0xfe]) expect(hasMarker(stored, marker), marker).toBe(false);
+      expect(hasMarker(stored, 0xe0)).toBe(true);
+      expect(hasMarker(stored, 0xdb)).toBe(true);
+      expect(stored.length).toBeLessThan(makeJpeg().length);
+      expect(row.metadata.installId).toBe(PHOTO_INSTALL);
+    });
+
+    it("refuses a missing install id, non-JPEG, broken JPEG and oversize body", async () => {
+      const noInstall = await invoke(PHOTO_URL, { method: "POST", body: makeJpeg(), headers: { "CF-Connecting-IP": REPORT_IP } });
+      expect(noInstall.status).toBe(422);
+      expect((await noInstall.json()).field).toBe("installId");
+
+      const png = await postPhoto(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]));
+      expect(png.status).toBe(415);
+      expect(await png.json()).toEqual({ error: "not_jpeg" });
+
+      const truncated = makeJpeg().slice(0, 30);
+      expect((await postPhoto(truncated)).status).toBe(415);
+      const noEoi = makeJpeg().slice(0, -2);
+      expect((await postPhoto(noEoi)).status).toBe(415);
+
+      const big = new Uint8Array(2 * 1024 * 1024 + 1);
+      big.set([0xff, 0xd8, 0xff]);
+      const tooBig = await postPhoto(big);
+      expect(tooBig.status).toBe(413);
+      expect([...kv.keys()].some((key) => key.startsWith("cr:photo:"))).toBe(false);
+
+      expect((await invoke(PHOTO_URL, { method: "GET" })).status).toBe(405);
+    });
+
+    it("uses the same daily device limit as reports, on its own counter", async () => {
+      env.COURSE_REPORTS_DEVICE_DAY = "2";
+      expect((await postPhoto(makeJpeg())).status).toBe(201);
+      expect((await postPhoto(makeJpeg())).status).toBe(201);
+      const limited = await postPhoto(makeJpeg());
+      expect(limited.status).toBe(429);
+      const report = await postReport(
+        reportBody({ clientReportId: PHOTO_REPORT }),
+        { headers: { "X-Install-Id": PHOTO_INSTALL } },
+      );
+      expect(report.status).toBe(201);
+    });
+
+    it("attaches a photo to a report only when it exists and belongs to the same install", async () => {
+      const { photoId } = await (await postPhoto(makeJpeg())).json();
+      const ok = await postReport(
+        reportBody({ clientReportId: PHOTO_REPORT, photoId }),
+        { headers: { "X-Install-Id": PHOTO_INSTALL } },
+      );
+      expect(ok.status).toBe(201);
+      expect(storedReport(PHOTO_REPORT).photoId).toBe(photoId);
+
+      const missing = await postReport(
+        reportBody({ clientReportId: "88888888-8888-4888-8888-888888888888", photoId: "99999999-9999-4999-8999-999999999999" }),
+        { headers: { "X-Install-Id": PHOTO_INSTALL } },
+      );
+      expect(missing.status).toBe(422);
+      expect((await missing.json()).field).toBe("photoId");
+
+      const other = await postReport(
+        reportBody({ clientReportId: "88888888-8888-4888-8888-888888888889", photoId }),
+        { headers: { "X-Install-Id": "someone-else" } },
+      );
+      expect(other.status).toBe(422);
+
+      const bad = await postReport(
+        reportBody({ clientReportId: "88888888-8888-4888-8888-88888888888a", photoId: "nope" }),
+        { headers: { "X-Install-Id": PHOTO_INSTALL } },
+      );
+      expect((await bad.json()).field).toBe("photoId");
+    });
+
+    it("gives the image only to the admin", async () => {
+      env.COURSE_REPORTS_ADMIN_TOKEN = "admin-secret";
+      const { photoId } = await (await postPhoto(makeJpeg())).json();
+      const url = `${PHOTO_URL}/${photoId}`;
+      expect((await invoke(url)).status).toBe(401);
+      const asAdmin = await invoke(url, { headers: { Authorization: "Bearer admin-secret" } });
+      expect(asAdmin.status).toBe(200);
+      expect(asAdmin.headers.get("Content-Type")).toBe("image/jpeg");
+      expect(asAdmin.headers.get("Cache-Control")).toBe("no-store");
+      const bytes = new Uint8Array(await asAdmin.arrayBuffer());
+      expect(bytes[0]).toBe(0xff);
+      expect(hasMarker(bytes, 0xe1)).toBe(false);
+      const gone = await invoke(`${PHOTO_URL}/99999999-9999-4999-8999-999999999999`, {
+        headers: { Authorization: "Bearer admin-secret" },
+      });
+      expect(gone.status).toBe(404);
+      // A public board read cannot reach the key.
+      const board = await invoke(`${ORIGIN}/cr:photo:${photoId}`);
+      expect(board.status).toBe(400);
+    });
+
+    it("deletes the photo at once when a review is rejected or rewarded", async () => {
+      env.COURSE_REPORTS_ADMIN_TOKEN = "admin-secret";
+      const auth = { "Content-Type": "application/json", Authorization: "Bearer admin-secret" };
+      const { photoId } = await (await postPhoto(makeJpeg())).json();
+      const sent = await postReport(
+        reportBody({
+          clientReportId: CONTRIB_REJECT,
+          reasons: ["hole-contribution"],
+          photoId,
+          contribution: holeContribution(),
+        }),
+        { headers: { "X-Install-Id": PHOTO_INSTALL } },
+      );
+      expect(sent.status).toBe(201);
+      expect(kv.has(`cr:photo:${photoId}`)).toBe(true);
+      const approved = await invoke(`${ORIGIN}/v1/course-reports/${CONTRIB_REJECT}/review`, {
+        method: "POST", headers: auth, body: JSON.stringify({ status: "approved" }),
+      });
+      expect(approved.status).toBe(200);
+      expect(kv.has(`cr:photo:${photoId}`)).toBe(true);
+      for (const status of ["used", "rewarded"]) {
+        const res = await invoke(`${ORIGIN}/v1/course-reports/${CONTRIB_REJECT}/review`, {
+          method: "POST", headers: auth, body: JSON.stringify({ status }),
+        });
+        expect(res.status).toBe(200);
+      }
+      expect(kv.has(`cr:photo:${photoId}`)).toBe(false);
+      expect(storedReport(CONTRIB_REJECT).photoDeleted).toBe(true);
+      expect(storedReport(CONTRIB_REJECT).photoId).toBe(photoId);
+
+      const second = await (await postPhoto(makeJpeg())).json();
+      await postReport(
+        reportBody({
+          clientReportId: CONTRIB_TAP,
+          reasons: ["hole-contribution"],
+          photoId: second.photoId,
+          contribution: holeContribution(),
+        }),
+        { headers: { "X-Install-Id": PHOTO_INSTALL } },
+      );
+      const rejected = await invoke(`${ORIGIN}/v1/course-reports/${CONTRIB_TAP}/review`, {
+        method: "POST", headers: auth, body: JSON.stringify({ status: "rejected" }),
+      });
+      expect(rejected.status).toBe(200);
+      expect(kv.has(`cr:photo:${second.photoId}`)).toBe(false);
+    });
   });
 
   it("returns 422 when a hole contribution is missing a green or has a bad email", async () => {
