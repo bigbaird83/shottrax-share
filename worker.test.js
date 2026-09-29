@@ -3633,7 +3633,7 @@ describe("shottrax-share worker", () => {
       greenMethod: "tap-map",
       tee,
       par: 4,
-      contributorEmail: "player@example.com",
+      hadEmail: true,
       hints: {
         positionAccuracyM: 15,
         poorFix: false,
@@ -3642,7 +3642,19 @@ describe("shottrax-share worker", () => {
       },
     });
     expect(tapStored.contribution.hints.greenToPositionM).toBeUndefined();
-    expect(tapStored.review).toEqual({ status: "pending", reviewedAt: null, note: null, usedAt: null });
+    expect(JSON.stringify(tapStored)).not.toContain("player@example.com");
+    expect(kv.get(`cr:email:${CONTRIB_TAP}`)).toEqual({
+      value: "player@example.com",
+      opts: { expirationTtl: 365 * DAY },
+      metadata: null,
+    });
+    expect(tapStored.review).toEqual({
+      status: "pending",
+      reviewedAt: null,
+      note: null,
+      usedAt: null,
+      rewardedAt: null,
+    });
     expect(tapStored.rewardEligible).toBeUndefined();
     expect(teeMeters).toBeGreaterThan(230 * METERS_PER_YARD);
     expect(teeMeters).toBeLessThan(520 * METERS_PER_YARD);
@@ -3787,6 +3799,7 @@ describe("shottrax-share worker", () => {
     const record = await one.json();
     expect(record.contribution.contributorEmail).toBe(email);
     expect(record.position).toEqual({ lat: 33.2, lon: -93.11, accuracyM: 6 });
+    expect(JSON.stringify(storedReport(CONTRIB_TAP))).not.toContain(email);
 
     const listed = await invoke(`${ORIGIN}/v1/course-reports?reason=hole-contribution`, {
       headers: { Authorization: "Bearer admin-secret" },
@@ -3817,7 +3830,9 @@ describe("shottrax-share worker", () => {
     expect(JSON.stringify(replay)).not.toContain("example.com");
     expect(reportRecords()).toHaveLength(1);
     expect(storedReport(CONTRIB_TAP)).toEqual(before);
-    expect(before.contribution.contributorEmail).toBe("player@example.com");
+    expect(before.contribution.hadEmail).toBe(true);
+    expect(before.contribution.contributorEmail).toBeUndefined();
+    expect(kv.get(`cr:email:${CONTRIB_TAP}`).value).toBe("player@example.com");
   });
 
   it("reviews a hole contribution through the allowed transitions", async () => {
@@ -3857,6 +3872,7 @@ describe("shottrax-share worker", () => {
       reviewedAt: approvedBody.review.reviewedAt,
       note: "on the green",
       usedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
+      rewardedAt: null,
     });
     expect(usedBody.rewardEligible).toBe(true);
     expect(storedReport(CONTRIB_TAP).rewardEligible).toBe(true);
@@ -3986,5 +4002,96 @@ describe("shottrax-share worker", () => {
     const badReason = await adminGet("/v1/course-reports?reason=not-a-reason");
     expect(badReason.status).toBe(422);
     expect(await badReason.json()).toEqual({ error: "invalid", field: "reason" });
+  });
+
+  it("deletes contributorEmail on reject and on rewarded, and stores it for 365 days", async () => {
+    const email = "player@example.com";
+    const emailTtl = 365 * DAY;
+    expect((await postReport(reportBody({
+      clientReportId: CONTRIB_REJECT,
+      reasons: ["hole-contribution"],
+      contribution: holeContribution({ contributorEmail: "Player@Example.com" }),
+    }))).status).toBe(201);
+    expect((await postReport(reportBody({
+      clientReportId: CONTRIB_TAP,
+      reasons: ["hole-contribution"],
+      contribution: holeContribution({ contributorEmail: email }),
+    }))).status).toBe(201);
+
+    expect(kv.get(`cr:email:${CONTRIB_TAP}`)).toEqual({
+      value: email,
+      opts: { expirationTtl: emailTtl },
+      metadata: null,
+    });
+    expect(kv.get(`cr:email:${CONTRIB_REJECT}`).opts.expirationTtl).toBe(emailTtl);
+    expect(JSON.stringify(storedReport(CONTRIB_TAP))).not.toContain(email);
+    expect(storedReport(CONTRIB_TAP).contribution.hadEmail).toBe(true);
+
+    const blocked = await invoke(`${ORIGIN}/${encodeURIComponent(`cr:email:${CONTRIB_TAP}`)}`);
+    expect(blocked.status).toBe(400);
+    expect(await blocked.text()).not.toContain(email);
+
+    env.COURSE_REPORTS_ADMIN_TOKEN = "admin-secret";
+    const auth = { Authorization: "Bearer admin-secret" };
+    function adminGet(id) {
+      return invoke(`${ORIGIN}/v1/course-reports/${id}`, { headers: auth });
+    }
+
+    const tooSoon = await postReview(CONTRIB_TAP, { status: "rewarded" }, auth);
+    expect(tooSoon.status).toBe(409);
+    expect(await tooSoon.json()).toEqual({ error: "invalid_transition" });
+    expect(kv.get(`cr:email:${CONTRIB_TAP}`).value).toBe(email);
+
+    const rejected = await postReview(CONTRIB_REJECT, { status: "rejected" }, auth);
+    expect(rejected.status).toBe(200);
+    const rejectedBody = await rejected.json();
+    expect(rejectedBody.review.status).toBe("rejected");
+    expect(rejectedBody.contribution.contributorEmail).toBeUndefined();
+    expect(rejectedBody.contribution.hadEmail).toBe(true);
+    expect(kv.has(`cr:email:${CONTRIB_REJECT}`)).toBe(false);
+    expect(JSON.stringify(storedReport(CONTRIB_REJECT))).not.toContain("example.com");
+
+    const rejectedGet = await adminGet(CONTRIB_REJECT);
+    expect(rejectedGet.status).toBe(200);
+    const rejectedRecord = await rejectedGet.json();
+    expect(rejectedRecord.contribution.contributorEmail).toBeUndefined();
+    expect(rejectedRecord.contribution.hadEmail).toBe(true);
+
+    const rejectedAgain = await postReview(CONTRIB_REJECT, { status: "rewarded" }, auth);
+    expect(rejectedAgain.status).toBe(409);
+
+    expect((await postReview(CONTRIB_TAP, { status: "approved" }, auth)).status).toBe(200);
+    const skipReward = await postReview(CONTRIB_TAP, { status: "rewarded" }, auth);
+    expect(skipReward.status).toBe(409);
+    expect((await postReview(CONTRIB_TAP, { status: "used" }, auth)).status).toBe(200);
+    expect(kv.get(`cr:email:${CONTRIB_TAP}`).value).toBe(email);
+    const usedRecord = await (await adminGet(CONTRIB_TAP)).json();
+    expect(usedRecord.contribution.contributorEmail).toBe(email);
+    expect(usedRecord.rewardEligible).toBe(true);
+    expect(usedRecord.review.rewardedAt).toBeNull();
+
+    const rewarded = await postReview(CONTRIB_TAP, { status: "rewarded" }, auth);
+    expect(rewarded.status).toBe(200);
+    const rewardedBody = await rewarded.json();
+    expect(rewardedBody.review.status).toBe("rewarded");
+    expect(rewardedBody.review.rewardedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    expect(rewardedBody.review.usedAt).toBe(usedRecord.review.usedAt);
+    expect(rewardedBody.rewardEligible).toBe(true);
+    expect(rewardedBody.contribution.contributorEmail).toBeUndefined();
+    expect(rewardedBody.contribution.hadEmail).toBe(true);
+    expect(kv.has(`cr:email:${CONTRIB_TAP}`)).toBe(false);
+    expect(JSON.stringify(storedReport(CONTRIB_TAP))).not.toContain(email);
+
+    const after = await (await adminGet(CONTRIB_TAP)).json();
+    expect(after.contribution.contributorEmail).toBeUndefined();
+    expect(after.contribution.hadEmail).toBe(true);
+    expect(after.rewardEligible).toBe(true);
+    expect(after.review.rewardedAt).toBe(rewardedBody.review.rewardedAt);
+
+    const backToUsed = await postReview(CONTRIB_TAP, { status: "used" }, auth);
+    expect(backToUsed.status).toBe(409);
+    expect(await backToUsed.json()).toEqual({ error: "invalid_transition" });
+    const backToApproved = await postReview(CONTRIB_TAP, { status: "approved" }, auth);
+    expect(backToApproved.status).toBe(409);
   });
 });

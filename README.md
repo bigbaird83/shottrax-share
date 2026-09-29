@@ -71,9 +71,11 @@ POST /v1/course-reports/{clientReportId}/review   admin, review a contribution
 | `greenMethod` | Required. `tap-map` or `im-here`. |
 | `tee` | Optional `{ lat, lon }`. Omit it, or send `null`, when the player did not mark a tee. A present value that is not a lat/lon is `422` with `field` `contribution.tee`. |
 | `par` | Optional integer, 3–6. Omit it, or send `null`, when the player did not enter par. |
-| `contributorEmail` | Optional. Trimmed, max 254 characters, basic `local@domain.tld` shape, stored lowercased. |
+| `contributorEmail` | Optional. Trimmed, max 254 characters, basic `local@domain.tld` shape, stored lowercased. The report JSON does not hold the address. |
 
 A missing or non-object `contribution` is `422` `{ "error": "invalid", "field": "contribution" }`. A bad `green`, `greenMethod`, `tee`, `par`, or `contributorEmail` uses `field` `contribution.<name>`. The server does not copy `position` onto `green` and does not fill in a tee or a par the player did not send.
+
+When an address is accepted, the report stores `contribution.hadEmail: true` and the address itself goes to `cr:email:<clientReportId>` with `expirationTtl` of 365 days. KV deletes that key on its own if nobody reviews the report. The `cr:` prefix is reserved, so `GET /cr:email:…` cannot read it. If `createdAt` is already 365 days old or older, the address is not stored. Admin `GET`s copy a live key onto `contribution.contributorEmail`. After the key is gone, those responses still show `hadEmail` and do not show the address.
 
 The phone refuses a bad GPS fix and an implausible hole length. The server still stores the contribution and adds `contribution.hints` for the reviewer. Hints never cause a `422`.
 
@@ -85,12 +87,13 @@ The phone refuses a bad GPS fix and an implausible hole length. The server still
 | `greenToTeeM` | Both `tee` and `par` were sent. Meters, rounded, from the green to the tee. |
 | `plausibleForPar` | Same as `greenToTeeM`. Inclusive yards: par 3 is 60–280, par 4 is 230–520, par 5 is 400–680. Par 6 has no band, so the flag is `false`. |
 
-A contribution record also stores `review`: `{ "status": "pending", "reviewedAt": null, "note": null, "usedAt": null }`.
+A contribution record also stores `review`: `{ "status": "pending", "reviewedAt": null, "note": null, "usedAt": null, "rewardedAt": null }`.
 
-A new report is `201` `{ "ok": true, "id": "<clientReportId>" }`. The same id again is `200` `{ "ok": true, "id", "duplicate": true }` and does not write. Neither response includes the stored record, so `contributorEmail` and `position` are not echoed to the phone. Both KV keys live 180 days:
+A new report is `201` `{ "ok": true, "id": "<clientReportId>" }`. The same id again is `200` `{ "ok": true, "id", "duplicate": true }` and does not write. Neither response includes the stored record, so `contributorEmail` and `position` are not echoed to the phone. The report keys live 180 days. The address key lives 365 days:
 
 - `cr:id:<clientReportId>` — dedupe marker. The value is the record key.
-- `cr:r:<receivedAt ISO with milliseconds>:<clientReportId>` — the normalized JSON, plus `receivedAt`, `installId`, and `country` from `request.cf.country` when Cloudflare sends it. The raw IP is not stored.
+- `cr:r:<receivedAt ISO with milliseconds>:<clientReportId>` — the normalized JSON, plus `receivedAt`, `installId`, and `country` from `request.cf.country` when Cloudflare sends it. The raw IP is not stored. The address is not in this JSON.
+- `cr:email:<clientReportId>` — the lowercased address, only when one was accepted and `createdAt` is still inside 365 days. `expirationTtl` is 365 days.
 
 New reports (not duplicates) are limited per UTC day: 30 per `CF-Connecting-IP`, and 20 per `X-Install-Id` when that header is present. Over the limit is `429` `{ "error": "rate_limited" }` with `Retry-After` in seconds, which the app retries. Override the caps with `COURSE_REPORTS_IP_DAY` and `COURSE_REPORTS_DEVICE_DAY` (see the comments in `wrangler.toml`). If `BOARDS` is unbound the response is `503` `{ "error": "boards_not_configured" }`. Review writes do not count toward the cap.
 
@@ -100,9 +103,9 @@ Admin `GET` and the review `POST` require `Authorization: Bearer <token>`. The t
 wrangler secret put COURSE_REPORTS_ADMIN_TOKEN
 ```
 
-Query params: `since` (ISO timestamp; reports with an earlier `receivedAt` are skipped using key order), `courseId` (exact match), `reason` (one known reason, for example `hole-contribution`), `status` (`pending`, `approved`, `rejected`, or `used`), `limit` (default 100, max 500), `cursor` (pass the previous KV list cursor back). An unknown `reason` or `status` is `422`. The body is `{ "reports": [ ... ], "cursor": "<cursor or null>" }`, oldest first. `GET /v1/course-reports/<clientReportId>` returns that one record, or `404` `{ "error": "not_found" }`. `contributorEmail` and `position` are included on these admin GETs.
+Query params: `since` (ISO timestamp; reports with an earlier `receivedAt` are skipped using key order), `courseId` (exact match), `reason` (one known reason, for example `hole-contribution`), `status` (`pending`, `approved`, `rejected`, `used`, or `rewarded`), `limit` (default 100, max 500), `cursor` (pass the previous KV list cursor back). An unknown `reason` or `status` is `422`. The body is `{ "reports": [ ... ], "cursor": "<cursor or null>" }`, oldest first. `GET /v1/course-reports/<clientReportId>` returns that one record, or `404` `{ "error": "not_found" }`. `position` is on these admin GETs. `contributorEmail` is on them only while the `cr:email:` key exists.
 
-`POST /v1/course-reports/<clientReportId>/review` body is `{ "status": "approved" | "rejected" | "used", "note"?: string }`. `note` is optional, trimmed, max 500. Leave it out to keep the previous note. Send `null` or `""` to clear it. Allowed transitions are pending → approved, pending → rejected, and approved → used. Anything else is `409` `{ "error": "invalid_transition" }`. A missing report is `404`. Moving to `approved` or `rejected` sets `reviewedAt`. Moving to `used` sets `usedAt` and leaves `reviewedAt` as it was. `rewardEligible` is stored `true` only when the new status is `used` and `contributorEmail` is present. Nothing in this route grants the free month, and nothing writes the paint cache or any course record. Applying an approved hole is a separate manual step. The response is `200` and the updated record.
+`POST /v1/course-reports/<clientReportId>/review` body is `{ "status": "approved" | "rejected" | "used" | "rewarded", "note"?: string }`. `note` is optional, trimmed, max 500. Leave it out to keep the previous note. Send `null` or `""` to clear it. Allowed transitions are pending → approved, pending → rejected, approved → used, and used → rewarded. Anything else is `409` `{ "error": "invalid_transition" }`. A missing report is `404`. Moving to `approved` or `rejected` sets `reviewedAt`. Moving to `used` sets `usedAt` and leaves `reviewedAt` as it was. `rewardEligible` is stored `true` only when the new status is `used` and the email key is still present. Moving to `rejected` deletes `cr:email:<clientReportId>` in that same request and leaves `hadEmail`. Moving to `rewarded` sets `rewardedAt`, deletes that same key, and keeps `rewardEligible`. Nothing in this route grants the free month, and nothing writes the paint cache or any course record. Applying an approved hole is a separate manual step. The response is `200` and the updated record, with `contributorEmail` joined in only when the key is still there.
 
 CORS for this route allows `GET,POST,OPTIONS` and the `Authorization` header. Other routes are unchanged.
 

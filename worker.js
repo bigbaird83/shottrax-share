@@ -154,6 +154,13 @@ import { handleLivePage, isLiveBoardCode } from "./live-page.js";
  *   par                                 optional integer 3..6
  *   contributorEmail                    optional, trimmed, max 254, basic
  *                                       email shape, stored lowercased
+ * The address is not written on the report. It is stored at
+ * cr:email:<clientReportId> with a 365-day expirationTtl, so KV drops it
+ * even if nobody reviews the report. The cr: prefix is already reserved,
+ * so a board GET cannot read it. The report keeps hadEmail:true when an
+ * address was accepted. If createdAt is already 365 days old or older, the
+ * address is not stored. Admin GETs copy the address onto
+ * contribution.contributorEmail while the key exists.
  * A bad contribution is 422 {error:"invalid", field} with field "contribution"
  * or "contribution.<name>". position stays the top-level {lat, lon, accuracyM}
  * and is the GPS fix for "I'm here". This route does not copy position onto
@@ -169,22 +176,27 @@ import { handleLivePage, isLiveBoardCode } from "./live-page.js";
  *                       par 4 is 230–520, par 5 is 400–680. Par 6 has no
  *                       band, so the flag is false.
  *
- * A contribution record stores review {status, reviewedAt, note, usedAt}.
- * status starts as "pending". The other three start null.
+ * A contribution record stores review
+ * {status, reviewedAt, note, usedAt, rewardedAt}. status starts as "pending".
+ * The other four start null.
  *
  * The review POST uses the same bearer token and fails closed the same way.
- * Body is {status, note?}. status must be "approved", "rejected", or "used".
- * note is optional, trimmed, max 500. Omit note to keep the previous one.
- * Allowed transitions: pending→approved, pending→rejected, approved→used.
- * Anything else is 409 {error:"invalid_transition"}. Moving to used sets
- * usedAt. rewardEligible is stored true only when the new status is used and
- * contributorEmail is present. No reward is granted. Nothing here writes the
- * paint cache or any course record. Applying an approved hole is manual.
+ * Body is {status, note?}. status must be "approved", "rejected", "used", or
+ * "rewarded". note is optional, trimmed, max 500. Omit note to keep the
+ * previous one. Allowed transitions: pending→approved, pending→rejected,
+ * approved→used, used→rewarded. Anything else is 409
+ * {error:"invalid_transition"}. Moving to used sets usedAt. rewardEligible
+ * is stored true only when the new status is used and the email key is still
+ * present. Moving to rejected or rewarded deletes that key in the same
+ * request and leaves hadEmail. rewarded also sets rewardedAt and keeps
+ * rewardEligible. No reward is granted. Nothing here writes the paint cache
+ * or any course record. Applying an approved hole is manual.
  * A missing report is 404 {error:"not_found"}.
  *
- * BOARDS keys, both TTL 180 days:
- *   cr:id:<clientReportId>                  dedupe marker; value is the record key
- *   cr:r:<receivedAt ISO with ms>:<id>      normalized JSON
+ * BOARDS keys:
+ *   cr:id:<clientReportId>                  dedupe marker; value is the record key; TTL 180 days
+ *   cr:r:<receivedAt ISO with ms>:<id>      normalized JSON; TTL 180 days
+ *   cr:email:<clientReportId>               contributor address only; TTL 365 days
  * Server fields on the record: receivedAt, installId, and request.cf.country
  * when that is present. The raw IP is never stored. New reports are capped
  * per UTC day at 30 for CF-Connecting-IP and 20 for X-Install-Id when the
@@ -198,7 +210,7 @@ import { handleLivePage, isLiveBoardCode } from "./live-page.js";
  * `wrangler secret put COURSE_REPORTS_ADMIN_TOKEN`. Unset fails closed: 503
  * {error:"not_configured"}. Wrong or missing bearer is 401. Query: since
  * (ISO, key order on receivedAt), courseId (exact), reason (a known reason),
- * status (pending, approved, rejected, or used), limit (default 100, max
+ * status (pending, approved, rejected, used, or rewarded), limit (default 100, max
  * 500), cursor (KV list cursor). An unknown reason or status is 422. Body is
  * {reports, cursor|null}, oldest first. Unbound BOARDS is 503
  * {error:"boards_not_configured"} on POST and on admin GET. contributorEmail
@@ -2703,6 +2715,8 @@ async function paintGetBody(boards, key, raw) {
 }
 
 const COURSE_REPORT_TTL = 60 * 60 * 24 * 180;
+/** KV deletes the address this long after accept, even if nobody reviews it. */
+const COURSE_REPORT_EMAIL_TTL = 60 * 60 * 24 * 365;
 const COURSE_REPORT_BODY_MAX = 4096;
 const COURSE_REPORT_IP_DAY_DEFAULT = 30;
 const COURSE_REPORT_DEVICE_DAY_DEFAULT = 20;
@@ -2716,8 +2730,8 @@ const COURSE_REPORT_REASONS = new Set([
   "hole-contribution",
 ]);
 const CONTRIBUTION_METHODS = new Set(["tap-map", "im-here"]);
-const REVIEW_STATUSES = new Set(["pending", "approved", "rejected", "used"]);
-const REVIEW_DECISIONS = new Set(["approved", "rejected", "used"]);
+const REVIEW_STATUSES = new Set(["pending", "approved", "rejected", "used", "rewarded"]);
+const REVIEW_DECISIONS = new Set(["approved", "rejected", "used", "rewarded"]);
 /** Inclusive playing length in yards. Par 6 is accepted and has no band. */
 const PAR_LENGTH_YARDS = {
   3: [60, 280],
@@ -2805,7 +2819,7 @@ function invalidContribution(name) {
  */
 function parseHoleContribution(payload, reasons) {
   const required = reasons.includes("hole-contribution");
-  if (!required) return { ok: true, present: false };
+  if (!required) return { ok: true, present: false, contributorEmail: null };
   if (!isPlainObject(payload.contribution)) return invalidContribution();
   const src = payload.contribution;
   const green = parseLatLon(src.green);
@@ -2824,15 +2838,17 @@ function parseHoleContribution(payload, reasons) {
     if (!Number.isInteger(src.par) || src.par < 3 || src.par > 6) return invalidContribution("par");
     contribution.par = src.par;
   }
+  let contributorEmail = null;
   if (Object.prototype.hasOwnProperty.call(src, "contributorEmail") && src.contributorEmail != null) {
     if (typeof src.contributorEmail !== "string") return invalidContribution("contributorEmail");
     const email = src.contributorEmail.trim().toLowerCase();
     if (email.length < 1 || email.length > 254 || !COURSE_REPORT_EMAIL_RE.test(email)) {
       return invalidContribution("contributorEmail");
     }
-    contribution.contributorEmail = email;
+    contributorEmail = email;
+    contribution.hadEmail = true;
   }
-  return { ok: true, present: true, contribution };
+  return { ok: true, present: true, contribution, contributorEmail };
 }
 
 /**
@@ -2956,10 +2972,16 @@ function parseCourseReport(payload) {
   if (contribution.present) {
     contribution.contribution.hints = contributionHints(contribution.contribution, record.position);
     record.contribution = contribution.contribution;
-    record.review = { status: "pending", reviewedAt: null, note: null, usedAt: null };
+    record.review = {
+      status: "pending",
+      reviewedAt: null,
+      note: null,
+      usedAt: null,
+      rewardedAt: null,
+    };
   }
 
-  return { ok: true, record };
+  return { ok: true, record, contributorEmail: contribution.contributorEmail };
 }
 
 function readCourseReportInstallId(request) {
@@ -3018,6 +3040,17 @@ function boardsBinding(env) {
 
 function courseReportMarkerKey(clientReportId) {
   return `cr:id:${clientReportId}`;
+}
+
+function courseReportEmailKey(clientReportId) {
+  return `cr:email:${clientReportId}`;
+}
+
+/** True when createdAt is still inside the 365-day address window. */
+function contributionEmailWithinCap(createdAt, now) {
+  const createdMs = Date.parse(createdAt);
+  if (!Number.isFinite(createdMs)) return false;
+  return now.getTime() - createdMs < COURSE_REPORT_EMAIL_TTL * 1000;
 }
 
 function courseReportRecordKey(receivedAt, clientReportId) {
@@ -3183,8 +3216,41 @@ async function handleCourseReportPost(request, env, cors) {
   if (country) record.country = country;
   await boards.put(recordKey, JSON.stringify(record), { expirationTtl: COURSE_REPORT_TTL });
   await boards.put(markerKey, recordKey, { expirationTtl: COURSE_REPORT_TTL });
+  if (parsed.contributorEmail && contributionEmailWithinCap(record.createdAt, now)) {
+    await boards.put(courseReportEmailKey(clientReportId), parsed.contributorEmail, {
+      expirationTtl: COURSE_REPORT_EMAIL_TTL,
+    });
+  }
   await rate.commit();
   return golfJson(201, { ok: true, id: clientReportId }, cors);
+}
+
+async function readContributionEmail(boards, clientReportId) {
+  const raw = await boards.get(courseReportEmailKey(clientReportId));
+  if (typeof raw !== "string") return null;
+  const email = raw.trim();
+  if (!email || email.length > 254 || !COURSE_REPORT_EMAIL_RE.test(email)) return null;
+  return email;
+}
+
+async function deleteContributionEmail(boards, clientReportId) {
+  if (!boards || typeof boards.delete !== "function") return;
+  await boards.delete(courseReportEmailKey(clientReportId));
+}
+
+/**
+ * Admin reads see the address only while its KV key still exists. The stored
+ * report never holds it. hadEmail stays after the key is deleted or expires.
+ */
+async function presentCourseReport(boards, record) {
+  if (!isPlainObject(record) || !isPlainObject(record.contribution)) return record;
+  const contribution = { ...record.contribution };
+  delete contribution.contributorEmail;
+  if (contribution.hadEmail === true) {
+    const email = await readContributionEmail(boards, record.clientReportId);
+    if (email) contribution.contributorEmail = email;
+  }
+  return { ...record, contribution };
 }
 
 async function loadCourseReport(boards, clientReportId) {
@@ -3198,7 +3264,7 @@ async function loadCourseReport(boards, clientReportId) {
 async function handleCourseReportGetOne(boards, clientReportId, cors) {
   const loaded = await loadCourseReport(boards, clientReportId);
   if (!loaded) return golfJson(404, { error: "not_found" }, cors);
-  return golfJson(200, loaded.record, cors);
+  return golfJson(200, await presentCourseReport(boards, loaded.record), cors);
 }
 
 async function handleCourseReportsGet(request, url, env, cors, clientReportId) {
@@ -3224,7 +3290,9 @@ async function handleCourseReportsGet(request, url, env, cors, clientReportId) {
     limit: readReportLimit(url.searchParams.get("limit")),
     cursor: url.searchParams.get("cursor"),
   });
-  return golfJson(200, { reports: listed.reports, cursor: listed.cursor }, cors);
+  const reports = [];
+  for (const record of listed.reports) reports.push(await presentCourseReport(boards, record));
+  return golfJson(200, { reports, cursor: listed.cursor }, cors);
 }
 
 function decodeCourseReportId(raw) {
@@ -3278,13 +3346,23 @@ function parseCourseReportReview(payload) {
 function reviewTransitionAllowed(current, next) {
   if (current === "pending") return next === "approved" || next === "rejected";
   if (current === "approved") return next === "used";
+  if (current === "used") return next === "rewarded";
   return false;
+}
+
+function dropStoredContributorEmail(record) {
+  if (!isPlainObject(record.contribution)) return;
+  if (typeof record.contribution.contributorEmail === "string" && record.contribution.contributorEmail) {
+    record.contribution.hadEmail = true;
+  }
+  delete record.contribution.contributorEmail;
 }
 
 /**
  * Records the review decision on the existing cr:r: row. rewardEligible is
- * the only fulfillment field, and only after used when an email was stored.
- * This does not call a billing or subscription API.
+ * set by the handler only when status becomes used and the email key exists.
+ * rejected and rewarded remove any address from this row. This does not call
+ * a billing or subscription API.
  */
 function applyCourseReportReview(record, decision, nowIso) {
   const previous = isPlainObject(record.review) ? record.review : {};
@@ -3293,16 +3371,17 @@ function applyCourseReportReview(record, decision, nowIso) {
     reviewedAt: previous.reviewedAt ?? null,
     note: previous.note ?? null,
     usedAt: previous.usedAt ?? null,
+    rewardedAt: previous.rewardedAt ?? null,
   };
   if (decision.status === "approved" || decision.status === "rejected") {
     review.reviewedAt = nowIso;
   }
   if (decision.status === "used") review.usedAt = nowIso;
+  if (decision.status === "rewarded") review.rewardedAt = nowIso;
   if (decision.noteSet) review.note = decision.note;
   record.review = review;
-  if (decision.status === "used") {
-    const email = record.contribution && record.contribution.contributorEmail;
-    if (typeof email === "string" && email.length > 0) record.rewardEligible = true;
+  if (decision.status === "rejected" || decision.status === "rewarded") {
+    dropStoredContributorEmail(record);
   }
   return record;
 }
@@ -3325,9 +3404,16 @@ async function handleCourseReportReview(request, env, cors, clientReportId) {
   }
 
   const nowIso = new Date().toISOString();
+  const emailOnFile = decision.status === "used"
+    ? await readContributionEmail(boards, clientReportId)
+    : null;
   const record = applyCourseReportReview(loaded.record, decision, nowIso);
+  if (decision.status === "used" && emailOnFile) record.rewardEligible = true;
   await boards.put(loaded.key, JSON.stringify(record), { expirationTtl: COURSE_REPORT_TTL });
-  return golfJson(200, record, cors);
+  if (decision.status === "rejected" || decision.status === "rewarded") {
+    await deleteContributionEmail(boards, clientReportId);
+  }
+  return golfJson(200, await presentCourseReport(boards, record), cors);
 }
 
 async function handleCourseReports(request, url, env, cors) {
