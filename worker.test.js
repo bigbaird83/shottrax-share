@@ -5,6 +5,7 @@ import worker, { osmInflight, presentGcaCourseBody } from "./worker.js";
 const ORIGIN = "https://shottrax-share.bcbaird.workers.dev";
 const PRIMARY = "https://overpass-api.de/api/interpreter";
 const MIRROR = "https://overpass.private.coffee/api/interpreter";
+const OSM_MAP = "https://api.openstreetmap.org/api/0.6/map";
 const USER_AGENT = "shottracker-worker/1.0 (+https://shottrax-share.bcbaird.workers.dev)";
 const COURSE_ID = "2fa21943-abaa-43a4-a90f-cb06c82216b4";
 const DATA_KEY = "osm:v1:33.1941,-93.2077:1800";
@@ -53,6 +54,26 @@ function magnoliaUrl(extra = {}) {
     radius: "1800",
     ...extra,
   });
+}
+
+function osmMapXml(inner) {
+  return `<?xml version="1.0" encoding="UTF-8"?><osm version="0.6" generator="OpenStreetMap server">${inner}</osm>`;
+}
+
+function osmNode(id, lat, lon) {
+  return `<node id="${id}" visible="true" version="1" lat="${lat}" lon="${lon}"/>`;
+}
+
+function osmWay(id, version, refs, tags) {
+  const nds = refs.map((ref) => `<nd ref="${ref}"/>`).join("");
+  const tagXml = Object.entries(tags).map(([key, value]) => `<tag k="${key}" v="${value}"/>`).join("");
+  return `<way id="${id}" visible="true" version="${version}">${nds}${tagXml}</way>`;
+}
+
+function bboxFromCall(call) {
+  const match = String(call[0]).match(/[?&]bbox=([^&]+)/);
+  const [west, south, east, north] = decodeURIComponent(match[1]).split(",").map(Number);
+  return { west, south, east, north };
 }
 
 function postedQuery(init) {
@@ -401,7 +422,7 @@ describe("shottrax-share worker", () => {
     expect(response.status).toBe(503);
     expect(await response.json()).toEqual({ error: "upstream_busy" });
     expect(response.headers.get("Retry-After")).toBe("45");
-    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([PRIMARY, MIRROR]);
+    expect(fetchMock.mock.calls.map((call) => String(call[0]).split("?")[0])).toEqual([PRIMARY, MIRROR, OSM_MAP]);
     expect(kv.size).toBe(0);
     expect(edge.size).toBe(0);
   });
@@ -412,7 +433,7 @@ describe("shottrax-share worker", () => {
     expect(response.status).toBe(503);
     expect(await response.json()).toEqual({ error: "upstream_busy" });
     expect(response.headers.get("Retry-After")).toBe("30");
-    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([PRIMARY, MIRROR]);
+    expect(fetchMock.mock.calls.map((call) => String(call[0]).split("?")[0])).toEqual([PRIMARY, MIRROR, OSM_MAP]);
     expect(kv.size).toBe(0);
     expect(edge.size).toBe(0);
   });
@@ -447,8 +468,8 @@ describe("shottrax-share worker", () => {
     const down = await invoke(magnoliaUrl());
     expect(down.status).toBe(503);
     expect(await down.json()).toEqual({ error: "upstream_busy" });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([PRIMARY, MIRROR]);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls.map((call) => String(call[0]).split("?")[0])).toEqual([PRIMARY, MIRROR, OSM_MAP]);
     expect(kv.size).toBe(0);
     expect(edge.size).toBe(0);
   });
@@ -762,6 +783,286 @@ describe("shottrax-share worker", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  const BACKUP_XML = osmMapXml(`
+    ${osmNode(11, "33.19", "-93.21")}
+    ${osmNode(12, "33.2", "-93.2")}
+    ${osmNode(13, "33.18", "-93.22")}
+    ${osmNode(14, "33.21", "-93.19")}
+    ${osmWay(501, 4, [11, 99, 12], { golf: "hole", ref: "7", par: "5", name: "A &amp; B" })}
+    ${osmWay(800, 1, [11, 13], { highway: "service" })}
+    ${osmWay(502, 3, [13, 14], { golf: "green", ref: "7" })}
+    ${osmWay(503, 2, [11, 12], { golf: "cartpath" })}
+    ${osmWay(504, 1, [11, 12], { golf: "pitch" })}
+    <relation id="77" visible="true" version="1"><member type="way" ref="501" role=""/><tag k="type" v="route"/><tag k="golf" v="hole"/></relation>
+    <relation id="900" visible="true" version="6"><member type="way" ref="800" role="outer"/><tag k="type" v="multipolygon"/><tag k="golf" v="fairway"/></relation>
+  `);
+
+  function mockOverpassDownThen(osmResponder) {
+    mockOverpass(async (url, init) => {
+      const target = String(url);
+      if (target === PRIMARY || target === MIRROR) return new Response("gateway", { status: 504 });
+      expect(target.startsWith(`${OSM_MAP}?bbox=`)).toBe(true);
+      expect(init.method).toBe("GET");
+      expect(init.headers["User-Agent"]).toBe(USER_AGENT);
+      expect(init.body).toBeUndefined();
+      return osmResponder(target, init);
+    });
+  }
+
+  it("converts an editing API backup into out geom JSON after primary and mirror 504", async () => {
+    mockOverpassDownThen(async () => new Response(BACKUP_XML, {
+      status: 200,
+      headers: { "Content-Type": "application/xml" },
+    }));
+    const response = await invoke(magnoliaUrl());
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Overlay-Cache")).toBe("MISS");
+    expect(response.headers.get("X-Overlay-Source")).toBe("osm-api");
+    expect(response.headers.get("Content-Type")).toContain("application/json");
+    const text = await response.text();
+    const payload = JSON.parse(text);
+    expect(payload.version).toBe(0.6);
+    expect(payload.generator).toBe("osm-api");
+    expect(payload.elements.map((element) => `${element.type}/${element.id}`)).toEqual([
+      "way/501",
+      "way/502",
+      "way/503",
+      "relation/900",
+    ]);
+    const hole = payload.elements[0];
+    expect(hole).toMatchObject({
+      type: "way",
+      id: 501,
+      version: 4,
+      nodes: [11, 12],
+      geometry: [
+        { lat: 33.19, lon: -93.21 },
+        { lat: 33.2, lon: -93.2 },
+      ],
+      tags: { golf: "hole", ref: "7", par: "5", name: "A & B" },
+      bounds: { minlat: 33.19, minlon: -93.21, maxlat: 33.2, maxlon: -93.2 },
+    });
+    expect(payload.elements[1]).toMatchObject({
+      type: "way",
+      id: 502,
+      version: 3,
+      nodes: [13, 14],
+      geometry: [
+        { lat: 33.18, lon: -93.22 },
+        { lat: 33.21, lon: -93.19 },
+      ],
+      tags: { golf: "green", ref: "7" },
+    });
+    expect(payload.elements[2].tags).toEqual({ golf: "cartpath" });
+    const fairway = payload.elements[3];
+    expect(fairway).toMatchObject({
+      type: "relation",
+      id: 900,
+      version: 6,
+      tags: { type: "multipolygon", golf: "fairway" },
+      members: [
+        {
+          type: "way",
+          ref: 800,
+          role: "outer",
+          geometry: [
+            { lat: 33.19, lon: -93.21 },
+            { lat: 33.18, lon: -93.22 },
+          ],
+        },
+      ],
+    });
+    expect(payload.elements.some((element) => element.type === "node")).toBe(false);
+    expect(payload.elements.some((element) => element.tags && element.tags.highway)).toBe(false);
+    expect(payload.elements.some((element) => element.tags && element.tags.golf === "pitch")).toBe(false);
+    expect(payload.elements.some((element) => element.tags && element.tags.golf === "hole" && element.type === "relation")).toBe(false);
+
+    expect(fetchMock.mock.calls.map((call) => String(call[0]).split("?")[0])).toEqual([PRIMARY, MIRROR, OSM_MAP]);
+    const bbox = bboxFromCall(fetchMock.mock.calls[2]);
+    expect(bbox.south).toBeLessThan(33.1940935);
+    expect(bbox.north).toBeGreaterThan(33.1940935);
+    expect(bbox.west).toBeLessThan(-93.2077463);
+    expect(bbox.east).toBeGreaterThan(-93.2077463);
+    expect(kv.get(DATA_KEY)?.value).toBe(text);
+    expect(kv.get(DATA_KEY)?.opts?.expirationTtl).toBe(365 * DAY);
+    expect(JSON.parse(kv.get(INDEX_KEY).value)).toEqual([{ lat: 33.1941, lng: -93.2077, radius: 1800 }]);
+    expect(kv.has(NONE_KEY)).toBe(false);
+
+    fetchMock.mockClear();
+    edge.clear();
+    const hit = await invoke(magnoliaUrl());
+    expect(hit.status).toBe(200);
+    expect(hit.headers.get("X-Overlay-Cache")).toBe("HIT");
+    expect(hit.headers.get("X-Overlay-Source")).toBe("osm-api");
+    expect(await hit.text()).toBe(text);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("splits a too-many-nodes 400 into quadrants and merges deduped ways", async () => {
+    const quadrants = [
+      osmMapXml(`
+        ${osmNode(11, "33.19", "-93.21")}
+        ${osmNode(12, "33.2", "-93.2")}
+        ${osmWay(501, 4, [11, 12], { golf: "hole", ref: "1", par: "4" })}
+        ${osmWay(601, 1, [11, 12], { golf: "green" })}
+        ${osmWay(800, 1, [11, 12], { highway: "residential" })}
+      `),
+      osmMapXml(`
+        ${osmNode(11, "33.19", "-93.21")}
+        ${osmWay(501, 4, [11], { golf: "hole", ref: "1", par: "4" })}
+        ${osmWay(701, 2, [11], { golf: "bunker" })}
+      `),
+      osmMapXml(`
+        ${osmNode(21, "33.18", "-93.22")}
+        ${osmNode(22, "33.21", "-93.19")}
+        ${osmWay(801, 3, [21, 22], { golf: "fairway", ref: "2" })}
+      `),
+      "You requested too many nodes (limit is 50000). Either request a smaller area, or use planet.osm",
+    ];
+    let osmCalls = 0;
+    mockOverpassDownThen(async () => {
+      osmCalls += 1;
+      if (osmCalls === 1) {
+        return new Response(
+          "You requested too many nodes (limit is 50000). Either request a smaller area, or use planet.osm",
+          { status: 400 },
+        );
+      }
+      const body = quadrants[osmCalls - 2];
+      const status = osmCalls === 5 ? 400 : 200;
+      return new Response(body, {
+        status,
+        headers: { "Content-Type": status === 200 ? "application/xml" : "text/plain" },
+      });
+    });
+    const response = await invoke(magnoliaUrl());
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Overlay-Source")).toBe("osm-api");
+    const payload = await response.json();
+    expect(payload.elements.map((element) => `${element.type}/${element.id}`)).toEqual([
+      "way/501",
+      "way/601",
+      "way/701",
+      "way/801",
+    ]);
+    const hole = payload.elements[0];
+    expect(hole.nodes).toEqual([11, 12]);
+    expect(hole.geometry).toEqual([
+      { lat: 33.19, lon: -93.21 },
+      { lat: 33.2, lon: -93.2 },
+    ]);
+    expect(hole.tags).toEqual({ golf: "hole", ref: "1", par: "4" });
+    expect(hole.version).toBe(4);
+    expect(payload.elements.some((element) => element.tags && element.tags.highway)).toBe(false);
+    expect(payload.elements.some((element) => element.id === 901)).toBe(false);
+
+    const osm = fetchMock.mock.calls.filter((call) => String(call[0]).startsWith(OSM_MAP));
+    expect(osm).toHaveLength(5);
+    expect(fetchMock).toHaveBeenCalledTimes(7);
+    const parent = bboxFromCall(osm[0]);
+    const quads = osm.slice(1).map(bboxFromCall);
+    const midLat = (parent.south + parent.north) / 2;
+    const midLng = (parent.west + parent.east) / 2;
+    const close = (actual, expected) => expect(actual).toBeCloseTo(expected, 5);
+    close(quads[0].west, parent.west);
+    close(quads[0].south, parent.south);
+    close(quads[0].east, midLng);
+    close(quads[0].north, midLat);
+    close(quads[1].west, midLng);
+    close(quads[1].south, parent.south);
+    close(quads[1].east, parent.east);
+    close(quads[1].north, midLat);
+    close(quads[2].west, parent.west);
+    close(quads[2].south, midLat);
+    close(quads[2].east, midLng);
+    close(quads[2].north, parent.north);
+    close(quads[3].west, midLng);
+    close(quads[3].south, midLat);
+    close(quads[3].east, parent.east);
+    close(quads[3].north, parent.north);
+    expect(kv.get(DATA_KEY)?.value).toContain('"id":501');
+    expect(kv.has(NONE_KEY)).toBe(false);
+  });
+
+  it("returns busy when the editing API answers 509 or 429", async () => {
+    for (const [status, retry] of [[509, "75"], [429, "12"]]) {
+      kv.clear();
+      edge.clear();
+      osmInflight.clear();
+      fetchMock.mockClear();
+      mockOverpass(async (url) => {
+        if (String(url).startsWith(OSM_MAP)) {
+          return new Response("limited", { status, headers: { "Retry-After": retry } });
+        }
+        return new Response("gateway", { status: 504 });
+      });
+      const response = await invoke(magnoliaUrl());
+      expect(response.status, String(status)).toBe(503);
+      expect(await response.json()).toEqual({ error: "upstream_busy" });
+      expect(response.headers.get("Retry-After")).toBe(retry);
+      expect(fetchMock.mock.calls.filter((call) => String(call[0]).startsWith(OSM_MAP))).toHaveLength(1);
+      expect(kv.has(NONE_KEY)).toBe(false);
+      expect(kv.has(DATA_KEY)).toBe(false);
+      expect(edge.size).toBe(0);
+    }
+  });
+
+  it("does not call the editing API when a cached overlay exists", async () => {
+    const freshAt = Date.now() - 2 * DAY * 1000;
+    seedOverlay(MAGNOLIA_BODY, freshAt);
+    mockOverpass(async () => {
+      throw new Error("cached overlay must not call upstream");
+    });
+    const fresh = await invoke(magnoliaUrl());
+    expect(fresh.status).toBe(200);
+    expect(fresh.headers.get("X-Overlay-Cache")).toBe("HIT");
+    expect(fresh.headers.get("X-Overlay-Source")).toBeNull();
+    expect(await fresh.text()).toBe(MAGNOLIA_BODY);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    kv.clear();
+    edge.clear();
+    fetchMock.mockClear();
+    const staleAt = Date.now() - 31 * DAY * 1000;
+    seedOverlay(MAGNOLIA_BODY, staleAt);
+    mockOverpass(async (url) => {
+      expect(String(url).startsWith(OSM_MAP)).toBe(false);
+      return new Response("gateway", { status: 504 });
+    });
+    const stale = await invoke(magnoliaUrl());
+    expect(stale.status).toBe(200);
+    expect(stale.headers.get("X-Overlay-Cache")).toBe("STALE");
+    expect(stale.headers.get("X-Overlay-Source")).toBeNull();
+    expect(await stale.text()).toBe(MAGNOLIA_BODY);
+    expect(fetchMock.mock.calls.map((call) => String(call[0]).split("?")[0])).toEqual([PRIMARY, MIRROR]);
+    expect(kv.get(DATA_KEY).value).toBe(MAGNOLIA_BODY);
+    expect(kv.has(NONE_KEY)).toBe(false);
+  });
+
+  it("does not store a negative marker when the editing API backup is empty", async () => {
+    const xml = osmMapXml(`
+      ${osmNode(11, "33.19", "-93.21")}
+      ${osmWay(800, 1, [11], { highway: "service" })}
+    `);
+    mockOverpassDownThen(async () => new Response(xml, {
+      status: 200,
+      headers: { "Content-Type": "application/xml" },
+    }));
+    const response = await invoke(magnoliaUrl());
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: "upstream_busy" });
+    expect(kv.has(NONE_KEY)).toBe(false);
+    expect(kv.has(DATA_KEY)).toBe(false);
+    expect(edge.size).toBe(0);
+    expect(fetchMock.mock.calls.map((call) => String(call[0]).split("?")[0])).toEqual([PRIMARY, MIRROR, OSM_MAP]);
+
+    fetchMock.mockClear();
+    const again = await invoke(magnoliaUrl());
+    expect(again.status).toBe(503);
+    expect(fetchMock.mock.calls.map((call) => String(call[0]).split("?")[0])).toEqual([PRIMARY, MIRROR, OSM_MAP]);
+    expect(kv.has(NONE_KEY)).toBe(false);
   });
 
   it("refuses board GET and PUT for osm: keys", async () => {

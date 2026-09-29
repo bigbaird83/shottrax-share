@@ -26,6 +26,16 @@ import { handleLivePage, isLiveBoardCode } from "./live-page.js";
  *
  *   GET /osm/v1/overlay?courseId&lat&lng&radius
  *
+ * Fallback when nothing is cached: Overpass primary, then the mirror, then
+ * the OSM editing API (api.openstreetmap.org /api/0.6/map) for the bbox that
+ * covers lat/lng/radius. The editing API runs only after both Overpass
+ * endpoints time out, throw, or return 429 or 5xx. Its XML is filtered to the
+ * same golf ways and relations as overpassQuery and converted to that query's
+ * out geom JSON, so the phone's parseOverpassOverlay is unchanged. A fresh or
+ * stale cached overlay never triggers it. X-Overlay-Source: osm-api marks a
+ * backup body (generator "osm-api", which the phone ignores). An empty backup
+ * is not stored as osm:v1:none, because that answer is less trustworthy.
+ *
  * Golfapi quota (paid golfapi.io). GCA and OSM are not on this budget.
  * Periods are UTC: day YYYY-MM-DD, week ISO (YYYY-Www), month YYYY-MM.
  *
@@ -162,6 +172,7 @@ import { handleLivePage, isLiveBoardCode } from "./live-page.js";
 
 const OVERPASS_PRIMARY = "https://overpass-api.de/api/interpreter";
 const OVERPASS_MIRROR = "https://overpass.private.coffee/api/interpreter";
+const OSM_API_MAP = "https://api.openstreetmap.org/api/0.6/map";
 const OVERPASS_USER_AGENT = "shottracker-worker/1.0 (+https://shottrax-share.bcbaird.workers.dev)";
 /** KV keeps the only copy for a year. Freshness is fetchedAt, not expiration. */
 const OSM_KV_TTL = 60 * 60 * 24 * 365;
@@ -172,12 +183,16 @@ const OSM_NEGATIVE_TTL = 60 * 60 * 6;
 /** One refresh attempt per location per hour while the copy is stale. */
 const OSM_REFRESH_TTL = 60 * 60;
 /**
- * Primary gets about 11s. Timeout, throw, 429, and 504 then use the mirror
+ * Primary gets about 11s. Timeout, throw, 429, and 5xx then use the mirror
  * for whatever is left of the ~27s budget. A short backoff sits between them.
+ * If both fail that way, the editing API gets the same ~27s ceiling and the
+ * same ~11s cap per map call, including at most four quadrant fetches.
  */
 const OSM_BUDGET_MS = 27000;
 const OSM_PRIMARY_MS = 11000;
 const OSM_BACKOFF_MS = 400;
+/** One too-many-nodes 400 may add this many map calls. No further splits. */
+const OSM_API_MAX_EXTRA = 4;
 /** Nearby reuse: same radius, center within this many meters. Not for negative markers. */
 const OSM_NEAR_M = 600;
 /** Coarse index cell, in millionths of a degree. 10_000 millionths = 0.01 degree. */
@@ -186,7 +201,7 @@ const OSM_MAX_CELL_STEPS = 3;
 const EARTH_M = 6371000;
 const COURSE_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 
-/** In-isolate collapse so identical misses share one Overpass call. */
+/** In-isolate collapse so identical misses share one overlay load. */
 export const osmInflight = new Map();
 
 const GOLF_VENDORS = {
@@ -1842,6 +1857,29 @@ function overpassQuery(lat, lng, radiusM) {
 out geom;`;
 }
 
+/**
+ * Tag values overpassQuery selects. Ways include hole and cartpath; relations
+ * do not. Kept next to the query so a backup body matches what the phone parses.
+ */
+const OSM_WAY_GOLF = new Set([
+  "green",
+  "fairway",
+  "tee",
+  "hole",
+  "bunker",
+  "water_hazard",
+  "lateral_water_hazard",
+  "cartpath",
+]);
+const OSM_RELATION_GOLF = new Set([
+  "green",
+  "fairway",
+  "tee",
+  "bunker",
+  "water_hazard",
+  "lateral_water_hazard",
+]);
+
 function parseCoord(raw, min, max) {
   if (typeof raw !== "string") return null;
   const text = raw.trim();
@@ -1994,16 +2032,28 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Backup bodies carry generator "osm-api". Overpass bodies do not. The phone ignores it. */
+function overlaySource(body) {
+  if (typeof body !== "string" || !body.includes("osm-api")) return null;
+  try {
+    const payload = JSON.parse(body);
+    if (payload && payload.generator === "osm-api") return "osm-api";
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 function overlayDataResponse(body, cors, cacheState) {
-  return new Response(body, {
-    status: 200,
-    headers: {
-      ...cors,
-      "Content-Type": "application/json",
-      "Cache-Control": cacheState === "STALE" ? "no-store" : `public, max-age=${OSM_EDGE_TTL}`,
-      "X-Overlay-Cache": cacheState,
-    },
-  });
+  const headers = {
+    ...cors,
+    "Content-Type": "application/json",
+    "Cache-Control": cacheState === "STALE" ? "no-store" : `public, max-age=${OSM_EDGE_TTL}`,
+    "X-Overlay-Cache": cacheState,
+  };
+  const source = overlaySource(body);
+  if (source) headers["X-Overlay-Source"] = source;
+  return new Response(body, { status: 200, headers });
 }
 
 /** Edge copy carries fetchedAt so a hit older than 30 days is not served as fresh. */
@@ -2061,6 +2111,13 @@ async function callOverpass(url, query, timeoutMs) {
   }
 }
 
+/** null result is a timeout or thrown fetch. 429 and 5xx are the other Overpass failures that move on. */
+function overpassIsDown(result) {
+  if (!result) return true;
+  if (result.status === 429) return true;
+  return result.status >= 500 && result.status <= 599;
+}
+
 /** null → retry or give up. Empty is final: no golf features, do not retry. */
 function classifyAttempt(result) {
   if (!result || result.status !== 200) return null;
@@ -2075,7 +2132,386 @@ function classifyAttempt(result) {
   return { kind: "empty" };
 }
 
-async function fetchOverlayUpstream(query) {
+function decodeXml(value) {
+  return value.replace(/&(?:#(\d+)|#x([0-9a-fA-F]+)|lt|gt|quot|apos|amp);/g, (all, dec, hex) => {
+    if (dec || hex) {
+      const code = dec ? Number(dec) : parseInt(hex, 16);
+      if (!Number.isInteger(code) || code < 0 || code > 0x10ffff) return all;
+      try {
+        return String.fromCodePoint(code);
+      } catch {
+        return all;
+      }
+    }
+    if (all === "&lt;") return "<";
+    if (all === "&gt;") return ">";
+    if (all === "&quot;") return '"';
+    if (all === "&apos;") return "'";
+    return "&";
+  });
+}
+
+function xmlAttrs(source) {
+  const attrs = {};
+  if (!source) return attrs;
+  const re = /([A-Za-z_:][\w:.-]*)\s*=\s*"([^"]*)"/g;
+  let match;
+  while ((match = re.exec(source))) attrs[match[1]] = decodeXml(match[2]);
+  return attrs;
+}
+
+function parseOsmId(raw) {
+  if (typeof raw !== "string" || !/^\d+$/.test(raw)) return null;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1) return null;
+  return value;
+}
+
+function parseOsmVersion(raw) {
+  if (typeof raw !== "string" || !/^\d+$/.test(raw)) return null;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1) return null;
+  return value;
+}
+
+/** Pass through an OSM lat/lon. Out-of-range values are dropped, not rewritten. */
+function parseXmlCoord(raw, min, max) {
+  if (typeof raw !== "string" || raw.trim() === "") return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < min || value > max) return null;
+  return value;
+}
+
+function xmlChildAttrs(inner, name) {
+  const found = [];
+  if (!inner) return found;
+  const re = new RegExp(`<${name}\\b([^>]*?)\\/?>`, "g");
+  let match;
+  while ((match = re.exec(inner))) found.push(xmlAttrs(match[1]));
+  return found;
+}
+
+function xmlTags(inner) {
+  const tags = {};
+  for (const attrs of xmlChildAttrs(inner, "tag")) {
+    if (!attrs.k) continue;
+    tags[attrs.k] = attrs.v ?? "";
+  }
+  return tags;
+}
+
+function xmlNdRefs(inner) {
+  const refs = [];
+  for (const attrs of xmlChildAttrs(inner, "nd")) {
+    const id = parseOsmId(attrs.ref);
+    if (id != null) refs.push(id);
+  }
+  return refs;
+}
+
+function xmlMembers(inner) {
+  const members = [];
+  for (const attrs of xmlChildAttrs(inner, "member")) {
+    if (attrs.type !== "node" && attrs.type !== "way" && attrs.type !== "relation") continue;
+    const ref = parseOsmId(attrs.ref);
+    if (ref == null) continue;
+    members.push({ type: attrs.type, ref, role: attrs.role ?? "" });
+  }
+  return members;
+}
+
+function parseOsmMapXml(xml) {
+  const nodes = new Map();
+  const ways = [];
+  const relations = [];
+  if (typeof xml !== "string" || xml.length === 0) return { nodes, ways, relations };
+  const re = /<(node|way|relation)\b([^>]*?)(\/?)>/g;
+  let match;
+  while ((match = re.exec(xml))) {
+    const kind = match[1];
+    const attrs = xmlAttrs(match[2]);
+    let inner = "";
+    if (match[3] !== "/") {
+      const close = `</${kind}>`;
+      const end = xml.indexOf(close, re.lastIndex);
+      if (end < 0) break;
+      inner = xml.slice(re.lastIndex, end);
+      re.lastIndex = end + close.length;
+    }
+    if (attrs.visible === "false") continue;
+    const id = parseOsmId(attrs.id);
+    if (id == null) continue;
+    const version = parseOsmVersion(attrs.version);
+    if (kind === "node") {
+      const lat = parseXmlCoord(attrs.lat, -90, 90);
+      const lon = parseXmlCoord(attrs.lon, -180, 180);
+      if (lat == null || lon == null) continue;
+      nodes.set(id, { lat, lon });
+      continue;
+    }
+    const tags = xmlTags(inner);
+    if (kind === "way") ways.push({ id, version, refs: xmlNdRefs(inner), tags });
+    else relations.push({ id, version, members: xmlMembers(inner), tags });
+  }
+  return { nodes, ways, relations };
+}
+
+function geometryBounds(points) {
+  let minlat = Infinity;
+  let minlon = Infinity;
+  let maxlat = -Infinity;
+  let maxlon = -Infinity;
+  for (const point of points) {
+    if (point.lat < minlat) minlat = point.lat;
+    if (point.lon < minlon) minlon = point.lon;
+    if (point.lat > maxlat) maxlat = point.lat;
+    if (point.lon > maxlon) maxlon = point.lon;
+  }
+  if (!Number.isFinite(minlat)) return null;
+  return { minlat, minlon, maxlat, maxlon };
+}
+
+/** Coordinates only for nd refs the map response actually included. */
+function wayGeometry(refs, nodes) {
+  const nodeIds = [];
+  const geometry = [];
+  for (const ref of refs) {
+    const node = nodes.get(ref);
+    if (!node) continue;
+    nodeIds.push(ref);
+    geometry.push({ lat: node.lat, lon: node.lon });
+  }
+  return { nodeIds, geometry };
+}
+
+function withVersion(element, version) {
+  if (version == null) return element;
+  const ordered = {};
+  for (const [key, value] of Object.entries(element)) {
+    ordered[key] = value;
+    if (key === "id") ordered.version = version;
+  }
+  if (!Object.prototype.hasOwnProperty.call(ordered, "version")) ordered.version = version;
+  return ordered;
+}
+
+function wayToElement(way, nodes) {
+  if (!way.tags || !OSM_WAY_GOLF.has(way.tags.golf)) return null;
+  const { nodeIds, geometry } = wayGeometry(way.refs, nodes);
+  if (geometry.length === 0) return null;
+  const element = {
+    type: "way",
+    id: way.id,
+    nodes: nodeIds,
+    geometry,
+    tags: way.tags,
+  };
+  const bounds = geometryBounds(geometry);
+  if (bounds) element.bounds = bounds;
+  return withVersion(element, way.version);
+}
+
+function relationToElement(relation, waysById, nodes) {
+  if (!relation.tags || !OSM_RELATION_GOLF.has(relation.tags.golf)) return null;
+  const members = [];
+  const points = [];
+  for (const member of relation.members) {
+    const entry = { type: member.type, ref: member.ref, role: member.role };
+    if (member.type === "way") {
+      const way = waysById.get(member.ref);
+      if (way) {
+        const { geometry } = wayGeometry(way.refs, nodes);
+        if (geometry.length > 0) {
+          entry.geometry = geometry;
+          points.push(...geometry);
+        }
+      }
+    } else if (member.type === "node") {
+      const node = nodes.get(member.ref);
+      if (node) {
+        entry.lat = node.lat;
+        entry.lon = node.lon;
+        points.push(node);
+      }
+    }
+    members.push(entry);
+  }
+  const element = {
+    type: "relation",
+    id: relation.id,
+    members,
+    tags: relation.tags,
+  };
+  const bounds = geometryBounds(points);
+  if (bounds) element.bounds = bounds;
+  return withVersion(element, relation.version);
+}
+
+function compareOverlayElements(a, b) {
+  if (a.type !== b.type) return a.type === "way" ? -1 : 1;
+  return a.id - b.id;
+}
+
+/** Same element shape as Overpass `out geom`: geometry on ways, not a node list. */
+function osmMapToElements(xml) {
+  const { nodes, ways, relations } = parseOsmMapXml(xml);
+  const waysById = new Map();
+  for (const way of ways) waysById.set(way.id, way);
+  const elements = [];
+  for (const way of ways) {
+    const element = wayToElement(way, nodes);
+    if (element) elements.push(element);
+  }
+  for (const relation of relations) {
+    const element = relationToElement(relation, waysById, nodes);
+    if (element) elements.push(element);
+  }
+  elements.sort(compareOverlayElements);
+  return elements;
+}
+
+function elementGeometryCount(element) {
+  if (Array.isArray(element.geometry)) return element.geometry.length;
+  if (!Array.isArray(element.members)) return 0;
+  let count = 0;
+  for (const member of element.members) {
+    if (Array.isArray(member.geometry)) count += member.geometry.length;
+    else if (Number.isFinite(member.lat) && Number.isFinite(member.lon)) count += 1;
+  }
+  return count;
+}
+
+function mergeElement(merged, element) {
+  const key = `${element.type}:${element.id}`;
+  const prev = merged.get(key);
+  if (!prev || elementGeometryCount(element) > elementGeometryCount(prev)) merged.set(key, element);
+}
+
+/**
+ * Overpass JSON document. generator is not part of the phone parser; it marks
+ * this body as the editing-API backup after it is cached.
+ */
+function osmApiDocument(elements) {
+  return JSON.stringify({
+    version: 0.6,
+    generator: "osm-api",
+    elements,
+    osm3s: {
+      copyright: "The data included in this document is from www.openstreetmap.org. The data is made available under ODbL.",
+    },
+  });
+}
+
+function formatBboxCoord(value) {
+  if (!Number.isFinite(value)) return "0";
+  const rounded = Number(value.toFixed(7));
+  if (rounded === 0) return "0";
+  return String(rounded);
+}
+
+function formatBboxParam(bbox) {
+  return [bbox.west, bbox.south, bbox.east, bbox.north].map(formatBboxCoord).join(",");
+}
+
+/** Circle around the request, in degrees. Same meters-per-degree figure as the cell index. */
+function coveringBbox(lat, lng, radiusM) {
+  const latDelta = radiusM / 111320;
+  const cos = Math.cos((lat * Math.PI) / 180);
+  const lngDelta = radiusM / Math.max(111320 * Math.abs(cos), 1);
+  return {
+    west: Math.max(-180, lng - lngDelta),
+    south: Math.max(-90, lat - latDelta),
+    east: Math.min(180, lng + lngDelta),
+    north: Math.min(90, lat + latDelta),
+  };
+}
+
+function splitBbox(bbox) {
+  const midLat = (bbox.south + bbox.north) / 2;
+  const midLng = (bbox.west + bbox.east) / 2;
+  if (!(midLat > bbox.south && midLat < bbox.north && midLng > bbox.west && midLng < bbox.east)) return [];
+  return [
+    { west: bbox.west, south: bbox.south, east: midLng, north: midLat },
+    { west: midLng, south: bbox.south, east: bbox.east, north: midLat },
+    { west: bbox.west, south: midLat, east: midLng, north: bbox.north },
+    { west: midLng, south: midLat, east: bbox.east, north: bbox.north },
+  ];
+}
+
+function tooManyNodes(result) {
+  return Boolean(result && result.status === 400 && typeof result.text === "string" && /too many nodes/i.test(result.text));
+}
+
+function osmIsLimited(result) {
+  return Boolean(result && (result.status === 509 || result.status === 429));
+}
+
+async function callOsmMap(bbox, timeoutMs) {
+  if (timeoutMs < 200) return null;
+  if (!(bbox.west < bbox.east && bbox.south < bbox.north)) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${OSM_API_MAP}?bbox=${formatBboxParam(bbox)}`, {
+      method: "GET",
+      headers: {
+        Accept: "application/xml, text/xml",
+        "User-Agent": OVERPASS_USER_AGENT,
+      },
+      signal: controller.signal,
+    });
+    return { response, status: response.status, text: await response.text() };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function mapCallBudget(deadline) {
+  return Math.min(OSM_PRIMARY_MS, deadline - Date.now());
+}
+
+function elementsHaveGolf(elements) {
+  return elements.some((element) => element && element.tags && typeof element.tags.golf === "string" && element.tags.golf !== "");
+}
+
+/**
+ * Last resort after Overpass. `limited` is 509 or 429. `miss` is anything else
+ * that must not be cached as an empty overlay.
+ */
+async function fetchOsmApiOverlay(lat, lng, radius) {
+  const deadline = Date.now() + OSM_BUDGET_MS;
+  const bbox = coveringBbox(lat, lng, radius);
+  const first = await callOsmMap(bbox, mapCallBudget(deadline));
+  if (osmIsLimited(first)) {
+    const header = first.response ? first.response.headers.get("Retry-After") : null;
+    return { kind: "limited", retryAfter: cleanRetryAfter(header) };
+  }
+  if (first && first.status === 200) {
+    const elements = osmMapToElements(first.text);
+    if (elementsHaveGolf(elements)) return { kind: "data", body: osmApiDocument(elements) };
+    return { kind: "miss" };
+  }
+  if (!tooManyNodes(first)) return { kind: "miss" };
+
+  const merged = new Map();
+  const quadrants = splitBbox(bbox).slice(0, OSM_API_MAX_EXTRA);
+  for (const quad of quadrants) {
+    const result = await callOsmMap(quad, mapCallBudget(deadline));
+    if (osmIsLimited(result)) {
+      const header = result.response ? result.response.headers.get("Retry-After") : null;
+      return { kind: "limited", retryAfter: cleanRetryAfter(header) };
+    }
+    if (!result || result.status !== 200) continue;
+    for (const element of osmMapToElements(result.text)) mergeElement(merged, element);
+  }
+  const elements = [...merged.values()].sort(compareOverlayElements);
+  if (!elementsHaveGolf(elements)) return { kind: "miss" };
+  return { kind: "data", body: osmApiDocument(elements) };
+}
+
+async function fetchOverlayUpstream(query, backup) {
   const deadline = Date.now() + OSM_BUDGET_MS;
   const primaryBudget = Math.min(OSM_PRIMARY_MS, Math.max(0, deadline - Date.now()));
   const first = await callOverpass(OVERPASS_PRIMARY, query, primaryBudget);
@@ -2083,8 +2519,8 @@ async function fetchOverlayUpstream(query) {
   if (firstHit) return firstHit;
 
   const firstRetry = first && first.response ? first.response.headers.get("Retry-After") : null;
-  // No response means the primary timed out or threw. Those, plus 429 and 504, use the mirror.
-  const useMirror = !first || first.status === 429 || first.status === 504;
+  // No response means the primary timed out or threw. Those, plus 429 and 5xx, use the mirror.
+  const useMirror = overpassIsDown(first);
   const pause = Math.min(OSM_BACKOFF_MS, Math.max(0, deadline - Date.now() - 500));
   if (pause > 0) await sleep(pause);
   const remaining = deadline - Date.now();
@@ -2096,10 +2532,29 @@ async function fetchOverlayUpstream(query) {
   const secondHit = classifyAttempt(second);
   if (secondHit) return secondHit;
   const secondRetry = second && second.response ? second.response.headers.get("Retry-After") : null;
-  return {
-    kind: "busy",
-    retryAfter: cleanRetryAfter(secondRetry) || cleanRetryAfter(firstRetry) || "30",
-  };
+  const overpassRetry = cleanRetryAfter(secondRetry) || cleanRetryAfter(firstRetry) || "30";
+  // Editing API only after the mirror was actually tried and both ends failed the same way.
+  // A cached refresh does not pass backup, so a stale copy never reaches this call.
+  if (
+    backup
+    && useMirror
+    && overpassIsDown(first)
+    && overpassIsDown(second)
+    && Number.isFinite(backup.lat)
+    && Number.isFinite(backup.lng)
+    && Number.isFinite(backup.radius)
+  ) {
+    try {
+      const fromApi = await fetchOsmApiOverlay(backup.lat, backup.lng, backup.radius);
+      if (fromApi.kind === "data") return { kind: "data", body: fromApi.body };
+      if (fromApi.kind === "limited") {
+        return { kind: "busy", retryAfter: fromApi.retryAfter || overpassRetry };
+      }
+    } catch {
+      // An editing-API failure is the same busy outcome as Overpass. Do not cache it.
+    }
+  }
+  return { kind: "busy", retryAfter: overpassRetry };
 }
 
 /** Remember where a positive overlay was stored so a nearby pin can find it. */
@@ -2160,6 +2615,7 @@ async function readPositive(boards, dataKey) {
 /**
  * Ask Overpass for a newer overlay. Success overwrites the positive entry.
  * Busy, timeout, or empty leaves it untouched. Returns the new body, or null.
+ * A stale copy is never a reason to call the editing API.
  */
 async function refreshStoredOverlay({ boards, cache, edgeKey, dataKey, query, cors, lat, lng, radius }) {
   try {
@@ -2339,7 +2795,7 @@ async function loadOverlay({
   // 404 for this location only and is never indexed for nearby reuse.
   if ((await boards.get(noneKey)) != null) return { kind: "empty", cacheState: "HIT" };
 
-  const upstream = await fetchOverlayUpstream(query);
+  const upstream = await fetchOverlayUpstream(query, { lat, lng, radius });
   if (upstream.kind === "data") {
     const fetchedAt = Date.now();
     await boards.put(dataKey, upstream.body, positivePutOptions(fetchedAt));

@@ -131,7 +131,7 @@ https://shottrax-share.bcbaird.workers.dev/gca/v1/courses?q=magnolia
 
 ## OSM overlay proxy
 
-Phones call this Worker instead of `https://overpass-api.de/api/interpreter`. The public Overpass server asks apps not to send heavy direct traffic, and it often answers `504` or `429`. The Worker builds the query itself, the same golf ways and relations as ShotTraxx `overpassQuery` in `src/course/osmOverlay.ts` (`[out:json][timeout:25]`, `around` the point, `out geom`). Clients never send Overpass QL, so this is not an open proxy. The JSON body is returned unchanged for the app's `parseOverpassOverlay`.
+Phones call this Worker instead of `https://overpass-api.de/api/interpreter`. The public Overpass server asks apps not to send heavy direct traffic, and it often answers `504` or `429`. The Worker builds the query itself, the same golf ways and relations as ShotTraxx `overpassQuery` in `src/course/osmOverlay.ts` (`[out:json][timeout:25]`, `around` the point, `out geom`). Clients never send Overpass QL, so this is not an open proxy. An Overpass JSON body is returned unchanged for the app's `parseOverpassOverlay`. When both Overpass endpoints are down and nothing is cached, a last-resort OSM editing API response is converted into that same `out geom` JSON.
 
 ```
 GET /osm/v1/overlay?courseId=<id>&lat=<lat>&lng=<lng>&radius=<meters>
@@ -144,14 +144,14 @@ GET /osm/v1/overlay?courseId=<id>&lat=<lat>&lng=<lng>&radius=<meters>
 | `lng` | Required. Finite, -180 through 180 |
 | `radius` | Optional integer meters. 200–2000, default 1800 |
 
-The phone gets `200` `Content-Type: application/json` and the raw Overpass body, with `X-Overlay-Cache` of `HIT`, `HIT-NEAR`, `MISS`, `REFRESHED`, or `STALE`. CORS matches share-board and `/meta/` routes (`Access-Control-Allow-Origin: *`). The body is never a cache wrapper.
+The phone gets `200` `Content-Type: application/json` and the overlay JSON, with `X-Overlay-Cache` of `HIT`, `HIT-NEAR`, `MISS`, `REFRESHED`, or `STALE`. A body that came from the editing API also sends `X-Overlay-Source: osm-api`. CORS matches share-board and `/meta/` routes (`Access-Control-Allow-Origin: *`). The body is never a cache wrapper.
 
 `courseId` is required and is kept for clients. It is not part of the cache key. The same rounded point and radius share one entry no matter which course id the phone sends.
 
 Cache key: `osm:v1:<lat to 4 decimals>,<lng to 4 decimals>:<radius>`. A successful response (at least one element with a `golf` tag, and no timeout or runtime `remark`) is stored in `BOARDS` as that raw JSON. `expirationTtl` is 365 days so the entry is not deleted on a 30-day timer. `fetchedAt` is KV metadata.
 
 - Younger than 30 days: `X-Overlay-Cache: HIT`. Overpass is not called.
-- 30 days or older: the phone gets the stored overlay immediately with `X-Overlay-Cache: STALE`. The refresh runs in the background (`ctx.waitUntil`). A new non-empty overlay overwrites the entry; the next request is `HIT`. If Overpass is busy, times out, errors, or returns no golf features, the stored overlay is left unchanged. A refresh never drops a saved overlay and never answers `503` or `404` while an older copy exists.
+- 30 days or older: the phone gets the stored overlay immediately with `X-Overlay-Cache: STALE`. The refresh runs in the background (`ctx.waitUntil`). A new non-empty overlay overwrites the entry; the next request is `HIT`. If Overpass is busy, times out, errors, or returns no golf features, the stored overlay is left unchanged. A refresh never drops a saved overlay, never answers `503` or `404` while an older copy exists, and never calls the editing API.
 
 Before a background refresh, the Worker writes `osm:v1:refreshing:<same location key>` with a 1-hour TTL. While that marker exists, another request for that location serves `STALE` and does not call Overpass. `GET` / `PUT` for that key is refused like any other `osm:` key. Without `ctx.waitUntil` the Worker waits for the refresh instead, and a successful one is `X-Overlay-Cache: REFRESHED`.
 
@@ -161,9 +161,19 @@ Older entries were stored as `osm:v1:<courseId>:<lat>,<lng>:<radius>`. A miss do
 
 `caches.default` holds a copy for 1 day, with `fetchedAt` on that cached response, so an edge hit cannot keep serving an overlay past its refresh. A `STALE` answer is not written to the edge cache. A hit does not call Overpass. Identical misses in the same isolate share one upstream call.
 
-When nothing is stored yet, `429`, `5xx`, timeouts, network errors, bad JSON, and an Overpass `200` whose `remark` reports a runtime error or timeout (Overpass uses `200` plus `remark` when a query times out) are not cached. The phone gets `503` `{ "error": "upstream_busy" }` and `Retry-After` (the upstream value when it sent one, otherwise 30). The primary attempt is about 11 seconds. If it times out, throws, or returns `429` or `504`, the retry goes to `https://overpass.private.coffee/api/interpreter` with the time left in the ~27 second budget. Other failed responses retry the primary. The upstream `User-Agent` is `shottracker-worker/1.0 (+https://shottrax-share.bcbaird.workers.dev)`.
+When nothing is stored yet, `429`, `5xx`, timeouts, network errors, bad JSON, and an Overpass `200` whose `remark` reports a runtime error or timeout (Overpass uses `200` plus `remark` when a query times out) are not cached. The phone gets `503` `{ "error": "upstream_busy" }` and `Retry-After` (the upstream value when it sent one, otherwise 30). The primary attempt is about 11 seconds. If it times out, throws, or returns `429` or `5xx`, the retry goes to `https://overpass.private.coffee/api/interpreter` with the time left in the ~27 second budget. Other failed responses retry the primary. The upstream `User-Agent` is `shottracker-worker/1.0 (+https://shottrax-share.bcbaird.workers.dev)`.
 
-A valid response with no golf features, and no exact or nearby overlay already stored, is `404` `{ "error": "no_overlay" }`. That negative marker is stored for 6 hours at `osm:v1:none:<lat>,<lng>:<radius>` and only ever answers `404` for that exact location. It is not written when a positive overlay exists, and it does not block a later `HIT-NEAR`.
+Fallback order on a cache miss:
+
+1. `https://overpass-api.de/api/interpreter`
+2. `https://overpass.private.coffee/api/interpreter` when the primary times out, throws, or returns `429` or `5xx`
+3. `https://api.openstreetmap.org/api/0.6/map?bbox=west,south,east,north` only when that mirror attempt also times out, throws, or returns `429` or `5xx`
+
+The editing API is a last resort. It is not called when a fresh or stale cached overlay exists, including a background refresh of a stale copy. The bbox is the one that covers the request lat/lng/radius. The request sends the same User-Agent. The map call answers XML; the Worker keeps only the golf ways and relations `overpassQuery` would have matched (`golf` of green, fairway, tee, hole, bunker, water_hazard, lateral_water_hazard, cartpath on ways; the same list without hole and cartpath on relations) and drops every other element. Ways come back in the `out geom` shape: id, version, tags, node refs, and a `geometry` array of the lat/lon OSM returned for those refs. Relation members carry the same geometry when the map included the member way or node. Nothing is invented. The JSON is stored under the same KV and edge keys as an Overpass hit. `generator` is `osm-api`, which the phone ignores, and the response includes `X-Overlay-Source: osm-api` so a cached copy can still be told apart. The editing API has the same ~27 second ceiling, and each map call is capped at about 11 seconds.
+
+The map API refuses a bbox over 0.25 square degrees or more than 50,000 nodes with HTTP 400. On a 400 whose body says there are too many nodes, the Worker splits that bbox into four quadrants, fetches each, and merges elements with duplicate ids removed. That split is at most four extra calls and does not split again. HTTP 509 or 429 from the editing API is the same `503` `{ "error": "upstream_busy" }` with `Retry-After` (the editing API value when it sent one, otherwise the Overpass value, otherwise 30).
+
+A valid Overpass response with no golf features, and no exact or nearby overlay already stored, is `404` `{ "error": "no_overlay" }`. That negative marker is stored for 6 hours at `osm:v1:none:<lat>,<lng>:<radius>` and only ever answers `404` for that exact location. It is not written when a positive overlay exists, and it does not block a later `HIT-NEAR`. An empty or unusable editing-API backup does not write that key. That answer is less trustworthy than Overpass, so the phone gets `503` and the next miss can try again.
 
 Other overlay errors: `bad_request` (400), `method_not_allowed` (405), `unknown_route` (404), `boards_not_configured` (503). No new secrets, env vars, or KV namespaces.
 
@@ -181,7 +191,7 @@ Merging to `main` deploys the Worker. When that Workers Builds run finishes, che
 curl -D - "https://shottrax-share.bcbaird.workers.dev/osm/v1/overlay?courseId=2fa21943-abaa-43a4-a90f-cb06c82216b4&lat=33.1940935&lng=-93.2077463&radius=1800"
 ```
 
-Expect `200` and golf features. Run it again and expect `X-Overlay-Cache: HIT`. If that course was already stored under the old course-id key, this same id adopts it and the first response can already be `HIT`.
+Expect `200` and golf features. Run it again and expect `X-Overlay-Cache: HIT`. If that course was already stored under the old course-id key, this same id adopts it and the first response can already be `HIT`. A miss that had to use the editing API is still `200`, with `X-Overlay-Source: osm-api`. The next request is `HIT` and keeps that header.
 
 Then the GCA pin, within 600 m of that point, should reuse that copy:
 
