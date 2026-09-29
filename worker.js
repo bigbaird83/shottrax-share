@@ -133,6 +133,17 @@ import { handleLivePage, isLiveBoardCode } from "./live-page.js";
  *   GET  /v1/course-reports                         admin
  *   GET  /v1/course-reports/{clientReportId}        admin, one record
  *   POST /v1/course-reports/{clientReportId}/review admin, review a contribution
+ *   POST /v1/course-reports/scorecard-photo         raw JPEG, returns {photoId}
+ *   GET  /v1/course-reports/scorecard-photo/{photoId} admin, the JPEG
+ *
+ * Scorecard photo: POST needs X-Install-Id (422 installId), a body of at most
+ * 2 MB (413), and a JPEG that parses (415 not_jpeg). APP1 (EXIF, XMP), APP13
+ * and COM segments are removed before it is stored. Stored at cr:photo:<id>
+ * with the 180-day report expiry. It counts against its own daily counters
+ * (cr:n:photo:*) with the same limits as reports. A report may carry photoId;
+ * it must exist and belong to the same X-Install-Id or the report is 422
+ * field photoId. Rejecting or rewarding a review deletes the photo at once and
+ * sets photoDeleted:true on the report. Nothing here is public.
  *
  * POST JSON, 4096 bytes max. 201 {ok:true,id} stores a new report. The same
  * clientReportId is 200 {ok:true,id,duplicate:true} and does not write again.
@@ -3195,6 +3206,8 @@ const COURSE_REPORT_TTL = 60 * 60 * 24 * 180;
 /** KV deletes the address this long after accept, even if nobody reviews it. */
 const COURSE_REPORT_EMAIL_TTL = 60 * 60 * 24 * 365;
 const COURSE_REPORT_BODY_MAX = 4096;
+const SCORECARD_PHOTO_MAX = 2 * 1024 * 1024;
+const SCORECARD_PHOTO_PREFIX = "cr:photo:";
 const COURSE_REPORT_IP_DAY_DEFAULT = 30;
 const COURSE_REPORT_DEVICE_DAY_DEFAULT = 20;
 const COURSE_REPORT_REASONS = new Set([
@@ -3509,6 +3522,11 @@ function parseCourseReport(payload) {
     record.shown = normalizeShown(payload.shown);
   }
 
+  if (Object.prototype.hasOwnProperty.call(payload, "photoId") && payload.photoId != null) {
+    if (!validClientReportId(payload.photoId)) return invalidField("photoId");
+    record.photoId = payload.photoId.toLowerCase();
+  }
+
   const contribution = parseHoleContribution(payload, reasons);
   if (!contribution.ok) return contribution;
   if (contribution.present) {
@@ -3613,12 +3631,12 @@ function courseReportCounterTtl(now) {
  * Duplicates are decided before this runs, so a replay does not consume a slot.
  * KV increments are not atomic; a burst can overshoot by a little.
  */
-async function courseReportRateLimit(boards, env, request, installId, now, cors) {
+async function courseReportRateLimit(boards, env, request, installId, now, cors, scope = "") {
   const limits = readCourseReportLimits(env);
   const day = now.toISOString().slice(0, 10);
   const ipHash = await readIpHash(request);
-  const ipKey = ipHash ? `cr:n:ip:${ipHash}:${day}` : null;
-  const devKey = installId ? `cr:n:dev:${installId}:${day}` : null;
+  const ipKey = ipHash ? `cr:n:${scope}ip:${ipHash}:${day}` : null;
+  const devKey = installId ? `cr:n:${scope}dev:${installId}:${day}` : null;
   const ipCount = ipKey ? await readCourseReportCount(boards, ipKey) : 0;
   const devCount = devKey ? await readCourseReportCount(boards, devKey) : 0;
   if ((ipKey && ipCount >= limits.ipDay) || (devKey && devCount >= limits.deviceDay)) {
@@ -3724,6 +3742,111 @@ async function readCourseReportPayload(request, cors) {
   }
 }
 
+function scorecardPhotoKey(photoId) {
+  return `${SCORECARD_PHOTO_PREFIX}${photoId}`;
+}
+
+/**
+ * Copy a JPEG without the metadata segments that can carry a location or a
+ * name: APP1 (EXIF, XMP), APP13 (IPTC) and COM. Every other segment is kept,
+ * including APP0 and the ICC profile in APP2, so colors do not change.
+ * Returns null when the bytes are not a well-formed JPEG up to the scan.
+ */
+function stripJpegMetadata(bytes) {
+  if (!(bytes instanceof Uint8Array) || bytes.length < 4) return null;
+  if (bytes[0] !== 0xff || bytes[1] !== 0xd8 || bytes[2] !== 0xff) return null;
+  const out = [bytes.subarray(0, 2)];
+  let i = 2;
+  while (i < bytes.length) {
+    if (bytes[i] !== 0xff) return null;
+    while (i < bytes.length && bytes[i] === 0xff) i++;
+    if (i >= bytes.length) return null;
+    const marker = bytes[i];
+    i++;
+    if (marker === 0xd9) return null;
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+      out.push(Uint8Array.of(0xff, marker));
+      continue;
+    }
+    if (i + 2 > bytes.length) return null;
+    const length = (bytes[i] << 8) | bytes[i + 1];
+    if (length < 2 || i + length > bytes.length) return null;
+    if (marker === 0xda) {
+      // Start of scan: the entropy-coded data follows and is copied as is.
+      out.push(bytes.subarray(i - 2, bytes.length));
+      break;
+    }
+    const drop = marker === 0xe1 || marker === 0xed || marker === 0xfe;
+    if (!drop) out.push(bytes.subarray(i - 2, i + length));
+    i += length;
+    if (i >= bytes.length) return null;
+  }
+  let total = 0;
+  for (const part of out) total += part.length;
+  if (total < 4) return null;
+  const joined = new Uint8Array(total);
+  let at = 0;
+  for (const part of out) {
+    joined.set(part, at);
+    at += part.length;
+  }
+  // The scan must end with the end-of-image marker.
+  if (joined[total - 2] !== 0xff || joined[total - 1] !== 0xd9) return null;
+  return joined;
+}
+
+async function handleScorecardPhotoPost(request, env, cors) {
+  const install = readCourseReportInstallId(request);
+  if (!install.ok || !install.id) return golfJson(422, { error: "invalid", field: "installId" }, cors);
+  const declared = Number(request.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > SCORECARD_PHOTO_MAX) {
+    return golfJson(413, { error: "too_large" }, cors);
+  }
+  const boards = boardsBinding(env);
+  if (!boards) return golfJson(503, { error: "boards_not_configured" }, cors);
+  const raw = new Uint8Array(await request.arrayBuffer());
+  if (raw.length > SCORECARD_PHOTO_MAX) return golfJson(413, { error: "too_large" }, cors);
+  if (raw.length < 4 || raw[0] !== 0xff || raw[1] !== 0xd8 || raw[2] !== 0xff) {
+    return golfJson(415, { error: "not_jpeg" }, cors);
+  }
+  const clean = stripJpegMetadata(raw);
+  if (!clean) return golfJson(415, { error: "not_jpeg" }, cors);
+
+  const now = new Date();
+  const rate = await courseReportRateLimit(boards, env, request, install.id, now, cors, "photo:");
+  if (rate.limited) return rate.response;
+  const photoId = crypto.randomUUID();
+  await boards.put(scorecardPhotoKey(photoId), clean, {
+    expirationTtl: COURSE_REPORT_TTL,
+    metadata: { installId: install.id, bytes: clean.length, uploadedAt: now.toISOString() },
+  });
+  await rate.commit();
+  return golfJson(201, { ok: true, photoId }, cors);
+}
+
+async function handleScorecardPhotoGet(request, env, cors, photoId) {
+  const denied = await authorizeCourseReports(request, env, cors);
+  if (denied) return denied;
+  const boards = boardsBinding(env);
+  if (!boards) return golfJson(503, { error: "boards_not_configured" }, cors);
+  const found = await boards.getWithMetadata(scorecardPhotoKey(photoId), "arrayBuffer");
+  if (!found || found.value == null) return golfJson(404, { error: "not_found" }, cors);
+  return new Response(found.value, {
+    status: 200,
+    headers: {
+      ...cors,
+      "Content-Type": "image/jpeg",
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
+
+async function deleteScorecardPhoto(boards, photoId) {
+  if (!boards || typeof boards.delete !== "function" || !photoId) return;
+  await boards.delete(scorecardPhotoKey(photoId));
+}
+
 async function handleCourseReportPost(request, env, cors) {
   const body = await readCourseReportPayload(request, cors);
   if (!body.ok) return body.response;
@@ -3741,6 +3864,14 @@ async function handleCourseReportPost(request, env, cors) {
   const existing = await boards.get(markerKey);
   if (existing != null) {
     return golfJson(200, { ok: true, id: clientReportId, duplicate: true }, cors);
+  }
+
+  if (parsed.record.photoId) {
+    const photo = await boards.getWithMetadata(scorecardPhotoKey(parsed.record.photoId), "arrayBuffer");
+    const owner = photo && photo.metadata && photo.metadata.installId;
+    if (!photo || photo.value == null || (install.id && owner && owner !== install.id)) {
+      return golfJson(422, { error: "invalid", field: "photoId" }, cors);
+    }
   }
 
   const now = new Date();
@@ -3853,6 +3984,15 @@ function courseReportRoute(pathname) {
   const rest = path.slice("/v1/course-reports/".length);
   if (!rest) return { ok: false };
   const parts = rest.split("/");
+  if (parts[0] === "scorecard-photo") {
+    if (parts.length === 1) return { ok: true, id: null, action: "photo" };
+    if (parts.length === 2) {
+      const photoId = decodeCourseReportId(parts[1]);
+      if (!photoId) return { ok: false };
+      return { ok: true, id: photoId.toLowerCase(), action: "photo-get" };
+    }
+    return { ok: false };
+  }
   if (parts.length === 1) {
     const id = decodeCourseReportId(parts[0]);
     if (!id) return { ok: false };
@@ -3954,6 +4094,11 @@ async function handleCourseReportReview(request, env, cors, clientReportId) {
   await boards.put(loaded.key, JSON.stringify(record), { expirationTtl: COURSE_REPORT_TTL });
   if (decision.status === "rejected" || decision.status === "rewarded") {
     await deleteContributionEmail(boards, clientReportId);
+    if (record.photoId) {
+      await deleteScorecardPhoto(boards, record.photoId);
+      record.photoDeleted = true;
+      await boards.put(loaded.key, JSON.stringify(record), { expirationTtl: COURSE_REPORT_TTL });
+    }
   }
   return golfJson(200, await presentCourseReport(boards, record), cors);
 }
@@ -3961,6 +4106,14 @@ async function handleCourseReportReview(request, env, cors, clientReportId) {
 async function handleCourseReports(request, url, env, cors) {
   const parsed = courseReportRoute(url.pathname);
   if (!parsed.ok) return golfJson(404, { error: "unknown_route" }, cors);
+  if (parsed.action === "photo") {
+    if (request.method === "POST") return handleScorecardPhotoPost(request, env, cors);
+    return golfJson(405, { error: "method_not_allowed" }, cors);
+  }
+  if (parsed.action === "photo-get") {
+    if (request.method === "GET") return handleScorecardPhotoGet(request, env, cors, parsed.id);
+    return golfJson(405, { error: "method_not_allowed" }, cors);
+  }
   if (request.method === "GET") {
     if (parsed.action) return golfJson(405, { error: "method_not_allowed" }, cors);
     return handleCourseReportsGet(request, url, env, cors, parsed.id);
