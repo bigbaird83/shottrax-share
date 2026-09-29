@@ -142,7 +142,7 @@ import { handleLivePage, isLiveBoardCode } from "./live-page.js";
  * with the 180-day report expiry. It counts against its own daily counters
  * (cr:n:photo:*) with the same limits as reports. A report may carry photoId;
  * it must exist and belong to the same X-Install-Id or the report is 422
- * field photoId. Rejecting or rewarding a review deletes the photo at once and
+ * field photoId. A hole-contribution with a photoId may omit green and greenMethod. Rejecting or rewarding a review deletes the photo at once and
  * sets photoDeleted:true on the report. Nothing here is public.
  *
  * POST JSON, 4096 bytes max. 201 {ok:true,id} stores a new report. The same
@@ -3354,12 +3354,21 @@ function parseHoleContribution(payload, reasons) {
   if (!required) return { ok: true, present: false, contributorEmail: null };
   if (!isPlainObject(payload.contribution)) return invalidContribution();
   const src = payload.contribution;
-  const green = parseLatLon(src.green);
-  if (!green) return invalidContribution("green");
-  if (typeof src.greenMethod !== "string" || !CONTRIBUTION_METHODS.has(src.greenMethod)) {
-    return invalidContribution("greenMethod");
+  // A report that carries a photoId may leave out green and greenMethod
+  // together (a scorecard photo sent from home). One without the other, or a
+  // bad value, is still refused. Without a photoId both stay required.
+  const hasPhoto = payload.photoId != null && validClientReportId(payload.photoId);
+  const noGreen = src.green == null && src.greenMethod == null;
+  const contribution = {};
+  if (!(hasPhoto && noGreen)) {
+    const green = parseLatLon(src.green);
+    if (!green) return invalidContribution("green");
+    if (typeof src.greenMethod !== "string" || !CONTRIBUTION_METHODS.has(src.greenMethod)) {
+      return invalidContribution("greenMethod");
+    }
+    contribution.green = green;
+    contribution.greenMethod = src.greenMethod;
   }
-  const contribution = { green, greenMethod: src.greenMethod };
 
   if (Object.prototype.hasOwnProperty.call(src, "tee") && src.tee != null) {
     const tee = parseLatLon(src.tee);
@@ -3399,7 +3408,7 @@ function contributionHints(contribution, position) {
   const fix = isPlainObject(position) && finiteNumber(position.lat) && finiteNumber(position.lon)
     ? position
     : null;
-  if (contribution.greenMethod === "im-here" && fix) {
+  if (contribution.green && contribution.greenMethod === "im-here" && fix) {
     hints.greenToPositionM = Math.round(distanceMeters(
       contribution.green.lat,
       contribution.green.lon,
@@ -3411,7 +3420,7 @@ function contributionHints(contribution, position) {
     hints.positionAccuracyM = fix.accuracyM;
     hints.poorFix = fix.accuracyM > POOR_FIX_ACCURACY_M;
   }
-  if (contribution.tee && Number.isInteger(contribution.par)) {
+  if (contribution.green && contribution.tee && Number.isInteger(contribution.par)) {
     const meters = distanceMeters(
       contribution.green.lat,
       contribution.green.lon,
@@ -3421,7 +3430,7 @@ function contributionHints(contribution, position) {
     hints.greenToTeeM = Math.round(meters);
     hints.plausibleForPar = yardsPlausibleForPar(meters, contribution.par);
   }
-  if (Array.isArray(contribution.tees) && contribution.tees.length > 0) {
+  if (contribution.green && Array.isArray(contribution.tees) && contribution.tees.length > 0) {
     hints.tees = contribution.tees.map((tee) => {
       const meters = distanceMeters(
         contribution.green.lat,
