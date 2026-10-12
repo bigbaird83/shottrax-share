@@ -53,7 +53,7 @@ describe("live board page: codes", () => {
     expect(livePageCode("/s/")).toBe(null);
     expect(livePageCode("/s/BK3MCQ/extra")).toBe(null);
     // Not in the code alphabet, wrong length, or a reserved / paint key.
-    for (const bad of ["BK3MC", "BK3MCQQ", "BK0MCQ", "round9", "gq:balance", "gca:course:14322", "id:14322", "osm:v1:x"]) {
+    for (const bad of ["BK3MC", "BK3MCQQ", "BK0MCQ", "round9", "gq:balance", "gca:course:14322", "id:14322", "osm:v1:x", "fr:secret", "fr:id:14322"]) {
       expect(livePageCode(`/s/${encodeURIComponent(bad)}`), bad).toBe(null);
     }
     expect(isLiveBoardCode("BK3MCQ")).toBe(true);
@@ -293,7 +293,7 @@ describe("live board page: worker route", () => {
 
   it("never reads reserved, paint, or non-code keys", async () => {
     const secret = JSON.stringify({ holes: [{ hole: 1, score: 99, par: 4 }], courseName: "SECRET" });
-    for (const key of ["gq:balance", "gapi:course:abc", "gqueue:abc", "osm:v1:secret", "gca:course:14322", "id:14322", "name:magnolia", "round9"]) {
+    for (const key of ["gq:balance", "gapi:course:abc", "gqueue:abc", "osm:v1:secret", "gca:course:14322", "id:14322", "name:magnolia", "round9", "fr:secret", "fr:id:14322"]) {
       kv.set(key, secret);
     }
     const reads = [];
@@ -302,7 +302,7 @@ describe("live board page: worker route", () => {
       reads.push(key);
       return get(key);
     };
-    for (const key of ["gq:balance", "gapi:course:abc", "gqueue:abc", "osm:v1:secret", "gca:course:14322", "id:14322", "name:magnolia", "round9"]) {
+    for (const key of ["gq:balance", "gapi:course:abc", "gqueue:abc", "osm:v1:secret", "gca:course:14322", "id:14322", "name:magnolia", "round9", "fr:secret", "fr:id:14322"]) {
       const res = await invoke(`/s/${encodeURIComponent(key)}`);
       expect(res.status, key).toBe(404);
       expect(await res.text()).not.toMatch(/SECRET/);

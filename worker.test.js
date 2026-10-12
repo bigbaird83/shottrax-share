@@ -1560,6 +1560,9 @@ describe("shottrax-share worker", () => {
       "v1board",
       "cr:id:secret",
       "cr:r:2026-01-01T00:00:00.000Z:secret",
+      "fr:secret",
+      "fr:id:14322",
+      "fr:name:magnolia",
     ];
     for (const key of reserved) {
       kv.set(key, { value: "keep-me", opts: { expirationTtl: 60 } });
@@ -4813,5 +4816,169 @@ describe("shottrax-share worker", () => {
     expect(await backToUsed.json()).toEqual({ error: "invalid_transition" });
     const backToApproved = await postReview(CONTRIB_TAP, { status: "approved" }, auth);
     expect(backToApproved.status).toBe(409);
+  });
+
+  const COURSE_CACHE_PREFIXES = ["id:", "name:", "osm:", "gq:", "gapi:", "gqueue:", "gca:", "cr:"];
+
+  function courseCacheKeys() {
+    return [...kv.keys()].filter((key) => COURSE_CACHE_PREFIXES.some((prefix) => key.startsWith(prefix))).sort();
+  }
+
+  function watchBoards() {
+    const ops = [];
+    const original = env.BOARDS;
+    const wrap = (name) => async (...args) => {
+      ops.push({ op: name, key: args[0] });
+      return original[name](...args);
+    };
+    env.BOARDS = {
+      ...original,
+      get: wrap("get"),
+      getWithMetadata: wrap("getWithMetadata"),
+      put: wrap("put"),
+      delete: wrap("delete"),
+    };
+    return ops;
+  }
+
+  it("does not let a board or live-page route read or write an fr: key", async () => {
+    const secret = "friend-secret";
+    const keys = [
+      "fr:secret",
+      "fr:id:14322",
+      "fr:name:magnolia",
+      "fr:osm:v1:33.1900,-93.2100:1800",
+      "fr:gapi:course:abc",
+      "fr:gqueue:abc",
+      "fr:gq:balance",
+      "fr:gca:course:14322",
+      "fr:cr:id:secret",
+    ];
+    for (const key of keys) {
+      kv.set(key, { value: secret, opts: { expirationTtl: 60 } });
+    }
+    const ops = watchBoards();
+    const urls = [
+      ...keys.map((key) => `${ORIGIN}/${encodeURIComponent(key)}`),
+      `${ORIGIN}/fr%3Asecret`,
+      `${ORIGIN}/%2566r%253Asecret`,
+      `${ORIGIN}/%252566r%25253Asecret`,
+      `${ORIGIN}/fr:secret/id:14322`,
+    ];
+    for (const url of urls) {
+      for (const method of ["GET", "PUT", "DELETE"]) {
+        const response = await invoke(url, { method, body: method === "PUT" ? "{\"x\":1}" : undefined });
+        expect(response.status, `${method} ${url}`).toBe(400);
+        expect(await response.text(), `${method} ${url}`).toBe("bad key");
+      }
+    }
+    const page = await invoke(`${ORIGIN}/s/${encodeURIComponent("fr:secret")}`);
+    expect(page.status).toBe(404);
+    expect(await page.text()).not.toContain(secret);
+    const nestedPage = await invoke(`${ORIGIN}/s/${encodeURIComponent("fr:id:14322")}`);
+    expect(nestedPage.status).toBe(404);
+    expect(await nestedPage.text()).not.toContain(secret);
+
+    expect(ops.filter((op) => op.key.startsWith("fr:") || op.key.startsWith("fr%"))).toEqual([]);
+    for (const key of keys) {
+      expect(kv.get(key)).toEqual({ value: secret, opts: { expirationTtl: 60 } });
+    }
+    expect(courseCacheKeys()).toEqual([]);
+
+    const board = await invoke(`${ORIGIN}/round9`, { method: "PUT", body: "{\"hole\":1}" });
+    expect(board.status).toBe(200);
+    expect(kv.get("round9").value).toBe("{\"hole\":1}");
+    const paint = await invoke(`${ORIGIN}/name:magnolia`, { method: "PUT", body: "{\"paint\":1}" });
+    expect(paint.status).toBe(200);
+    expect(kv.get("name:magnolia")?.opts).toEqual({ expirationTtl: 365 * DAY });
+  });
+
+  it("does not let an fr: id write the shared course map cache", async () => {
+    fetchMock.mockImplementation(async (url) => {
+      const href = String(url);
+      if (href.startsWith(PRIMARY) || href.startsWith(MIRROR) || href.startsWith(OSM_MAP)) return overpassOk();
+      if (href.includes("golfapi.io")) {
+        if (href.includes("/coordinates/")) return jsonResponse(coordPayload("fr:friend-coord"));
+        if (href.includes("/courses?")) {
+          return jsonResponse({ apiRequestsLeft: "50", courses: [{ courseID: "abc", courseName: "Magnolia" }] });
+        }
+        return jsonResponse(coursePayload("fr:friend-golf"));
+      }
+      if (href.includes("golfcoursesapi.com")) return jsonResponse({ id: "x", course_name: "X" });
+      throw new Error(`unexpected fetch ${href}`);
+    });
+    const ops = watchBoards();
+
+    const overlay = await invoke(overlayUrl({
+      courseId: "fr:friend-map",
+      lat: "33.1940935",
+      lng: "-93.2077463",
+      radius: "1800",
+    }));
+    expect(courseCacheKeys()).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(overlay.status).toBe(400);
+    expect(await overlay.json()).toEqual({ error: "bad_request" });
+
+    const golfCourse = await golfGet(`/golfapi/v2.3/courses/${encodeURIComponent("fr:friend-golf")}`);
+    expect(golfCourse.status).toBe(404);
+    expect(await golfCourse.json()).toEqual({ error: "unknown_route" });
+    const golfEncoded = await golfGet("/golfapi/v2.3/courses/fr%253Afriend-encoded");
+    expect(golfEncoded.status).toBe(404);
+    const golfCoord = await golfGet(`/golfapi/v2.3/coordinates/${encodeURIComponent("fr:friend-coord")}`);
+    expect(golfCoord.status).toBe(404);
+    const golfSearch = await golfGet(`/golfapi/v2.3/courses?name=${encodeURIComponent("fr:friend-search")}`);
+    expect(golfSearch.status).toBe(404);
+    const golfSearchEncoded = await golfGet("/golfapi/v2.3/courses?name=fr%253Afriend-search");
+    expect(golfSearchEncoded.status).toBe(404);
+
+    const gcaHeaders = { "X-Install-Id": INSTALL };
+    const gcaCourse = await invoke(`${ORIGIN}/gca/v1/courses/${encodeURIComponent("fr:friend-gca")}`, { headers: gcaHeaders });
+    expect(gcaCourse.status).toBe(404);
+    expect(await gcaCourse.json()).toEqual({ error: "unknown_route" });
+    const gcaEncoded = await invoke(`${ORIGIN}/gca/v1/courses/fr%253Afriend-gca`, { headers: gcaHeaders });
+    expect(gcaEncoded.status).toBe(404);
+    const gcaTriple = await invoke(`${ORIGIN}/gca/v1/courses/fr%25253Afriend-gca`, { headers: gcaHeaders });
+    expect(gcaTriple.status).toBe(404);
+    const gcaGreens = await invoke(
+      `${ORIGIN}/gca/v1/courses/${encodeURIComponent("fr:friend-greens")}/green-centers`,
+      { headers: gcaHeaders },
+    );
+    expect(gcaGreens.status).toBe(404);
+
+    const report = await postReport(reportBody({ courseId: "fr:friend-report" }));
+    expect(report.status).toBe(422);
+    expect(await report.json()).toEqual({ error: "invalid", field: "courseId" });
+    const encodedReport = await postReport(reportBody({
+      clientReportId: REPORT_ID_2,
+      courseId: "fr%3Afriend-report",
+    }));
+    expect(encodedReport.status).toBe(422);
+    expect(await encodedReport.json()).toEqual({ error: "invalid", field: "courseId" });
+
+    const hiddenPaint = await invoke(`${ORIGIN}/${encodeURIComponent("fr:id:14322")}`, {
+      method: "PUT",
+      body: "{\"paint\":1}",
+    });
+    expect(hiddenPaint.status).toBe(400);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(ops.filter((op) => op.op === "put" || op.op === "delete")).toEqual([]);
+    expect(courseCacheKeys()).toEqual([]);
+    expect([...kv.keys()].filter((key) => key.startsWith("fr:"))).toEqual([]);
+
+    const queueKey = "gqueue:fr:friend";
+    const queueSearch = `gqueue:q:${"ab".repeat(32)}`;
+    kv.set(queueKey, { value: JSON.stringify({ attempts: 0, at: 1 }) });
+    kv.set(queueSearch, {
+      value: JSON.stringify({ attempts: 0, at: 1, q: "fr:friend-search", search: "?name=fr:friend-search" }),
+    });
+    const queuedCourse = kv.get(queueKey);
+    const queuedSearch = kv.get(queueSearch);
+    await runDrain();
+    expect(kv.get(queueKey)).toEqual(queuedCourse);
+    expect(kv.get(queueSearch)).toEqual(queuedSearch);
+    expect(courseCacheKeys().filter((key) => key !== queueKey && key !== queueSearch)).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

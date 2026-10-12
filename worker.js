@@ -106,7 +106,15 @@ import { handleLivePage, isLiveBoardCode } from "./live-page.js";
  * about one write per second, so a burst can overshoot by 1–2. The global
  * daily cap and the balance floor are the backstop. A Durable Object could
  * make this exact later. Public GET/PUT/DELETE cannot read or write gq:,
- * gapi:, gqueue:, gca:, osm:, or cr: keys, or any key that starts with v1.
+ * gapi:, gqueue:, gca:, osm:, cr:, or fr: keys, or any key that starts with v1.
+ *
+ * `fr:` is reserved for future friend rows. Nothing in this Worker stores
+ * friend data, and there is no friend route. Board and share routes never
+ * read or write an fr: key, including a percent-encoded key and a key that
+ * hides a course id (fr:id:, fr:name:, fr:osm:, and the other cache prefixes).
+ * An id that is itself an fr: key is rejected before OSM, golfapi, GCA, the
+ * golfapi refill, or a course report can write the shared course map cache
+ * (id:, name:, osm:, gq:, gapi:, gqueue:, gca:, cr:).
  *
  * GCA search stays edge-only for 24 hours. courses/{id} and
  * courses/{id}/green-centers keep the raw upstream body in BOARDS for a year
@@ -346,7 +354,9 @@ const GOLFAPI_LATENCY_KINDS = ["search", "course", "coordinates"];
 const GOLFAPI_IP_PREFIX = "shottrax-golfapi-ip-v1:";
 const GOLFAPI_SEARCH_PREFIX = "shottrax-golfapi-search-v1:";
 const GOLFAPI_BALANCE_KEY = "gq:balance";
-const RESERVED_BOARD_PREFIXES = ["osm:", "gq:", "gapi:", "gqueue:", "gca:", "cr:"];
+/** Future anonymous-friend rows. Not a board code and not a course-cache key. */
+const FRIEND_KEY_PREFIX = "fr:";
+const RESERVED_BOARD_PREFIXES = ["osm:", "gq:", "gapi:", "gqueue:", "gca:", "cr:", FRIEND_KEY_PREFIX];
 const GOLFAPI_REASONS = [
   "device_day",
   "device_week",
@@ -360,11 +370,37 @@ const GOLFAPI_REASONS = [
   "install_id_required",
 ];
 
-function isReservedBoardKey(key) {
-  if (typeof key !== "string") return false;
+function reservedBoardText(key) {
   // /v1/... must not fall through to a board named "v1", and neither may any other key.
   if (key.startsWith("v1")) return true;
   return RESERVED_BOARD_PREFIXES.some((prefix) => key.startsWith(prefix));
+}
+
+/** A few decodes, so fr%253A… and fr%25253A… still count as the fr: namespace. */
+function matchesAnyDecoding(key, predicate) {
+  if (typeof key !== "string" || key.length === 0) return false;
+  let current = key;
+  for (let i = 0; i < 4; i += 1) {
+    if (predicate(current)) return true;
+    let decoded;
+    try {
+      decoded = decodeURIComponent(current);
+    } catch {
+      return false;
+    }
+    if (decoded === current) return false;
+    current = decoded;
+  }
+  return predicate(current);
+}
+
+function isReservedBoardKey(key) {
+  return matchesAnyDecoding(key, reservedBoardText);
+}
+
+/** True for the friend namespace, including leftover percent-encoding. */
+function isFriendKey(key) {
+  return matchesAnyDecoding(key, (text) => text.startsWith(FRIEND_KEY_PREFIX));
 }
 
 /** Course paint cache keys share BOARDS with live boards. */
@@ -501,6 +537,8 @@ function safeGolfapiId(raw) {
     return null;
   }
   if (!/^[A-Za-z0-9._:-]{1,128}$/.test(id)) return null;
+  // A friend id must not become gapi:, gq:, or gqueue: rows.
+  if (isFriendKey(id)) return null;
   return id;
 }
 
@@ -519,7 +557,10 @@ function golfapiSearchQuery(url) {
 
 function parseGolfapiRest(rest, url) {
   if (rest === "courses") {
-    if (golfapiSearchQuery(url) == null) return null;
+    const query = golfapiSearchQuery(url);
+    if (query == null) return null;
+    // A friend id used as the search text must not open a gapi:search: row.
+    if (isFriendKey(normalizeName(query))) return null;
     return { kind: "search" };
   }
   let match = /^courses\/([^/]+)$/.exec(rest);
@@ -1494,6 +1535,8 @@ async function drainGolfapiQueue(env) {
   for (const name of names) {
     const record = parseQueueRecord(await boards.get(name));
     if (name.startsWith("gqueue:q:")) {
+      // Leave a friend-query row untouched. Do not delete it and do not replay it into gapi:.
+      if (isFriendKey(record.q) || isFriendKey(normalizeName(record.q))) continue;
       const token = name.slice("gqueue:q:".length);
       // Original query string. The app sends name=; older rows used q=.
       const searchOk = record.search.startsWith("?") && !/[\r\n#]/.test(record.search);
@@ -1505,6 +1548,8 @@ async function drainGolfapiQueue(env) {
       items.push({ name, kind: "search", token, record });
       continue;
     }
+    // A queued friend id is not a golf course. Do not delete the row and do not fetch it.
+    if (isFriendKey(name.slice("gqueue:".length))) continue;
     const id = safeGolfapiId(name.slice("gqueue:".length));
     if (!id || name !== `gqueue:${id}`) {
       await boards.delete(name);
@@ -1628,19 +1673,26 @@ function safeGcaId(raw) {
   return raw;
 }
 
+/** Course and green-centers ids. A friend id is blocked before any GCA KV write. */
+function gcaResource(raw, kind) {
+  let decoded = raw;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    decoded = raw;
+  }
+  if (isFriendKey(decoded)) return { kind: "blocked" };
+  const id = safeGcaId(raw);
+  return id ? { kind, id } : { kind: "search" };
+}
+
 /** Search stays edge-only. Course and green-centers are the durable reads. */
 function parseGcaRest(rest) {
   if (rest === "courses") return { kind: "search" };
   let match = /^courses\/([^/]+)\/green-centers$/.exec(rest);
-  if (match) {
-    const id = safeGcaId(match[1]);
-    return id ? { kind: "green-centers", id } : { kind: "search" };
-  }
+  if (match) return gcaResource(match[1], "green-centers");
   match = /^courses\/([^/]+)$/.exec(rest);
-  if (match) {
-    const id = safeGcaId(match[1]);
-    return id ? { kind: "course", id } : { kind: "search" };
-  }
+  if (match) return gcaResource(match[1], "course");
   return { kind: "search" };
 }
 
@@ -1876,6 +1928,8 @@ async function handleGca(request, url, rest, env, ctx, cors, apiKey) {
     return golfJson(401, { error: "install_id_required" }, cors);
   }
   const parsed = parseGcaRest(rest);
+  // Friend ids must not fall through to search: that path still writes gca:stats.
+  if (parsed.kind === "blocked") return golfJson(404, { error: "unknown_route" }, cors);
   if (parsed.kind === "course" || parsed.kind === "green-centers") {
     return handleGcaDurable({ kind: parsed.kind, id: parsed.id, url, rest, env, ctx, cors, apiKey, missingInstallId });
   }
@@ -1989,7 +2043,8 @@ function parseRadius(raw) {
 
 function parseOverlayRequest(url) {
   const courseId = url.searchParams.get("courseId");
-  if (courseId == null || !COURSE_ID_RE.test(courseId)) return null;
+  // A friend id must not read or write osm: overlay keys, including the legacy courseId key.
+  if (courseId == null || !COURSE_ID_RE.test(courseId) || isFriendKey(courseId)) return null;
   const lat = parseCoord(url.searchParams.get("lat"), -90, 90);
   const lng = parseCoord(url.searchParams.get("lng"), -180, 180);
   if (lat == null || lng == null) return null;
@@ -3457,7 +3512,7 @@ function parseCourseReport(payload) {
   if (!isPlainObject(payload)) return invalidField("body");
   if (!validClientReportId(payload.clientReportId)) return invalidField("clientReportId");
   if (!isIsoDateTime(payload.createdAt)) return invalidField("createdAt");
-  if (typeof payload.courseId !== "string" || payload.courseId.length < 1 || payload.courseId.length > 180) {
+  if (typeof payload.courseId !== "string" || payload.courseId.length < 1 || payload.courseId.length > 180 || isFriendKey(payload.courseId)) {
     return invalidField("courseId");
   }
   if (typeof payload.courseName !== "string") return invalidField("courseName");
@@ -4169,8 +4224,8 @@ export default {
     if (osm) return osm;
 
     // Live board web page (GET /s/{code}). Only a real board code is read: never a reserved
-    // key and never a paint key, so the page cannot show overlay, course-store, GCA, golfapi,
-    // queue, paint-cache, or course-report data.
+    // key (including fr:) and never a paint key, so the page cannot show overlay, course-store,
+    // GCA, golfapi, queue, paint-cache, course-report, or friend data.
     const page = await handleLivePage(request, env, {
       loadBoard: (code) => {
         if (!isLiveBoardCode(code) || isReservedBoardKey(code) || isPaintKey(code)) return null;
@@ -4194,8 +4249,9 @@ export default {
     if (!key || key.length > 180) {
       return new Response("bad key", { status: 400, headers: cors });
     }
-    // Overlay, golfapi counters, the course store, GCA copies, the refill queue, and
-    // course reports share BOARDS. Public board routes must not read, replace, or delete those keys.
+    // Overlay, golfapi counters, the course store, GCA copies, the refill queue,
+    // course reports, and future friend rows share BOARDS. Public board routes must not
+    // read, replace, or delete those keys.
     if ((request.method === "GET" || request.method === "PUT" || request.method === "DELETE") && isReservedBoardKey(key)) {
       return new Response("bad key", { status: 400, headers: cors });
     }
