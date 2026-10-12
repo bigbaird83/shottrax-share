@@ -12,9 +12,9 @@ The header value is 32 to 64 characters from `A–Z`, `a–z`, `0–9`, `_`, and
 
 The raw friend key is never written to KV and never returned. The Worker stores only SHA-256 of a fixed prefix plus the key, under an `fr:` key. Responses never include a name, email, phone, install id, or the friend key.
 
-Request bodies are JSON objects. A field that is not in that call's allowlist, including a `null` placeholder, is `400` `{ "error": "invalid_body" }`. So is JSON that does not parse, a non-object, or a wrong type. A body over the call's size limit is `413` `{ "error": "payload_too_large" }`. The limit is 2048 bytes, except `publishRound`, which is 8192. An empty body is allowed only where this document says so.
+Request bodies are JSON objects. A field that is not in that call's allowlist, including a `null` placeholder, is `400` `{ "error": "invalid_body" }`. JSON that does not parse, a non-object, or a wrong type is the same error. The one accepted null is unshare: `{ "share": false, "round": null }`. A body over the call's size limit is `413` `{ "error": "payload_too_large" }`. The limit is 2048 bytes, except `publishRound`, which is 8192. An empty body is allowed only where this document says so.
 
-`GET` and `POST` are the only methods used below. Anything else on a known path is `405` `{ "error": "method_not_allowed" }`. A path under `/v1/` that this document does not list is `404` `{ "error": "unknown_route" }`.
+`GET` and `POST` are the methods below, plus `PUT` for `publishRound`. Anything else on a known path is `405` `{ "error": "method_not_allowed" }`. A path under `/v1/` that this document does not list is `404` `{ "error": "unknown_route" }`.
 
 If `BOARDS` is not bound, a call that needs it is `503` `{ "error": "boards_not_configured" }`. Code lookup (and later `sendRequest`, which uses that lookup) needs the guess limiter. If that binding is missing, the call fails closed with `503` `{ "error": "guess_limiter_not_configured" }` and does not read the code.
 
@@ -62,6 +62,8 @@ The friend key must already have a code. Otherwise `401` `{ "error": "friend_key
 { "code": "AB3K7NP2" }
 ```
 
+`name` is not a field. The phone keeps that nickname on the device. Sending `name` is `invalid_body`.
+
 Performs the code lookup below, including the guess limit. A limited caller gets `rate_limited` and is not told whether the code exists.
 
 A real code that is not the caller, and no block in either direction, stores a pending request. Access does not start here. The other person must accept.
@@ -82,6 +84,8 @@ Quiet block: if the target has blocked the caller, the response is the same `200
 { "ownerId": "<the requester>" }
 ```
 
+The phone's `id` is this `ownerId`. `name` is not a field.
+
 Only the recipient of a pending request can accept. That creates the friendship.
 
 `200` `{ "status": "friends", "ownerId": "<the requester>" }`
@@ -95,6 +99,8 @@ No pending request: `409` `{ "error": "not_friends" }`. The caller already block
 ```json
 { "ownerId": "<the other person>" }
 ```
+
+The phone's `id` is this `ownerId`.
 
 Deletes the friendship and deletes shared rounds on both sides in that request. Fetch no longer returns those rounds.
 
@@ -110,6 +116,8 @@ No accepted friendship: `409` `{ "error": "not_friends" }`.
 { "ownerId": "<the other person>" }
 ```
 
+The phone's `id` is this `ownerId`.
+
 Same deletion as remove: both sides' shared rounds are deleted in that request, and access ends immediately. The block is stored for the caller.
 
 `200` `{ "ok": true }`
@@ -120,11 +128,31 @@ The blocked person gets no notice. Their later `sendRequest` and `accept` behave
 
 `PUT /v1/friends/rounds`
 
-Body is one round, at most 8192 bytes. The Worker sets `ownerId` from the friend key. A client `ownerId` must match that id or the body is `invalid_body`. The same `id` replaces the previous round.
+The body is `{ "share", "round" }`, at most 8192 bytes. No other fields.
+
+Publish when sharing is on:
+
+```json
+{ "share": true, "round": { "id": "round_7Kp2", "courseName": "Greystone", "playedOn": "2026-10-11", "gross": 82, "toPar": 10, "holes": [] } }
+```
+
+`round` uses the shared-round allowlist. The Worker sets `ownerId` from the friend key. A client `ownerId` must match that id or the body is `invalid_body`. The same `id` replaces the previous round.
 
 `200` `{ "ok": true, "id": "<round id>" }`
 
-Friends can fetch the round only after they have accepted. Publishing does not make a pending request into a friendship.
+Unshare and delete:
+
+```json
+{ "share": false, "round": null }
+```
+
+Deletes the caller's shared rounds in that request. The next fetch does not include them.
+
+`200` `{ "ok": true }`
+
+`share: false` with a round, `share: true` with `null`, or a `name` field is `invalid_body`.
+
+Friends can fetch a published round only after they have accepted. Publishing does not make a pending request into a friendship.
 
 ### fetchRounds
 
@@ -234,8 +262,23 @@ Friend rows use the `fr:` prefix only. The keys this API writes are:
 
 None of these routes read or write `id:`, `name:`, `osm:`, `gq:`, `gapi:`, `gqueue:`, `gca:`, or `cr:`. Board `GET` / `PUT` / `DELETE` still refuse `fr:`, so a board path cannot read a friend row. Guess counts live in the Durable Object, not in KV.
 
-## Where the phone draft differs
+## Phone draft differences
 
-The contract above is the source of truth. Two differences are visible without the phone file: the draft's PR covers Friends/Groups, and this contract has no group calls; `X-Install-Id` stays the install id and is not the friend key.
+ShotTraxx PR #533 `src/domain/friendsApi.ts` returns `FriendsApiResult` on every call: `{ ok: true, snapshot }` with `{ code, people, rounds }`, or `{ ok: false, reason }` where `reason` is `todo`, `off`, or `refused`. The contract wins. The server does not return that snapshot. Each call returns only its own body. The phone builds `{ code, people, rounds }` on the device. `people` and nicknames never come from the server.
 
-`src/domain/friendsApi.ts` on PR #533 was not readable from this Worker credential (the ShotTraxx repo is private to this token). Line-by-line differences against that file are not claimed here. When the phone is updated, any of the following in the draft gives way to this document: a path or method other than the ones above, auth by install id or by a person's name, a friend key derived from the install id, a code alphabet or length other than eight unambiguous characters, a lookup that skips the guess limit, `remove` or `block` that leaves shared rounds in place, a block response that tells the blocked person they are blocked, `null` stat fields, GPS, photos, or names on a round, and writes outside `fr:`.
+`name` on `sendRequest` and `accept` is a local nickname. The phone keeps it on the device and does not send it. The server rejects a `name` field with `400` `{ "error": "invalid_body" }`. The phone's `id` is the server's `ownerId`.
+
+| Phone call | Contract |
+|---|---|
+| `getCode()` | `POST /v1/friends/code` → `{ code, ownerId }` |
+| `resetCode()` | `POST /v1/friends/code/reset` → `{ code, ownerId }` |
+| `sendRequest({ code, name })` | `POST /v1/friends/requests` with `{ code }` only |
+| `accept({ id, name })` | `POST /v1/friends/requests/accept` with `{ ownerId }` only |
+| `remove(id)` | `POST /v1/friends/remove` with `{ ownerId }` |
+| `block(id)` | `POST /v1/friends/block` with `{ ownerId }` |
+| `publishRound({ round, share })` | `PUT /v1/friends/rounds`. `share: true` and a round publishes it. `share: false` and `round: null` unshares and deletes the caller's shared rounds. |
+| `fetchRounds()` | `GET /v1/friends/rounds` → `{ rounds }` |
+
+`off` is the phone switch. No request is sent. `todo` is a call the phone has not finished, or a server that is not ready: `unknown_route`, `boards_not_configured`, `guess_limiter_not_configured`. `refused` is every other error: `friend_key_required`, `invalid_body`, `payload_too_large`, `method_not_allowed`, `code_not_found`, `not_friends`, `rate_limited`, and `blocked`.
+
+`blocked` is returned only to the person who blocked, and the phone maps it to `refused`, the same reason it uses for `code_not_found` and `not_friends`. The blocked person never receives `blocked`. Their `sendRequest` is the normal `200` pending body, and their `accept` is `not_friends`. That is a success or a `refused`, not a block.
