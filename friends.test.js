@@ -75,7 +75,13 @@ function createLimiterNamespace() {
         obj = new FriendGuessLimiter(sqliteState(name), {});
         objects.set(name, obj);
       }
-      return obj;
+      // A real stub accepts fetch(input, init) and delivers one Request to the class.
+      return {
+        fetch(input, init) {
+          const request = input instanceof Request ? input : new Request(input, init);
+          return obj.fetch(request);
+        },
+      };
     },
   };
 }
