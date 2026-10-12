@@ -1,0 +1,399 @@
+/**
+ * Anonymous friend codes. Auth is X-Friend-Key, a random secret the phone
+ * generates. It is not an install id and it is not a name. KV rows are fr:
+ * only. Guess counts live in FriendGuessLimiter (SQLite Durable Object),
+ * one object per friend-key hash and one per IP hash.
+ *
+ * Served here: getCode, resetCode, and code lookup. Requests, block, and
+ * rounds are specified in the friends contract and are not routed yet.
+ */
+
+export const FRIEND_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+export const FRIEND_CODE_GUESS_LIMIT = 8;
+export const FRIEND_IP_GUESS_LIMIT = 24;
+export const FRIEND_GUESS_WINDOW_MS = 60 * 60 * 1000;
+
+const FRIEND_KEY_PREFIX = "fr:";
+const FRIEND_KEY_HASH_PREFIX = "shottrax-friend-key-v1:";
+const FRIEND_IP_HASH_PREFIX = "shottrax-friend-guess-ip-v1:";
+const FRIEND_BODY_LIMIT = 2048;
+const COURSE_CACHE_PREFIXES = ["id:", "name:", "osm:", "gq:", "gapi:", "gqueue:", "gca:", "cr:"];
+const FRIEND_KEY_RE = /^[A-Za-z0-9_-]{32,64}$/;
+const INSTALL_ID_RE = /^id_\d+_[a-z0-9]+$/i;
+const CODE_RE = /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}$/;
+
+const GUESS_SCHEMA = `CREATE TABLE IF NOT EXISTS guess_limit (
+  id INTEGER PRIMARY KEY,
+  attempts INTEGER NOT NULL,
+  window_start INTEGER NOT NULL,
+  blocked INTEGER NOT NULL
+)`;
+
+export function isFriendPath(pathname) {
+  return pathname === "/v1/friends" || pathname.startsWith("/v1/friends/");
+}
+
+/** DO name for a friend key. Tests use this to reset and block the same object the route uses. */
+export async function limiterNameForFriendKey(friendKey) {
+  return `key:${await sha256Hex(FRIEND_KEY_HASH_PREFIX + friendKey)}`;
+}
+
+export class FriendGuessLimiter {
+  constructor(ctx, env) {
+    this.ctx = ctx;
+    this.env = env;
+    const name = ctx && ctx.id && typeof ctx.id.name === "string" ? ctx.id.name : "";
+    this.limit = name.startsWith("ip:") ? FRIEND_IP_GUESS_LIMIT : FRIEND_CODE_GUESS_LIMIT;
+    this.#ready = ctx.blockConcurrencyWhile(async () => {
+      this.#ensure();
+    });
+  }
+
+  #ready;
+
+  async fetch(request) {
+    await this.#ready;
+    if (request.method !== "POST") return doJson({ error: "method_not_allowed" }, 405);
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return doJson({ error: "invalid_body" }, 400);
+    }
+    const now = Number.isFinite(body && body.now) ? body.now : Date.now();
+    if (body && body.op === "attempt") {
+      // Read, compare, and increment stay inside this synchronous transaction.
+      const result = this.ctx.storage.transactionSync(() => this.#attemptSync(now));
+      return doJson(result);
+    }
+    if (body && body.op === "reset") {
+      this.ctx.storage.transactionSync(() => this.#resetSync());
+      return doJson({ ok: true });
+    }
+    if (body && body.op === "block") {
+      this.ctx.storage.transactionSync(() => this.#blockSync(now));
+      return doJson({ ok: true });
+    }
+    return doJson({ error: "invalid_body" }, 400);
+  }
+
+  #ensure() {
+    this.ctx.storage.sql.exec(GUESS_SCHEMA);
+  }
+
+  #attemptSync(now) {
+    this.#ensure();
+    const rows = this.ctx.storage.sql
+      .exec("SELECT attempts, window_start, blocked FROM guess_limit WHERE id = 1")
+      .toArray();
+    if (rows.length === 0) {
+      this.ctx.storage.sql.exec(
+        "INSERT INTO guess_limit (id, attempts, window_start, blocked) VALUES (1, 1, ?, 0)",
+        now,
+      );
+      return { ok: true };
+    }
+    let attempts = Number(rows[0].attempts);
+    let windowStart = Number(rows[0].window_start);
+    const blocked = Number(rows[0].blocked) === 1;
+    if (blocked) return { ok: false, retryAfterSec: Math.ceil(FRIEND_GUESS_WINDOW_MS / 1000) };
+    if (now - windowStart >= FRIEND_GUESS_WINDOW_MS) {
+      attempts = 0;
+      windowStart = now;
+    }
+    if (attempts >= this.limit) {
+      const retryAfterSec = Math.max(1, Math.ceil((FRIEND_GUESS_WINDOW_MS - (now - windowStart)) / 1000));
+      return { ok: false, retryAfterSec };
+    }
+    attempts += 1;
+    this.ctx.storage.sql.exec(
+      "UPDATE guess_limit SET attempts = ?, window_start = ? WHERE id = 1",
+      attempts,
+      windowStart,
+    );
+    return { ok: true };
+  }
+
+  #resetSync() {
+    this.#ensure();
+    this.ctx.storage.sql.exec("DELETE FROM guess_limit");
+  }
+
+  #blockSync(now) {
+    this.#ensure();
+    const rows = this.ctx.storage.sql.exec("SELECT id FROM guess_limit WHERE id = 1").toArray();
+    if (rows.length === 0) {
+      this.ctx.storage.sql.exec(
+        "INSERT INTO guess_limit (id, attempts, window_start, blocked) VALUES (1, 0, ?, 1)",
+        now,
+      );
+      return;
+    }
+    this.ctx.storage.sql.exec("UPDATE guess_limit SET blocked = 1 WHERE id = 1");
+  }
+}
+
+export async function handleFriends(request, url, env, cors) {
+  if (!isFriendPath(url.pathname)) return null;
+  const route = FRIEND_ROUTES[url.pathname];
+  if (!route) return friendJson(404, { error: "unknown_route" }, cors);
+  const handler = route[request.method];
+  if (!handler) return friendJson(405, { error: "method_not_allowed" }, cors);
+  return handler(request, env, cors);
+}
+
+const FRIEND_ROUTES = {
+  "/v1/friends/code": { POST: getCode },
+  "/v1/friends/code/reset": { POST: resetCode },
+  "/v1/friends/codes/lookup": { POST: lookupCode },
+};
+
+async function getCode(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const parsed = await readJsonObject(request, FRIEND_BODY_LIMIT, true);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (unknownFields(parsed.value, [])) return friendJson(400, { error: "invalid_body" }, cors);
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const keyHash = await sha256Hex(FRIEND_KEY_HASH_PREFIX + friendKey);
+  const authKey = friendKvKey("k", keyHash);
+  const existing = parseAuth(await friendGet(boards, authKey));
+  if (existing) return friendJson(200, { code: existing.code, ownerId: existing.ownerId }, cors);
+  const ownerId = randomOwnerId();
+  const code = await unusedCode(boards, null);
+  await friendPut(boards, friendKvKey("code", code), ownerId);
+  await friendPut(boards, authKey, storedAuth(ownerId, code));
+  return friendJson(200, { code, ownerId }, cors);
+}
+
+async function resetCode(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const parsed = await readJsonObject(request, FRIEND_BODY_LIMIT, true);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (unknownFields(parsed.value, [])) return friendJson(400, { error: "invalid_body" }, cors);
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const keyHash = await sha256Hex(FRIEND_KEY_HASH_PREFIX + friendKey);
+  const authKey = friendKvKey("k", keyHash);
+  const existing = parseAuth(await friendGet(boards, authKey));
+  if (!existing) return friendJson(401, { error: "friend_key_required" }, cors);
+  const previous = existing.code;
+  const code = await unusedCode(boards, previous);
+  await friendPut(boards, friendKvKey("code", code), existing.ownerId);
+  await friendPut(boards, authKey, storedAuth(existing.ownerId, code));
+  // The old code is deleted before the response, so a later lookup misses.
+  await friendDelete(boards, friendKvKey("code", previous));
+  return friendJson(200, { code, ownerId: existing.ownerId }, cors);
+}
+
+async function lookupCode(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  if (!guessNamespace(env)) return friendJson(503, { error: "guess_limiter_not_configured" }, cors);
+  const parsed = await readJsonObject(request, FRIEND_BODY_LIMIT, false);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (unknownFields(parsed.value, ["code"])) return friendJson(400, { error: "invalid_body" }, cors);
+  const code = normalizeFriendCode(parsed.value.code);
+  if (!code) return friendJson(400, { error: "invalid_body" }, cors);
+  const now = Date.now();
+  const keyName = await limiterNameForFriendKey(friendKey);
+  const keyAttempt = await guessAttempt(env, keyName, now);
+  if (!keyAttempt.ok) return rateLimited(cors, keyAttempt.retryAfterSec);
+  const ipHash = await friendIpHash(request);
+  if (ipHash) {
+    const ipAttempt = await guessAttempt(env, `ip:${ipHash}`, now);
+    if (!ipAttempt.ok) return rateLimited(cors, ipAttempt.retryAfterSec);
+  }
+  const ownerId = await friendGet(boards, friendKvKey("code", code));
+  if (typeof ownerId !== "string" || ownerId.length === 0) {
+    return friendJson(404, { error: "code_not_found" }, cors);
+  }
+  return friendJson(200, { ownerId }, cors);
+}
+
+function readFriendKey(request) {
+  const raw = request.headers.get("X-Friend-Key");
+  if (typeof raw !== "string") return null;
+  const friendKey = raw.trim();
+  if (!FRIEND_KEY_RE.test(friendKey)) return null;
+  if (INSTALL_ID_RE.test(friendKey)) return null;
+  const installId = request.headers.get("X-Install-Id");
+  if (typeof installId === "string" && installId.trim() === friendKey) return null;
+  return friendKey;
+}
+
+function normalizeFriendCode(raw) {
+  if (typeof raw !== "string") return null;
+  const compact = raw.trim().replace(/[\s-]+/g, "").toUpperCase();
+  if (!CODE_RE.test(compact)) return null;
+  return compact;
+}
+
+function unknownFields(value, allowed) {
+  const allow = new Set(allowed);
+  return Object.keys(value).some((key) => !allow.has(key));
+}
+
+async function readJsonObject(request, limit, allowEmpty) {
+  const declared = Number(request.headers.get("Content-Length"));
+  if (Number.isFinite(declared) && declared > limit) return { error: "payload_too_large", status: 413 };
+  const raw = await request.text();
+  if (raw.length > limit) return { error: "payload_too_large", status: 413 };
+  if (raw.length === 0) {
+    if (allowEmpty) return { value: {} };
+    return { error: "invalid_body", status: 400 };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { error: "invalid_body", status: 400 };
+  }
+  if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { error: "invalid_body", status: 400 };
+  }
+  return { value: parsed };
+}
+
+function boardsBinding(env) {
+  const boards = env && env.BOARDS;
+  if (!boards || typeof boards.get !== "function" || typeof boards.put !== "function" || typeof boards.delete !== "function") {
+    return null;
+  }
+  return boards;
+}
+
+function guessNamespace(env) {
+  const ns = env && env.FRIEND_GUESSES;
+  if (!ns || typeof ns.idFromName !== "function" || typeof ns.get !== "function") return null;
+  return ns;
+}
+
+async function guessAttempt(env, name, now) {
+  const ns = guessNamespace(env);
+  const stub = ns.get(ns.idFromName(name));
+  const response = await stub.fetch("https://friend-guess.internal/limit", {
+    method: "POST",
+    body: JSON.stringify({ op: "attempt", now }),
+  });
+  const body = await response.json();
+  if (body && body.ok === true) return { ok: true };
+  const retryAfterSec = Number.isFinite(body && body.retryAfterSec) ? body.retryAfterSec : Math.ceil(FRIEND_GUESS_WINDOW_MS / 1000);
+  return { ok: false, retryAfterSec };
+}
+
+function friendKvKey(kind, id) {
+  if (kind !== "k" && kind !== "code") throw new Error("friend_namespace");
+  if (typeof id !== "string" || id.length < 1) throw new Error("friend_namespace");
+  const key = `fr:${kind}:${id}`;
+  assertFriendNamespace(key);
+  return key;
+}
+
+function assertFriendNamespace(key) {
+  if (typeof key !== "string" || !key.startsWith(FRIEND_KEY_PREFIX)) throw new Error("friend_namespace");
+  const rest = key.slice(FRIEND_KEY_PREFIX.length);
+  if (COURSE_CACHE_PREFIXES.some((prefix) => rest.startsWith(prefix))) throw new Error("friend_namespace");
+}
+
+async function friendGet(boards, key) {
+  assertFriendNamespace(key);
+  return boards.get(key);
+}
+
+async function friendPut(boards, key, value) {
+  assertFriendNamespace(key);
+  await boards.put(key, value);
+}
+
+async function friendDelete(boards, key) {
+  assertFriendNamespace(key);
+  await boards.delete(key);
+}
+
+/** Auth row. Only these two fields. No name, no install id, no raw friend key. */
+function storedAuth(ownerId, code) {
+  return JSON.stringify({ ownerId, code });
+}
+
+function parseAuth(raw) {
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  if (typeof parsed.ownerId !== "string" || typeof parsed.code !== "string") return null;
+  if (!CODE_RE.test(parsed.code)) return null;
+  if (Object.keys(parsed).some((key) => key !== "ownerId" && key !== "code")) return null;
+  return { ownerId: parsed.ownerId, code: parsed.code };
+}
+
+async function unusedCode(boards, avoid) {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const code = randomFriendCode();
+    if (code === avoid) continue;
+    const existing = await friendGet(boards, friendKvKey("code", code));
+    if (existing == null || existing === "") return code;
+  }
+  throw new Error("friend_code_exhausted");
+}
+
+function randomFriendCode() {
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  let out = "";
+  for (const byte of bytes) out += FRIEND_CODE_ALPHABET[byte % FRIEND_CODE_ALPHABET.length];
+  return out;
+}
+
+function randomOwnerId() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+async function friendIpHash(request) {
+  const raw = request.headers.get("CF-Connecting-IP");
+  if (typeof raw !== "string") return null;
+  const ip = raw.trim();
+  if (!ip || ip.length > 64 || /[\s\r\n]/.test(ip)) return null;
+  return sha256Hex(FRIEND_IP_HASH_PREFIX + ip);
+}
+
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function rateLimited(cors, retryAfterSec) {
+  const seconds = String(Math.max(1, Math.ceil(Number(retryAfterSec) || 1)));
+  return friendJson(429, { error: "rate_limited" }, cors, { "Retry-After": seconds });
+}
+
+function friendJson(status, body, cors, extra) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      ...cors,
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      ...extra,
+    },
+  });
+}
+
+function doJson(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}

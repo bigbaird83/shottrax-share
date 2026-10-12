@@ -10,6 +10,17 @@ compatibility_date = "2026-09-23"
 binding = "BOARDS"
 id = "cfa1824a10374ab6a7fa0c97d0990e80"
 
+# Exact friend-code guess counters. One SQLite Durable Object per friend-key hash
+# and per IP hash. Workers Free only supports SQLite-backed Durable Objects,
+# so this class is created with new_sqlite_classes (not new_classes).
+[[durable_objects.bindings]]
+name = "FRIEND_GUESSES"
+class_name = "FriendGuessLimiter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["FriendGuessLimiter"]
+
 # Daily refill of queued golfapi course ids and searches. 08:00 UTC is early morning in the US.
 [triggers]
 crons = ["0 8 * * *"]

@@ -14,9 +14,17 @@ Merging to `main` deploys this Worker automatically through Cloudflare Workers B
 
 Board and paint-cache keys are stored only while that binding is present on the live Worker. If it is missing, those routes return `503` `{ "error": "boards_not_configured" }`.
 
-`GET`, `PUT`, and `DELETE` for a reserved prefix return `400` and do not read or write KV, so a board request cannot read, replace, or reset an overlay, a golfapi counter, a stored course, a GCA copy, the refill queue, a course report, or a future friend row (`fr:`). Paint keys (`id:`, `name:`) and ordinary board codes are unchanged. A key that starts with `v1` is reserved too, so `GET /v1` cannot read a board.
+`GET`, `PUT`, and `DELETE` for a reserved prefix return `400` and do not read or write KV, so a board request cannot read, replace, or reset an overlay, a golfapi counter, a stored course, a GCA copy, the refill queue, a course report, or a friend row (`fr:`). Paint keys (`id:`, `name:`) and ordinary board codes are unchanged. A key that starts with `v1` is reserved too, so `GET /v1` cannot read a board.
 
-`fr:` is reserved for anonymous friend data. This Worker stores no friend rows and exposes no friend route. A percent-encoded `fr:` key, and a key that hides a course id (`fr:id:…`, `fr:name:…`, `fr:osm:…`, `fr:gapi:…`, `fr:gqueue:…`, `fr:gq:…`, `fr:gca:…`, `fr:cr:…`), is still `400` and does not touch KV. An id that starts with `fr:` is rejected before it can write the shared course map cache: OSM overlay, golfapi course, coordinates, and search, GCA course and green-centers, the golfapi refill, and course reports. Those requests do not create `id:`, `name:`, `osm:`, `gq:`, `gapi:`, `gqueue:`, `gca:`, or `cr:` keys.
+`fr:` is reserved for anonymous friend data. Friend code rows are `fr:k:` and `fr:code:` only. A percent-encoded `fr:` key, and a key that hides a course id (`fr:id:…`, `fr:name:…`, `fr:osm:…`, `fr:gapi:…`, `fr:gqueue:…`, `fr:gq:…`, `fr:gca:…`, `fr:cr:…`), is still `400` and does not touch KV. An id that starts with `fr:` is rejected before it can write the shared course map cache: OSM overlay, golfapi course, coordinates, and search, GCA course and green-centers, the golfapi refill, and course reports. Those requests do not create `id:`, `name:`, `osm:`, `gq:`, `gapi:`, `gqueue:`, `gca:`, or `cr:` keys.
+
+## Friends
+
+`POST /v1/friends/code` returns the eight-character friend code for `X-Friend-Key`. `POST /v1/friends/code/reset` replaces it and deletes the old `fr:code:` row before responding. `POST /v1/friends/codes/lookup` with `{ "code" }` returns `{ "ownerId" }` or `404` `{ "error": "code_not_found" }`. The friend key is 32–64 characters of `A–Z`, `a–z`, `0–9`, `_`, `-`. It is random, not the install id, and not a name. The raw key is not stored and not returned. A missing or bad key is `401` `{ "error": "friend_key_required" }`.
+
+Lookup allows 8 guesses per friend key and 24 per IP hash per 60 minutes. The count is exact, in the SQLite Durable Object `FriendGuessLimiter` (binding `FRIEND_GUESSES`). Over the limit is `429` `{ "error": "rate_limited" }` and `Retry-After`. The same object can reset that counter or block further guesses; a blocked guesser still gets `rate_limited`, not a distinct error. Guess rows are not KV keys. These routes do not write `id:`, `name:`, `osm:`, `gq:`, `gapi:`, `gqueue:`, `gca:`, or `cr:`. If `BOARDS` or `FRIEND_GUESSES` is missing, lookup fails closed (`boards_not_configured` or `guess_limiter_not_configured`).
+
+Requests, accept, remove, block, and shared rounds are not served in this step.
 
 ## Live board web page
 
