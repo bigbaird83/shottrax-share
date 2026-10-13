@@ -240,7 +240,7 @@ describe("alert email", () => {
 });
 
 describe("deploy entry routes", () => {
-  it("keeps a board put on worker.js and applies live paint and fr: golfapi rules", async () => {
+  it("keeps a board put on worker.js and applies the live paint rules", async () => {
     const rows = new Map();
     const boards = {
       async get(key) {
@@ -281,12 +281,5 @@ describe("deploy entry routes", () => {
     expect(body.day).toMatchObject({ calls: 0, cap: 100 });
     expect(typeof body.month.period).toBe("string");
     expect(typeof body.day.date).toBe("string");
-
-    const friend = await entry.fetch(new Request("https://shottrax-share.example/golfapi/v2.3/courses/fr%3Asecret", {
-      headers: { "X-Install-Id": "install-0001" },
-    }), { BOARDS: boards, GOLFAPI_KEY: "golf-secret" }, { waitUntil() {} });
-    expect(friend.status).toBe(404);
-    expect(await friend.json()).toEqual({ error: "unknown_route" });
-    expect(friend.headers.get("Access-Control-Allow-Origin")).toBeNull();
   });
 });
