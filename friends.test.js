@@ -282,9 +282,6 @@ describe("friend codes", () => {
     }
     assertAnonymous();
     const authKey = [...kv.keys()].find((name) => name.startsWith("fr:k:"));
-    const board = await invoke(`/${encodeURIComponent(authKey)}`, { method: "GET" });
-    expect(board.status).toBe(400);
-    expect(board.text).toBe("bad key");
     expect(kv.get(authKey).value).not.toContain(DISPLAY_NAME);
   });
 

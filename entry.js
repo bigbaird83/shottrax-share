@@ -2,6 +2,7 @@
 // The share module is the live shottrax-share script (boards, /s/ pages,
 // paint, OSM, course reports, /gca/*, /meta/*, and the golfapi hotfix).
 // Only the golf-proxy paths go to golf-proxy.js.
+// An fr: golfapi id or search is 404 before that proxy.
 import live from "./live-shottrax-share.js";
 import { coverageFromOverlayResponse, handleGolfProxy, GolfapiCounter, runGolfapiStockpile, STOCKPILE_CRON } from "./golf-proxy.js";
 import { FriendGuessLimiter, handleFriends, isFriendPath } from "./friends.js";
@@ -27,6 +28,48 @@ function isPrPath(p) {
   );
 }
 
+function isFriendToken(value) {
+  if (typeof value !== "string" || value.length === 0) return false;
+  let current = value;
+  for (let i = 0; i < 4; i += 1) {
+    if (current.startsWith("fr:")) return true;
+    let decoded;
+    try {
+      decoded = decodeURIComponent(current);
+    } catch {
+      return false;
+    }
+    if (decoded === current) return false;
+    current = decoded;
+  }
+  return current.startsWith("fr:");
+}
+
+function normalizeSearch(value) {
+  if (typeof value !== "string") return "";
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/** An fr: golfapi id or search must not reach the proxy or its KV. */
+function friendGolfapiBlocked(pathname, url) {
+  if (!pathname.startsWith("/golfapi/v2.3/")) return false;
+  const rest = pathname.replace(/\/+$/, "").slice("/golfapi/v2.3/".length);
+  if (rest === "courses") {
+    const name = url.searchParams.get("name");
+    const query = name != null && name.trim() !== "" ? name : url.searchParams.get("q");
+    return query != null && isFriendToken(normalizeSearch(query));
+  }
+  const match = /^(?:courses|coordinates)\/([^/]+)$/.exec(rest);
+  if (!match) return false;
+  let id = match[1];
+  try {
+    id = decodeURIComponent(id);
+  } catch {
+    // Keep the raw segment. isFriendToken still checks it.
+  }
+  return isFriendToken(id);
+}
+
 function withTimeout(promise, ms) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("timeout")), ms);
@@ -43,7 +86,6 @@ function withTimeout(promise, ms) {
   });
 }
 
-// In-process OSM overlay. No fetch() back to this Worker, and no golfapi credit.
 async function stockpileOverlay(course, env, ctx) {
   const id = typeof course?.courseId === "string" ? course.courseId.trim() : "";
   if (!/^[A-Za-z0-9._:-]{1,128}$/.test(id) || course.lat == null || course.lng == null) {
@@ -105,15 +147,18 @@ export default {
       if (request.method === "OPTIONS") return new Response(null, { headers: cors });
       return handleFriends(request, url, env, cors);
     }
+    if (request.method !== "OPTIONS" && friendGolfapiBlocked(pathname, url)) {
+      return withLiveCors(new Response(JSON.stringify({ error: "unknown_route" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      }), pathname);
+    }
     if (request.method !== "OPTIONS" && isPrPath(pathname)) {
       const res = await handleGolfProxy(request, env, ctx);
       if (res) return withLiveCors(res, pathname);
     }
     return live.fetch(request, env, ctx);
   },
-  // Only the 23:00 UTC stockpile cron stays here. It checks the balance window
-  // every night. The 08:00 UTC queue drain is permanently off (Doc, Oct 9 2026).
-  // It is not in crons, and this handler does not call it.
   async scheduled(event, env, ctx) {
     if (event && event.cron === STOCKPILE_CRON) {
       return runGolfapiStockpile(env, ctx, event, { overlay: (course) => stockpileOverlay(course, env, ctx) });

@@ -2,7 +2,7 @@
 
 Cloudflare Worker for ShotTraxx live boards and the course paint cache. It also proxies golf course vendor reads so the phone never holds a vendor key, and it fetches OpenStreetMap golf overlays once per location so phones do not call Overpass themselves.
 
-Live boards stay `GET` / `PUT` on a single path segment in the `BOARDS` KV namespace. Paint cache keys start with `id:` or `name:`. Keys that start with `osm:`, `gq:`, `gapi:`, `gqueue:`, `gca:`, `cr:`, or `fr:` are reserved, and so is any key that starts with `v1`.
+Live boards stay `GET` / `PUT` on a single path segment in the `BOARDS` KV namespace. Paint cache keys start with `id:` or `name:`. Keys that start with `osm:`, `gq:`, `gapi:`, `gqueue:`, `gca:`, or `cr:` are reserved, and so is any key that starts with `v1`.
 
 If `env.BOARDS` is not bound, board routes, overlay lookups, golfapi reads, and GCA course reads (`courses/{id}`, `courses/{id}/green-centers`) return `503` `{ "error": "boards_not_configured" }` instead of throwing. GCA search still proxies without that namespace.
 
@@ -14,9 +14,7 @@ Merging to `main` deploys this Worker automatically through Cloudflare Workers B
 
 Board and paint-cache keys are stored only while that binding is present on the live Worker. If it is missing, those routes return `503` `{ "error": "boards_not_configured" }`.
 
-`GET`, `PUT`, and `DELETE` for a reserved prefix return `400` and do not read or write KV, so a board request cannot read, replace, or reset an overlay, a golfapi counter, a stored course, a GCA copy, the refill queue, a course report, or a friend row (`fr:`). Paint keys (`id:`, `name:`) and ordinary board codes are unchanged. A key that starts with `v1` is reserved too, so `GET /v1` cannot read a board.
-
-`fr:` is reserved for anonymous friend data. Friend code rows are `fr:k:` and `fr:code:` only. A percent-encoded `fr:` key, and a key that hides a course id (`fr:id:…`, `fr:name:…`, `fr:osm:…`, `fr:gapi:…`, `fr:gqueue:…`, `fr:gq:…`, `fr:gca:…`, `fr:cr:…`), is still `400` and does not touch KV. An id that starts with `fr:` is rejected before it can write the shared course map cache: OSM overlay, golfapi course, coordinates, and search, GCA course and green-centers, the golfapi refill, and course reports. Those requests do not create `id:`, `name:`, `osm:`, `gq:`, `gapi:`, `gqueue:`, `gca:`, or `cr:` keys.
+`GET`, `PUT`, and `DELETE` for a reserved prefix return `400` and do not read or write KV, so a board request cannot read, replace, or reset an overlay, a golfapi counter, a stored course, a GCA copy, the refill queue, or a course report. Paint keys (`id:`, `name:`) and ordinary board codes are unchanged. A key that starts with `v1` is reserved too, so `GET /v1` cannot read a board.
 
 ## Friends
 
