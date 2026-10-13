@@ -14,11 +14,11 @@ The raw friend key is never written to KV and never returned. The Worker stores 
 
 Request bodies are JSON objects. A field that is not in that call's allowlist, including a `null` placeholder, is `400` `{ "error": "invalid_body" }`. JSON that does not parse, a non-object, or a wrong type is the same error. The one accepted null is unshare: `{ "share": false, "round": null }`. A body over the call's size limit is `413` `{ "error": "payload_too_large" }`. The limit is 2048 bytes, except `publishRound`, which is 8192. An empty body is allowed only where this document says so.
 
-`GET` and `POST` are the methods below, plus `PUT` for `publishRound`. Anything else on a known path is `405` `{ "error": "method_not_allowed" }`. A path under `/v1/` that this document does not list is `404` `{ "error": "unknown_route" }`.
+`GET` and `POST` are the methods below, plus `PUT` for `publishRound`. `OPTIONS` is the CORS preflight: status `200`, empty body, no friend key, and no KV read or write. Any other method on a known friends path is `405` `{ "error": "method_not_allowed" }`. A path under `/v1/friends` that this document does not list is `404` `{ "error": "unknown_route" }`. Existing `/v1/course-reports` is unchanged.
 
 If `BOARDS` is not bound, a call that needs it is `503` `{ "error": "boards_not_configured" }`. Code lookup (and later `sendRequest`, which uses that lookup) needs the guess limiter. If that binding is missing, the call fails closed with `503` `{ "error": "guess_limiter_not_configured" }` and does not read the code.
 
-Responses are JSON, `Cache-Control: no-store`. A limited call also sends `Retry-After` in seconds. CORS for `/v1/friends` allows `GET,POST,OPTIONS` and the `X-Friend-Key` header.
+Responses are JSON, `Cache-Control: no-store`. A limited call also sends `Retry-After` in seconds. CORS for `/v1/friends` allows `GET, POST, PUT, OPTIONS` and the headers `Content-Type` and `X-Friend-Key`.
 
 ## Friend codes
 
@@ -26,7 +26,7 @@ Eight characters from the same unambiguous alphabet as live board codes: `ABCDEF
 
 `getCode` mints a code the first time a friend key is seen and returns the same code after that. `resetCode` replaces it. The old code stops resolving on that request, before the response is sent. There is no grace period.
 
-The public id in round payloads is `ownerId`, a random 128-bit id, not the friend key. `resetCode` keeps `ownerId`.
+The public id in round payloads is `ownerId`, 128 random bits encoded as 22 unpadded base64url characters (`A–Z`, `a–z`, `0–9`, `-`, `_`), not the friend key. `resetCode` keeps `ownerId`.
 
 ## Calls
 
@@ -70,9 +70,9 @@ A real code that is not the caller, and no block in either direction, stores a p
 
 `200` `{ "status": "pending", "ownerId": "<their ownerId>" }`
 
-Already friends: `200` `{ "status": "friends", "ownerId": "<their ownerId>" }` and no second request is stored.
+Already friends: `200` `{ "status": "friends", "ownerId": "<their ownerId>" }` and no second request is stored. A pending request that is already stored returns the same `200` pending body and does not store a second row.
 
-The caller's own code is `400` `{ "error": "invalid_body" }`.
+The caller's own code is `400` `{ "error": "invalid_body" }`. That check is made before the guess limiter and does not consume a guess.
 
 Quiet block: if the target has blocked the caller, the response is the same `200` pending body as a real request. Nothing is stored for the target to accept, and the body is not `blocked`. If the caller has blocked the target, the caller gets `409` `{ "error": "blocked" }`. They already know.
 
@@ -90,7 +90,7 @@ Only the recipient of a pending request can accept. That creates the friendship.
 
 `200` `{ "status": "friends", "ownerId": "<the requester>" }`
 
-No pending request: `409` `{ "error": "not_friends" }`. The caller already blocked that person: `409` `{ "error": "blocked" }`. The caller is the one who was blocked: the same `not_friends` response as when there was never a request. No `blocked` signal.
+No pending request: `409` `{ "error": "not_friends" }`. The caller already blocked that person: `409` `{ "error": "blocked" }`. The caller is the one who was blocked: the same `not_friends` response as when there was never a request. No `blocked` signal. There is no decline call. A pending request stays pending until the recipient accepts or blocks.
 
 ### remove
 
@@ -162,7 +162,7 @@ No body.
 
 `200` `{ "rounds": [ ] }`
 
-Each entry is a stored round from an accepted friend, plus the caller's own published rounds. Rounds removed or blocked are already gone. Omitted stat fields stay omitted.
+Each entry is a stored round from an accepted friend, plus the caller's own published rounds. Rounds removed or blocked are already gone. Omitted stat fields stay omitted. The response is the full list. There is no cursor.
 
 ## Code lookup
 
@@ -215,7 +215,7 @@ Allowlist at the top level: `id`, `ownerId`, `courseName`, `playedOn`, `gross`, 
 | `playedOn` | `YYYY-MM-DD`. |
 | `gross` | Integer, 1–200. |
 | `toPar` | Integer, −40 through 200. |
-| `holes` | Array, 1–18 objects. Hole numbers are unique and run from 1 to 18. |
+| `holes` | Array of 1–18 objects. Each `hole` is an integer from 1 to 18, and the numbers are unique. A nine-hole round does not have to include holes 10–18. |
 
 Each hole allowlist: `hole`, `score`, `par`, and the optional stats below.
 
@@ -250,7 +250,7 @@ Example with FIR and putts on, and GIR and clubs off:
 }
 ```
 
-League scores are these shared rounds. The Worker keeps one for up to 1 year (`expirationTtl` of 365 days) or until `remove` or `block` deletes it, whichever comes first. Text filtering for league titles and report notes is not part of this contract. Those fields are unknown today. Filtering comes later.
+League scores are these shared rounds. The Worker keeps one for up to 1 year (`expirationTtl` of 365 days) or until `remove`, `block`, or unshare (`share: false` with `round: null`) deletes it, whichever comes first. Text filtering for league titles and report notes is not part of this contract. Those fields are unknown today. Filtering comes later.
 
 ## Storage
 
