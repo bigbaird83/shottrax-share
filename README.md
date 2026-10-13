@@ -6,7 +6,7 @@ Live boards stay `GET` / `PUT` on a single path segment in the `BOARDS` KV names
 
 If `env.BOARDS` is not bound, board routes, overlay lookups, golfapi reads, and GCA course reads (`courses/{id}`, `courses/{id}/green-centers`) return `503` `{ "error": "boards_not_configured" }` instead of throwing. GCA search still proxies without that namespace.
 
-Merging to `main` deploys this Worker automatically through Cloudflare Workers Builds. A hand `wrangler deploy` is not required. The Workers Builds check fails immediately on every branch other than `main`. That failure is a Cloudflare branch-build setting, not a problem in this repo. After the merge build finishes, verify with the Magnolia curl below.
+Merging to `main` deploys this Worker automatically through Cloudflare Workers Builds. A hand `npx wrangler deploy` is not required. That command uses the wrangler version pinned in `package.json`. The Workers Builds check fails immediately on every branch other than `main`. That failure is a Cloudflare branch-build setting, not a problem in this repo. After the merge build finishes, verify with the Magnolia curl below.
 
 ## Boards KV
 
