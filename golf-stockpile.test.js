@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { describe, test } from 'vitest';
 import { GolfapiCounter, handleGolfProxy } from './golf-proxy.js';
 import {
@@ -1185,28 +1184,69 @@ describe('golfapi stockpile', () => {
     }
   });
 
-  test('an unset monthly cap stops the stockpile when month usage is already 450', async () => {
-    const counter = new FakeCounter();
-    const env = {
-      GOLFAPI_KEY: 'golf-secret',
-      GOLFAPI_KV: new FakeKV(),
-      GOLFAPI_COUNTER: counter,
-      GOLFAPI_STOCKPILE_ENABLED: 'true',
-      GOLFAPI_ROLLOVER_CREDITS: '156',
-      GOLFAPI_CREDIT_FLOOR: '50',
-      GOLFAPI_DAILY_CAP: '150',
-      GOLFAPI_STOCKPILE_DAY_HEADROOM: '30',
-      GOLFAPI_STOCKPILE_RUN_CREDITS: '800',
-      GOLFAPI_CYCLE_DAY: '5',
-    };
-    assert.equal(env.GOLFAPI_STOCKPILE_ENABLED, 'true');
-    assert.equal(Object.hasOwn(env, 'GOLFAPI_MONTHLY_CAP'), false);
-    const at = Date.parse('2026-10-29T23:00:00Z');
-    const keys = stockpileKeys(new Date(at), env);
-    counter.sql.map.set(keys.monthKey, '450');
-    assert.equal(counter.sql.map.get(keys.monthKey), '450');
-    const src = readFileSync(new URL('./golf-stockpile.js', import.meta.url), 'utf8');
-    assert.match(src, /const monthCap = envNumber\(env, 'GOLFAPI_MONTHLY_CAP', 450\);/);
+  test('the stockpile keeps pulling at month usage 449 and 450 when the monthly cap is unset', async () => {
+    const at = Date.parse('2026-10-29T23:00:00.000Z');
+    const runs = [];
+    for (const monthUsed of [449, 450]) {
+      const counter = new FakeCounter();
+      const charges = [];
+      const innerFetch = counter.stub.fetch.bind(counter.stub);
+      counter.stub.fetch = async (request) => {
+        const body = await request.clone().json();
+        if (body.op === 'stockpileCharge') charges.push(body);
+        return innerFetch(request);
+      };
+      const env = {
+        GOLFAPI_KEY: 'golf-secret',
+        GOLFAPI_KV: new FakeKV(),
+        GOLFAPI_COUNTER: counter,
+        GOLFAPI_STOCKPILE_ENABLED: 'true',
+        GOLFAPI_ROLLOVER_CREDITS: '156',
+        GOLFAPI_CREDIT_FLOOR: '50',
+        GOLFAPI_DAILY_CAP: '150',
+        GOLFAPI_STOCKPILE_DAY_HEADROOM: '30',
+        GOLFAPI_STOCKPILE_RUN_CREDITS: '800',
+        GOLFAPI_CYCLE_DAY: '5',
+        ALERT_EMAIL: { async send() {} },
+      };
+      assert.equal(env.GOLFAPI_STOCKPILE_ENABLED, 'true');
+      assert.equal(Object.hasOwn(env, 'GOLFAPI_MONTHLY_CAP'), false);
+      const keys = stockpileKeys(new Date(at), env);
+      counter.sql.map.set(keys.monthKey, String(monthUsed));
+      await seedDemand(counter, keys.cycleId, { courseId: 'month-cap', name: 'Month Cap' });
+      const http = installFetch((url) => {
+        const discovery = url.includes('city=') || url.includes('state=');
+        return jsonResponse(discovery ? { courses: [], apiRequestsLeft: 400 } : {
+          courses: [],
+          courseID: 'month-cap',
+          country: 'US',
+          latitude: 34.7,
+          longitude: -92.2,
+          numHoles: 1,
+          hasGPS: 1,
+          apiRequestsLeft: 400,
+          coordinates: [
+            { hole: 1, poi: 1, latitude: 34.7, longitude: -92.2 },
+            { hole: 1, poi: 11, latitude: 34.71, longitude: -92.21 },
+          ],
+        });
+      });
+      try {
+        const result = await runGolfapiStockpile(env, {}, bulkEvent(at), { overlay: () => ({ kind: 'gap' }) });
+        assert.equal(result.stopped, null, String(monthUsed));
+        assert.equal(result.added, 1, String(monthUsed));
+        assert.equal(result.schedule.todayBudget, 34.9, String(monthUsed));
+        assert.equal(counter.sql.map.get(keys.monthKey), String(monthUsed));
+        assert.equal(charges.length > 0, true, String(monthUsed));
+        assert.equal(charges.every((body) => !Object.hasOwn(body, 'monthCap')), true, String(monthUsed));
+        runs.push({ monthUsed, spent: result.spent, calls: http.calls.length });
+      } finally {
+        http.restore();
+      }
+    }
+    assert.equal(runs[0].spent, runs[1].spent);
+    assert.equal(runs[0].calls, runs[1].calls);
+    assert.equal(runs[1].spent > 0, true);
   });
 
   test('a missing run ceiling does not fall back to 80 or call golfapi', async () => {
