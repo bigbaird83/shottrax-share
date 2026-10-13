@@ -21,4 +21,14 @@ describe("predeploy-check", () => {
     expect(checkWrangler(withGolfapiId("")).join("\n")).toContain("empty");
     expect(checkWrangler(withGolfapiId(BOARDS_KV_ID)).join("\n")).toContain(BOARDS_KV_ID);
   });
+
+  it("rejects a cron other than the 23:00 stockpile", () => {
+    const bad = toml.replace('crons = ["0 23 * * *"]', 'crons = ["0 8 * * *"]');
+    expect(checkWrangler(bad).join("\n")).toContain('["0 23 * * *"]');
+  });
+
+  it("rejects a main other than entry.js", () => {
+    const bad = toml.replace('main = "entry.js"', 'main = "live-shottrax-share.js"');
+    expect(checkWrangler(bad).join("\n")).toContain("entry.js");
+  });
 });
