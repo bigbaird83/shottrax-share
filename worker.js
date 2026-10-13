@@ -4196,8 +4196,9 @@ const PAINT_PENDING_PREFIX = "v1:paint-pending:";
 const PAINT_PENDING_TTL = 60 * 60 * 24 * 180;
 const PAINT_RECORD_TTL = 60 * 60 * 24 * 365;
 export const PAINT_PROMOTE_PATH = "/v1/paint-pending/promote";
-// Live allows osm, manual_verified, gca, and golfapi.
-const PAINT_SOURCES = new Set(["osm", "manual_verified", "gca", "golfapi"]);
+// Live allows osm, manual_verified, gca, and golfapi. opengolf is an extra
+// source the partial-merge cache already stores.
+const PAINT_SOURCES = new Set(["osm", "manual_verified", "gca", "golfapi", "opengolf"]);
 const PAINT_COURSE_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:~-]{0,127}$/;
 const PAINT_GET_PER_MIN_DEFAULT = 120;
 const PAINT_PUT_PER_MIN_DEFAULT = 20;

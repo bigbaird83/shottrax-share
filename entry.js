@@ -44,7 +44,7 @@ export { GolfapiCounter };
 //     on PUT, per-IP rate limit, record shape, green-move guard) and then the
 //     same partial merge. Main's fetch stores the body directly. Resolved:
 //     this entry uses handlePaintRoute. Allowed sources are osm,
-//     manual_verified, gca, and golfapi. A name
+//     manual_verified, gca, golfapi, and opengolf. A name
 //     key that is not three normalized parts is 400, which is what live does.
 //     worker.fetch still accepts the older unvalidated paint PUT so the
 //     partial-merge tests keep their direct path.
