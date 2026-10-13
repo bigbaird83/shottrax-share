@@ -4,9 +4,18 @@
 // Only the golf-proxy paths go to golf-proxy.js.
 import live from "./live-shottrax-share.js";
 import { coverageFromOverlayResponse, handleGolfProxy, GolfapiCounter, runGolfapiStockpile, STOCKPILE_CRON } from "./golf-proxy.js";
+import { FriendGuessLimiter, handleFriends, isFriendPath } from "./friends.js";
 
 export { GolfapiCounter };
-export { FriendGuessLimiter } from "./worker.js";
+export { FriendGuessLimiter };
+
+function friendCors() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET,POST,PUT,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, X-Friend-Key, X-Install-Id",
+  };
+}
 
 function isPrPath(p) {
   return (
@@ -89,7 +98,13 @@ function withLiveCors(response, pathname) {
 
 export default {
   async fetch(request, env, ctx) {
-    const { pathname } = new URL(request.url);
+    const url = new URL(request.url);
+    const { pathname } = url;
+    if (isFriendPath(pathname)) {
+      const cors = friendCors();
+      if (request.method === "OPTIONS") return new Response(null, { headers: cors });
+      return handleFriends(request, url, env, cors);
+    }
     if (request.method !== "OPTIONS" && isPrPath(pathname)) {
       const res = await handleGolfProxy(request, env, ctx);
       if (res) return withLiveCors(res, pathname);

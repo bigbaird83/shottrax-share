@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import entry from "./entry.js";
 import worker, { FriendGuessLimiter } from "./worker.js";
 import { limiterNameForFriendKey } from "./friends.js";
 
@@ -482,6 +483,19 @@ describe("friend codes", () => {
     expect(toml).toMatch(/new_sqlite_classes = \["FriendGuessLimiter"\]/);
     expect(toml).not.toMatch(/^\s*new_classes\s*=/m);
     expect(toml).toContain('binding = "BOARDS"');
+  });
+
+  it("serves getCode from the deploy entry", async () => {
+    const key = friendKey("entry");
+    const response = await entry.fetch(new Request(`${ORIGIN}/v1/friends/code`, {
+      method: "POST",
+      headers: { "X-Friend-Key": key, "Content-Type": "application/json" },
+      body: "{}",
+    }), env, { waitUntil() {} });
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.code).toMatch(CODE_RE);
+    expect(body.ownerId).toMatch(OWNER_RE);
   });
 
   it("answers the friends preflight without a friend key", async () => {
