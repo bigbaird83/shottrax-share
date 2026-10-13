@@ -280,47 +280,38 @@ describe("surviving mutant boundaries", () => {
     expect(fetchMock).toHaveBeenCalled();
   });
 
-  it("refuses a stockpile charge when golfer spare is under the day headroom and pulls nothing", () => {
-    const golferDayKey = "golfapi:credit:day:golfer";
-    const stockpileDayKey = "golfapi:stockpile:credit:day";
-    const stockpileMonthKey = "golfapi:stockpile:credit:month";
-    const body = {
-      golferDayKey,
-      stockpileDayKey,
-      stockpileMonthKey,
-      dayCap: 150,
-      dayHeadroomTenths: 300,
-      runCap: 800,
-      chargeTenths: 10,
-    };
-    const tight = counter();
-    tight.putCredits(golferDayKey, 1201);
-    expect(tight.stockpileCharge(body)).toEqual({ ok: false, reason: "app_daily" });
-    expect(tight.creditTenths(stockpileDayKey)).toBe(0);
-    expect(tight.creditTenths(stockpileMonthKey)).toBe(0);
-
-    const room = counter();
-    room.putCredits(golferDayKey, 1200);
-    expect(room.stockpileCharge(body)).toEqual({ ok: true });
-    expect(room.creditTenths(stockpileDayKey)).toBe(10);
+  it("allows a stockpile charge after 120 golfer pulls against the live daily cap", () => {
+    const { env, body, box } = stockpileChargeBox(120);
+    expect(env.GOLFAPI_STOCKPILE_ENABLED).toBe("true");
+    expect(env.GOLFAPI_DAILY_CAP).toBe("150");
+    expect(env.GOLFAPI_STOCKPILE_DAY_HEADROOM).toBe("30");
+    expect(box.stockpileCharge(body)).toEqual({ ok: true });
+    expect(box.creditTenths(body.stockpileDayKey)).toBe(10);
   });
 
-  it("refuses a stockpile charge of runCap plus a tenth and allows exactly runCap", () => {
-    const body = {
-      golferDayKey: "golfapi:credit:day:golfer",
-      stockpileDayKey: "golfapi:stockpile:credit:day",
-      stockpileMonthKey: "golfapi:stockpile:credit:month",
-      dayCap: 150,
-      dayHeadroomTenths: 0,
-      runCap: 10,
-    };
-    const exact = counter();
-    expect(exact.stockpileCharge({ ...body, chargeTenths: 100 })).toEqual({ ok: true });
-    expect(exact.creditAmount(body.stockpileDayKey)).toBe(10);
+  it("refuses a stockpile charge after 121 golfer pulls and pulls nothing", () => {
+    const { env, body, box } = stockpileChargeBox(121);
+    expect(env.GOLFAPI_STOCKPILE_ENABLED).toBe("true");
+    expect(box.stockpileCharge(body)).toEqual({ ok: false, reason: "app_daily" });
+    expect(box.creditTenths(body.stockpileDayKey)).toBe(0);
+    expect(box.creditTenths(body.stockpileMonthKey)).toBe(0);
+  });
 
-    const over = counter();
-    expect(over.stockpileCharge({ ...body, chargeTenths: 101 })).toEqual({ ok: false, reason: "run_cap" });
-    expect(over.creditTenths(body.stockpileDayKey)).toBe(0);
+  it("allows a stockpile charge that lands on exactly runCap", () => {
+    const { env, body, box } = stockpileChargeBox(0);
+    const runCap = Number(env.GOLFAPI_STOCKPILE_RUN_CREDITS);
+    expect(env.GOLFAPI_STOCKPILE_ENABLED).toBe("true");
+    expect(box.stockpileCharge({ ...body, chargeTenths: runCap * 10 })).toEqual({ ok: true });
+    expect(box.creditAmount(body.stockpileDayKey)).toBe(runCap);
+  });
+
+  it("refuses a stockpile charge of runCap plus a tenth", () => {
+    const { env, body, box } = stockpileChargeBox(0);
+    const runCap = Number(env.GOLFAPI_STOCKPILE_RUN_CREDITS);
+    expect(env.GOLFAPI_STOCKPILE_ENABLED).toBe("true");
+    expect(box.stockpileCharge({ ...body, chargeTenths: runCap * 10 + 1 })).toEqual({ ok: false, reason: "run_cap" });
+    expect(box.creditTenths(body.stockpileDayKey)).toBe(0);
+    expect(box.creditTenths(body.stockpileMonthKey)).toBe(0);
   });
 
   it("gives an empty-search row max-age 0 when it expires at this instant", async () => {
@@ -354,14 +345,17 @@ describe("surviving mutant boundaries", () => {
     }
   });
 
-  it("starts the next stockpile slot on the following 23:00 once now is past 23:00 UTC", () => {
-    const onTime = new Date("2026-10-29T23:00:00.000Z");
-    const after = new Date("2026-10-29T23:00:01.000Z");
-    const onSlots = stockpileRunSlots(onTime, 5);
-    const afterSlots = stockpileRunSlots(after, 5);
-    expect(onSlots[0]).toBe(Date.parse("2026-10-29T23:00:00.000Z"));
-    expect(afterSlots[0]).toBe(Date.parse("2026-10-30T23:00:00.000Z"));
-    expect(afterSlots.length).toBe(onSlots.length - 1);
+  it("keeps today's 23:00 slot when the faked clock is just before 23:00 UTC", () => {
+    const slots = slotsAt("2026-10-29T22:59:59.000Z");
+    expect(slots[0]).toBe(Date.parse("2026-10-29T23:00:00.000Z"));
+    expect(slots.length).toBe(7);
+  });
+
+  it("moves the first stockpile slot to the next day when the faked clock is just after 23:00 UTC", () => {
+    const before = slotsAt("2026-10-29T22:59:59.000Z");
+    const after = slotsAt("2026-10-29T23:00:01.000Z");
+    expect(after[0]).toBe(Date.parse("2026-10-30T23:00:00.000Z"));
+    expect(after.length).toBe(before.length - 1);
   });
 
   it("blocks the monthly budget only once the next open would pass it", async () => {
@@ -400,4 +394,43 @@ describe("surviving mutant boundaries", () => {
 
 function floorSafe() {
   return limits.floor + openNeed + 100;
+}
+
+function stockpileEnv() {
+  return {
+    GOLFAPI_STOCKPILE_ENABLED: "true",
+    GOLFAPI_DAILY_CAP: "150",
+    GOLFAPI_STOCKPILE_DAY_HEADROOM: "30",
+    GOLFAPI_STOCKPILE_RUN_CREDITS: "800",
+    GOLFAPI_CYCLE_DAY: "5",
+  };
+}
+
+function stockpileChargeBox(golferPulls) {
+  const env = stockpileEnv();
+  const box = counter();
+  const golferDayKey = "golfapi:credit:day:2026-10-29";
+  const body = {
+    golferDayKey,
+    stockpileDayKey: "golfapi:stockpile:credit:day:2026-10-29",
+    stockpileMonthKey: "golfapi:stockpile:credit:month:2026-10-05",
+    dayCap: Number(env.GOLFAPI_DAILY_CAP),
+    dayHeadroomTenths: Number(env.GOLFAPI_STOCKPILE_DAY_HEADROOM) * 10,
+    runCap: Number(env.GOLFAPI_STOCKPILE_RUN_CREDITS),
+    chargeTenths: 10,
+  };
+  box.putCredits(golferDayKey, golferPulls * 10);
+  return { env, body, box };
+}
+
+function slotsAt(iso) {
+  vi.useFakeTimers();
+  vi.setSystemTime(Date.parse(iso));
+  try {
+    const env = stockpileEnv();
+    expect(env.GOLFAPI_STOCKPILE_ENABLED).toBe("true");
+    return stockpileRunSlots(new Date(), Number(env.GOLFAPI_CYCLE_DAY));
+  } finally {
+    vi.useRealTimers();
+  }
 }

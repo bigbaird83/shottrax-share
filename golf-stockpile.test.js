@@ -1185,7 +1185,26 @@ describe('golfapi stockpile', () => {
     }
   });
 
-  test('an unset monthly cap stays 450 so a month already at 450 can stop the stockpile', () => {
+  test('an unset monthly cap stops the stockpile when month usage is already 450', async () => {
+    const counter = new FakeCounter();
+    const env = {
+      GOLFAPI_KEY: 'golf-secret',
+      GOLFAPI_KV: new FakeKV(),
+      GOLFAPI_COUNTER: counter,
+      GOLFAPI_STOCKPILE_ENABLED: 'true',
+      GOLFAPI_ROLLOVER_CREDITS: '156',
+      GOLFAPI_CREDIT_FLOOR: '50',
+      GOLFAPI_DAILY_CAP: '150',
+      GOLFAPI_STOCKPILE_DAY_HEADROOM: '30',
+      GOLFAPI_STOCKPILE_RUN_CREDITS: '800',
+      GOLFAPI_CYCLE_DAY: '5',
+    };
+    assert.equal(env.GOLFAPI_STOCKPILE_ENABLED, 'true');
+    assert.equal(Object.hasOwn(env, 'GOLFAPI_MONTHLY_CAP'), false);
+    const at = Date.parse('2026-10-29T23:00:00Z');
+    const keys = stockpileKeys(new Date(at), env);
+    counter.sql.map.set(keys.monthKey, '450');
+    assert.equal(counter.sql.map.get(keys.monthKey), '450');
     const src = readFileSync(new URL('./golf-stockpile.js', import.meta.url), 'utf8');
     assert.match(src, /const monthCap = envNumber\(env, 'GOLFAPI_MONTHLY_CAP', 450\);/);
   });
