@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import entry from "./entry.js";
 import { GolfapiCounter, handleGolfProxy } from "./golf-proxy.js";
-import { stockpilePhase, stockpileSchedule } from "./golf-stockpile.js";
+import { stockpilePhase, stockpileRunSlots, stockpileSchedule } from "./golf-stockpile.js";
 import live, {
   __resetHotfixMemoryForTests,
   billingPeriod,
@@ -278,6 +278,90 @@ describe("surviving mutant boundaries", () => {
     expect(allowed.status).toBe(200);
     expect(allowed.json.courseID).toBe("14322");
     expect(fetchMock).toHaveBeenCalled();
+  });
+
+  it("refuses a stockpile charge when golfer spare is under the day headroom and pulls nothing", () => {
+    const golferDayKey = "golfapi:credit:day:golfer";
+    const stockpileDayKey = "golfapi:stockpile:credit:day";
+    const stockpileMonthKey = "golfapi:stockpile:credit:month";
+    const body = {
+      golferDayKey,
+      stockpileDayKey,
+      stockpileMonthKey,
+      dayCap: 150,
+      dayHeadroomTenths: 300,
+      runCap: 800,
+      chargeTenths: 10,
+    };
+    const tight = counter();
+    tight.putCredits(golferDayKey, 1201);
+    expect(tight.stockpileCharge(body)).toEqual({ ok: false, reason: "app_daily" });
+    expect(tight.creditTenths(stockpileDayKey)).toBe(0);
+    expect(tight.creditTenths(stockpileMonthKey)).toBe(0);
+
+    const room = counter();
+    room.putCredits(golferDayKey, 1200);
+    expect(room.stockpileCharge(body)).toEqual({ ok: true });
+    expect(room.creditTenths(stockpileDayKey)).toBe(10);
+  });
+
+  it("refuses a stockpile charge of runCap plus a tenth and allows exactly runCap", () => {
+    const body = {
+      golferDayKey: "golfapi:credit:day:golfer",
+      stockpileDayKey: "golfapi:stockpile:credit:day",
+      stockpileMonthKey: "golfapi:stockpile:credit:month",
+      dayCap: 150,
+      dayHeadroomTenths: 0,
+      runCap: 10,
+    };
+    const exact = counter();
+    expect(exact.stockpileCharge({ ...body, chargeTenths: 100 })).toEqual({ ok: true });
+    expect(exact.creditAmount(body.stockpileDayKey)).toBe(10);
+
+    const over = counter();
+    expect(over.stockpileCharge({ ...body, chargeTenths: 101 })).toEqual({ ok: false, reason: "run_cap" });
+    expect(over.creditTenths(body.stockpileDayKey)).toBe(0);
+  });
+
+  it("gives an empty-search row max-age 0 when it expires at this instant", async () => {
+    const kv = new MemoryKv();
+    const now = Date.now();
+    await kv.put("golfapi:permanent:search:country=US&name=Expired", JSON.stringify({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ courses: [] }),
+      emptySearchTtl: 604800,
+      emptySearchUntil: now,
+    }));
+    const previousFetch = globalThis.fetch;
+    let fetched = 0;
+    try {
+      globalThis.fetch = async () => {
+        fetched += 1;
+        return new Response("should-not-fetch", { status: 500 });
+      };
+      const response = await handleGolfProxy(
+        new Request(`${ORIGIN}/golfapi/v2.3/courses?country=US&name=Expired&stored=1`),
+        proxyEnv(kv),
+        {},
+      );
+      expect(response.status).toBe(404);
+      expect(fetched).toBe(0);
+      const src = readFileSync(new URL("./golf-proxy.js", import.meta.url), "utf8");
+      expect(src).toContain("if (remaining <= 0) return 0;");
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
+  it("starts the next stockpile slot on the following 23:00 once now is past 23:00 UTC", () => {
+    const onTime = new Date("2026-10-29T23:00:00.000Z");
+    const after = new Date("2026-10-29T23:00:01.000Z");
+    const onSlots = stockpileRunSlots(onTime, 5);
+    const afterSlots = stockpileRunSlots(after, 5);
+    expect(onSlots[0]).toBe(Date.parse("2026-10-29T23:00:00.000Z"));
+    expect(afterSlots[0]).toBe(Date.parse("2026-10-30T23:00:00.000Z"));
+    expect(afterSlots.length).toBe(onSlots.length - 1);
   });
 
   it("blocks the monthly budget only once the next open would pass it", async () => {
