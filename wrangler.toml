@@ -1,51 +1,53 @@
+# Deploy config for the live Worker shottrax-share.
+# One source: entry.js serves share/board routes and the golf proxy.
 name = "shottrax-share"
-main = "worker.js"
+main = "entry.js"
 compatibility_date = "2026-09-23"
+workers_dev = true
 
-# Existing KV namespace "shottrax-boards".
-# Binding name must stay BOARDS so it matches env.BOARDS in worker.js.
-# Keep this id on every `wrangler deploy` so a dashboard bind is not dropped.
-# preview_id is omitted; add one only after creating a preview namespace.
+# Live binding, unchanged: share boards, paint, gca:/gapi:/gq:/cr:/osm: keys.
 [[kv_namespaces]]
 binding = "BOARDS"
 id = "cfa1824a10374ab6a7fa0c97d0990e80"
 
-# Daily refill of queued golfapi course ids and searches. 08:00 UTC is early morning in the US.
-[triggers]
-crons = ["0 8 * * *"]
+# Golfapi bodies and terrain blobs. Not shottrax-boards.
+[[kv_namespaces]]
+binding = "GOLFAPI_KV"
+id = "587c98f5372647a88bc9418aa076827a"
 
-# Golfapi quota overrides. Unset vars use the defaults documented at the top of worker.js.
-# IP limits default to twice the matching device limit. The API key is a secret, not a var:
-#   wrangler secret put GOLFAPI_KEY
-# Allowlisted install ids are a secret too, so they stay out of git and survive deploys:
-#   wrangler secret put GOLFAPI_ALLOWLIST
-# The value is comma-separated install ids. Those phones skip device, IP, search,
-# and the global cap. The balance floor still applies.
-# Live board page (GET /s/{code}). Leave STORE_LIVE unset until ShotTraxx is live in
-# the App Store; "true" adds the App Store banner and the App Store card. See README.
-# [vars]
-# STORE_LIVE = "true"
-# GOLFAPI_DEVICE_DAY = "3"
-# GOLFAPI_DEVICE_WEEK = "10"
-# GOLFAPI_DEVICE_MONTH = "20"
-# GOLFAPI_IP_DAY = "6"
-# GOLFAPI_IP_WEEK = "20"
-# GOLFAPI_IP_MONTH = "40"
-# GOLFAPI_GLOBAL_DAY = "100"
-# GOLFAPI_FLOOR = "10"
-# A search + course + coordinates set stays open for 15 minutes.
-# Fresh searches are also capped at 3x GOLFAPI_DEVICE_DAY per device per day.
-# GOLFAPI_SEARCH_* vars are not read.
-# GCA course and green-centers copies refresh after this many days. Default 30.
-# GCA_REFRESH_DAYS = "30"
-# Require X-Install-Id on /gca/v1/*. Leave unset. Installed builds do not send
-# the header on GCA, so turning this on would reject them. While it is off,
-# those calls are counted as missingInstallId on GET /meta/gca.
-# GCA_REQUIRE_INSTALL_ID = "true"
-# In-round course/hole reports (POST /v1/course-reports). Defaults are 30 new
-# reports per IP per UTC day and 20 per X-Install-Id. Invalid values keep the defaults.
-# COURSE_REPORTS_IP_DAY = "30"
-# COURSE_REPORTS_DEVICE_DAY = "20"
-# Admin GET /v1/course-reports is a secret, not a var. Leave it unset until the
-# list should open; unset fails closed with 503. Do not commit the token.
-#   wrangler secret put COURSE_REPORTS_ADMIN_TOKEN
+[[durable_objects.bindings]]
+name = "GOLFAPI_COUNTER"
+class_name = "GolfapiCounter"
+
+[[migrations]]
+tag = "v1-golfapi-counter"
+new_sqlite_classes = ["GolfapiCounter"]
+
+[[send_email]]
+name = "ALERT_EMAIL"
+destination_address = "shottraxx@gmail.com"
+
+# 23:00 UTC every day. The handler decides from the live balance whether
+# this night is inside the stockpile window. The 08:00 UTC queue drain is off.
+[triggers]
+crons = ["0 23 * * *"]
+
+[vars]
+GOLFAPI_INSTALL_DAILY_PULLS = "4"
+GOLFAPI_INSTALL_DAILY_SEARCHES = "30"
+GOLFAPI_INSTALL_DAILY_CALL_BACKSTOP = "20"
+GOLFAPI_DAILY_CAP = "150"
+GOLFAPI_MONTHLY_CAP = "450"
+GOLFAPI_CREDIT_FLOOR = "50"
+GOLFAPI_PLAN_MONTHLY = "500"
+GOLFAPI_CYCLE_DAY = "5"
+GOLFAPI_ROLLOVER_CREDITS = "156"
+GOLFAPI_STOCKPILE_ENABLED = "false"
+GOLFAPI_STOCKPILE_DAY_HEADROOM = "30"
+GOLFAPI_STOCKPILE_RUN_CREDITS = "800"
+GOLFAPI_STOCKPILE_MAX_DAYS = "7"
+GOLFAPI_STOCKPILE_DRY_RUN = "false"
+ALERT_TO = "shottraxx@gmail.com"
+ALERT_FROM = "alerts@shottraxx.com"
+TERRAIN_INSTALL_DAILY_CAP = "54"
+TERRAIN_MAX_GRID_POINTS = "6000"
