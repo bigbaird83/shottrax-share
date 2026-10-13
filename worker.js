@@ -555,6 +555,21 @@ function golfapiSearchQuery(url) {
   return null;
 }
 
+/**
+ * True when this golfapi path is an fr: course id or an fr: search.
+ * That decision has to happen before the missing-install counter: that
+ * counter is the one golfapi write that runs before route parsing.
+ */
+function isFriendGolfapiRoute(rest, url) {
+  if (typeof rest !== "string") return false;
+  if (rest === "courses") {
+    const query = golfapiSearchQuery(url);
+    return query != null && isFriendKey(normalizeName(query));
+  }
+  const match = /^(?:courses|coordinates)\/([^/]+)$/.exec(rest);
+  return Boolean(match && isFriendKey(match[1]));
+}
+
 function parseGolfapiRest(rest, url) {
   if (rest === "courses") {
     const query = golfapiSearchQuery(url);
@@ -1956,6 +1971,11 @@ async function handleGolfProxy(request, env, ctx, cors) {
   const hit = matchGolfVendor(url.pathname);
   if (!hit) return null;
   if (hit.vendor.secret === "GOLFAPI_KEY") {
+    // Reject fr: before noteGolfapiInstallRequired. That helper writes gq:stats
+    // for every golfapi call that has no install id, including these routes.
+    if (isFriendGolfapiRoute(hit.rest, url)) {
+      return golfJson(404, { error: "unknown_route" }, cors);
+    }
     if (!readInstallId(request)) {
       await noteGolfapiInstallRequired(env);
       return golfJson(401, { error: "install_id_required" }, cors);

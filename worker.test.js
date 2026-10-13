@@ -4931,6 +4931,22 @@ describe("shottrax-share worker", () => {
     expect(golfSearch.status).toBe(404);
     const golfSearchEncoded = await golfGet("/golfapi/v2.3/courses?name=fr%253Afriend-search");
     expect(golfSearchEncoded.status).toBe(404);
+    // No install id: the missing-install counter must not open a gq: row either.
+    const bareCourse = await golfGet(`/golfapi/v2.3/courses/${encodeURIComponent("fr:friend-golf")}`, { install: null });
+    expect(bareCourse.status).toBe(404);
+    expect(await bareCourse.json()).toEqual({ error: "unknown_route" });
+    const bareCoord = await golfGet(`/golfapi/v2.3/coordinates/${encodeURIComponent("fr:friend-coord")}`, { install: null });
+    expect(bareCoord.status).toBe(404);
+    expect(await bareCoord.json()).toEqual({ error: "unknown_route" });
+    const bareSearch = await golfGet(`/golfapi/v2.3/courses?name=${encodeURIComponent("fr:friend-search")}`, { install: null });
+    expect(bareSearch.status).toBe(404);
+    expect(await bareSearch.json()).toEqual({ error: "unknown_route" });
+    const bareSearchEncoded = await golfGet("/golfapi/v2.3/courses?name=fr%253Afriend-search", { install: null });
+    expect(bareSearchEncoded.status).toBe(404);
+    expect(await bareSearchEncoded.json()).toEqual({ error: "unknown_route" });
+    const bareEncoded = await golfGet("/golfapi/v2.3/courses/fr%253Afriend-encoded", { install: null });
+    expect(bareEncoded.status).toBe(404);
+    expect(await bareEncoded.json()).toEqual({ error: "unknown_route" });
 
     const gcaHeaders = { "X-Install-Id": INSTALL };
     const gcaCourse = await invoke(`${ORIGIN}/gca/v1/courses/${encodeURIComponent("fr:friend-gca")}`, { headers: gcaHeaders });
