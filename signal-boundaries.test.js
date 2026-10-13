@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import entry from "./entry.js";
 import { GolfapiCounter, handleGolfProxy } from "./golf-proxy.js";
@@ -216,10 +215,6 @@ describe("surviving mutant boundaries", () => {
     expect(schedule.todayBudget).toBe(285.7);
     expect(schedule.finalBalance).toBe(156);
     expect(schedule.runs.every((row) => row.balanceAfter >= 156)).toBe(true);
-    const src = readFileSync(new URL("./golf-stockpile.js", import.meta.url), "utf8");
-    expect(src).toContain(
-      "if (balance - budget < Number(rollover)) budget = roundCredit(Math.max(0, balance - Number(rollover)));",
-    );
   });
 
   it("clamps a longer stockpile setting to the last 7 nights", () => {
@@ -338,8 +333,39 @@ describe("surviving mutant boundaries", () => {
       );
       expect(response.status).toBe(404);
       expect(fetched).toBe(0);
-      const src = readFileSync(new URL("./golf-proxy.js", import.meta.url), "utf8");
-      expect(src).toContain("if (remaining <= 0) return 0;");
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
+  it("serves an empty-search row with only the seconds it has left", async () => {
+    const kv = new MemoryKv();
+    const now = Date.now();
+    await kv.put("golfapi:permanent:search:country=US&name=Soon", JSON.stringify({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ courses: [] }),
+      emptySearchTtl: 604800,
+      emptySearchUntil: now + 10_000,
+    }));
+    const previousFetch = globalThis.fetch;
+    let fetched = 0;
+    try {
+      globalThis.fetch = async () => {
+        fetched += 1;
+        return new Response("should-not-fetch", { status: 500 });
+      };
+      const response = await handleGolfProxy(
+        new Request(`${ORIGIN}/golfapi/v2.3/courses?country=US&name=Soon&stored=1`),
+        proxyEnv(kv),
+        {},
+      );
+      expect(response.status).toBe(200);
+      expect(fetched).toBe(0);
+      const maxAge = Number(String(response.headers.get("Cache-Control")).replace(/^public, max-age=/, ""));
+      expect(maxAge).toBeGreaterThan(0);
+      expect(maxAge).toBeLessThanOrEqual(10);
+      expect(response.headers.get("X-ShotTraxx-Golfapi-Empty-Search")).toBe("604800");
     } finally {
       globalThis.fetch = previousFetch;
     }
