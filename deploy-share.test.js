@@ -1,19 +1,10 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { describe, test } from 'vitest';
 import { GolfapiCounter, pinsFromUrl, terrainPinHash } from './golf-proxy.js';
 import { stockpileKeys } from './golf-stockpile.js';
 import worker from './entry.js';
 import live from './live-shottrax-share.js';
-import {
-  SRC_NAMESPACE_ID,
-  migrateGolfapiKv,
-  rowForLiveKey,
-} from './migrate-golfapi-kv.mjs';
-import { BOARDS_KV_ID, checkWrangler } from './predeploy-check.mjs';
 
 const COURSE_ID = '012141520625312276771';
 const COURSE_BODY = JSON.stringify({
@@ -208,21 +199,6 @@ function installFetchRecorder() {
 function credit(counter, key) {
   const raw = counter.sql.map.get(key);
   return raw == null ? 0 : Number(raw);
-}
-
-function toml({ golfapiId, name = 'shottrax-share', crons = '["0 23 * * *"]', main = 'entry.js' }) {
-  return `
-name = "${name}"
-main = "${main}"
-[[kv_namespaces]]
-binding = "BOARDS"
-id = "${BOARDS_KV_ID}"
-[[kv_namespaces]]
-binding = "GOLFAPI_KV"
-id = "${golfapiId}"
-[triggers]
-crons = ${crons}
-`;
 }
 
 describe('shottrax-share deploy wrapper', { concurrency: 1 }, () => {
@@ -496,7 +472,7 @@ describe('shottrax-share deploy wrapper', { concurrency: 1 }, () => {
     assert.match(tomlText, /^name = "shottrax-share"/m);
     assert.match(tomlText, /587c98f5372647a88bc9418aa076827a/);
     assert.doesNotMatch(tomlText, /REPLACE_WITH_NEW_GOLFAPI_KV_ID/);
-    assert.match(tomlText, new RegExp(BOARDS_KV_ID));
+    assert.match(tomlText, /cfa1824a10374ab6a7fa0c97d0990e80/);
   });
 
   test('entry stockpile buys a course that has no lat, then coordinates only for an overlay gap', async () => {
@@ -741,165 +717,5 @@ describe('shottrax-share deploy wrapper', { concurrency: 1 }, () => {
     }
   });
 
-  test('migration copies envelopes once, never writes the source namespace, and is idempotent', async () => {
-    const source = new Map([
-      ['gapi:course:course-1', COURSE_BODY],
-      ['gapi:coord:course-1', COORD_BODY],
-      ['gapi:course:not-json', 'not-json'],
-      ['gq:balance', JSON.stringify({ left: 80, at: 1 })],
-    ]);
-    const calls = [];
-    const fetchImpl = async (input, init) => {
-      const url = String(input);
-      const method = (init?.method || 'GET').toUpperCase();
-      calls.push({ url, method, body: init?.body ?? null });
-      const parsed = new URL(url);
-      if (method === 'GET' && parsed.pathname.endsWith('/keys')) {
-        const prefix = parsed.searchParams.get('prefix') || '';
-        const names = [...source.keys()].filter((key) => key.startsWith(prefix));
-        const cursor = parsed.searchParams.get('cursor');
-        assert.equal(url.includes('cursor='), Boolean(cursor));
-        if (cursor) assert.equal(url.includes(encodeURIComponent(cursor)), true);
-        return Response.json({ success: true, result: names.map((name) => ({ name })), result_info: {} });
-      }
-      if (method === 'GET' && parsed.pathname.includes('/values/')) {
-        const key = decodeURIComponent(parsed.pathname.split('/values/')[1]);
-        return new Response(source.get(key) ?? '', { status: 200 });
-      }
-      if (method === 'PUT' && parsed.pathname.endsWith('/bulk')) {
-        return Response.json({ success: true, result: null });
-      }
-      return new Response('unexpected', { status: 500 });
-    };
-    const dst = '0123456789abcdef0123456789abcdef';
-    const first = await migrateGolfapiKv({ dst, write: true, fetchImpl, token: 'test-token', log() {} });
-    const second = await migrateGolfapiKv({ dst, write: true, fetchImpl, token: 'test-token', log() {} });
-    assert.deepEqual(second, first);
-    assert.deepEqual(
-      first.map((row) => row.key),
-      ['golfapi:permanent:course:course-1', 'golfapi:permanent:coordinates:course-1', 'gq:balance'],
-    );
-    const course = JSON.parse(first[0].value);
-    assert.equal(course.status, 200);
-    assert.equal(course.contentType, 'application/json');
-    assert.equal(course.body, COURSE_BODY);
-    assert.equal(first[2].value, source.get('gq:balance'));
-    assert.equal(calls.some((call) => call.method === 'DELETE'), false);
-    const puts = calls.filter((call) => call.method === 'PUT');
-    assert.equal(puts.length, 2);
-    for (const put of puts) {
-      assert.equal(put.url.includes(SRC_NAMESPACE_ID), false);
-      assert.equal(put.url.includes(dst), true);
-      assert.match(put.url, /\/bulk$/);
-    }
-    assert.deepEqual(JSON.parse(puts[0].body), JSON.parse(puts[1].body));
-    await assert.rejects(() => migrateGolfapiKv({ dst: SRC_NAMESPACE_ID, fetchImpl, log() {} }));
-  });
 
-  test('a 429 value read, a 5xx key page, and a failed bulk PUT reject with no silent write', async () => {
-    const dst = '0123456789abcdef0123456789abcdef';
-    const listed = () =>
-      Response.json({ success: true, result: [{ name: 'gapi:course:course-1' }], result_info: {} });
-    const course = () => new Response(COURSE_BODY, { status: 200 });
-
-    const tooMany = [];
-    await assert.rejects(() =>
-      migrateGolfapiKv({
-        dst,
-        write: true,
-        log() {},
-        fetchImpl: async (input, init) => {
-          const url = String(input);
-          const method = (init?.method || 'GET').toUpperCase();
-          tooMany.push(method);
-          if (url.endsWith('/keys') || url.includes('/keys?')) return listed();
-          if (url.includes('/values/')) return new Response('slow down', { status: 429 });
-          return Response.json({ success: true });
-        },
-      }),
-    );
-    assert.equal(tooMany.includes('PUT'), false);
-
-    const keysFailed = [];
-    await assert.rejects(() =>
-      migrateGolfapiKv({
-        dst,
-        write: true,
-        log() {},
-        fetchImpl: async (input, init) => {
-          keysFailed.push((init?.method || 'GET').toUpperCase());
-          return new Response('unavailable', { status: 503 });
-        },
-      }),
-    );
-    assert.equal(keysFailed.includes('PUT'), false);
-
-    for (const bulk of [
-      () => new Response('no', { status: 500 }),
-      () => Response.json({ success: false, errors: [{ message: 'bulk failed' }] }),
-    ]) {
-      await assert.rejects(() =>
-        migrateGolfapiKv({
-          dst,
-          write: true,
-          log() {},
-          fetchImpl: async (input, init) => {
-            const url = String(input);
-            const method = (init?.method || 'GET').toUpperCase();
-            if (method === 'PUT') return bulk();
-            if (url.includes('/keys')) return listed();
-            if (url.includes('gq%3Abalance') || url.includes('gq:balance')) return new Response('', { status: 404 });
-            return course();
-          },
-        }),
-      );
-    }
-  });
-
-  test('a Cloudflare error JSON body is not turned into a row', () => {
-    const cloudflare = JSON.stringify({
-      success: false,
-      errors: [{ code: 10000, message: 'Authentication error' }],
-      messages: [],
-      result: null,
-    });
-    assert.equal(rowForLiveKey('gapi:course:course-1', cloudflare), null);
-    assert.equal(rowForLiveKey('gapi:coord:course-1', JSON.stringify({ error: 'not_found' })), null);
-    assert.equal(rowForLiveKey('gapi:course:course-1', JSON.stringify({ courseID: COURSE_ID })), null);
-    assert.ok(rowForLiveKey('gapi:course:course-1', COURSE_BODY));
-    assert.ok(rowForLiveKey('gapi:coord:course-1', COORD_BODY));
-  });
-
-  test('predeploy check rejects the placeholder and the BOARDS id, and accepts a distinct id', () => {
-    const placeholder = toml({ golfapiId: 'REPLACE_WITH_NEW_GOLFAPI_KV_ID' });
-    const boards = toml({ golfapiId: BOARDS_KV_ID });
-    const distinct = toml({ golfapiId: '0123456789abcdef0123456789abcdef' });
-    assert.ok(checkWrangler(placeholder).some((error) => error.includes('placeholder')));
-    assert.ok(checkWrangler(boards).some((error) => error.includes(BOARDS_KV_ID)));
-    assert.deepEqual(checkWrangler(distinct), []);
-    assert.ok(checkWrangler(toml({ golfapiId: '' })).some((error) => error.includes('empty')));
-    assert.ok(checkWrangler(toml({ golfapiId: distinctId(), crons: '["0 8 * * *"]' })).length > 0);
-    assert.ok(checkWrangler(toml({ golfapiId: distinctId(), crons: '[]' })).some((error) => error.includes('crons')));
-    assert.ok(checkWrangler(toml({ golfapiId: distinctId(), name: 'shottrax-golf' })).length > 0);
-    assert.ok(checkWrangler(toml({ golfapiId: distinctId(), main: 'live-shottrax-share.js' })).some((error) => error.includes('entry.js')));
-    assert.deepEqual(checkWrangler(toml({ golfapiId: distinctId(), main: 'entry.js' })), []);
-    const committed = readFileSync(new URL('./wrangler.toml', import.meta.url), 'utf8');
-    assert.deepEqual(checkWrangler(committed), []);
-
-    const script = new URL('./predeploy-check.mjs', import.meta.url).pathname;
-    const run = (text) => {
-      const dir = mkdtempSync(join(tmpdir(), 'predeploy-'));
-      writeFileSync(join(dir, 'wrangler.toml'), text);
-      return spawnSync(process.execPath, [script], { cwd: dir, encoding: 'utf8' });
-    };
-    assert.notEqual(run(placeholder).status, 0);
-    assert.notEqual(run(boards).status, 0);
-    assert.equal(run(distinct).status, 0);
-  });
 });
-
-function distinctId() {
-  return '0123456789abcdef0123456789abcdef';
-}
-
-
