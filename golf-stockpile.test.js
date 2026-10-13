@@ -1184,7 +1184,11 @@ describe('golfapi stockpile', () => {
     }
   });
 
-  test('the stockpile keeps pulling at month usage 449 and 450 when the monthly cap is unset', async () => {
+  // KNOWN BUG: monthCap is not enforced in the stockpile path (stockpileSchedule
+  // ignores it, and chargeBody omits monthCap). This pins the bug, not the
+  // intended rule. Flip this test when the bug is fixed. Month-cap finding:
+  // https://github.com/bigbaird83/shottrax-share/pull/25#issuecomment-6156561653
+  test('KNOWN BUG: monthCap is not enforced in the stockpile path', async () => {
     const at = Date.parse('2026-10-29T23:00:00.000Z');
     const runs = [];
     for (const monthUsed of [449, 450]) {
