@@ -240,7 +240,7 @@ describe("alert email", () => {
 });
 
 describe("deploy entry routes", () => {
-  it("keeps a board put on worker.js and applies the live paint rules", async () => {
+  it("keeps a board put on the live share module and applies the live paint rules", async () => {
     const rows = new Map();
     const boards = {
       async get(key) {
