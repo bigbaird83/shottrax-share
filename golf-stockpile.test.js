@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { describe, test } from 'vitest';
 import { GolfapiCounter, handleGolfProxy } from './golf-proxy.js';
 import {
@@ -1182,6 +1183,11 @@ describe('golfapi stockpile', () => {
     } finally {
       http.restore();
     }
+  });
+
+  test('an unset monthly cap stays 450 so a month already at 450 can stop the stockpile', () => {
+    const src = readFileSync(new URL('./golf-stockpile.js', import.meta.url), 'utf8');
+    assert.match(src, /const monthCap = envNumber\(env, 'GOLFAPI_MONTHLY_CAP', 450\);/);
   });
 
   test('a missing run ceiling does not fall back to 80 or call golfapi', async () => {
