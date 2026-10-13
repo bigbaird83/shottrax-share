@@ -399,10 +399,86 @@ describe("friend codes", () => {
     expect(miss.status).toBe(404);
   });
 
+  it("keeps the stored ownerId when the code is reset", async () => {
+    const key = friendKey("owner");
+    const first = await invoke("/v1/friends/code", { friend: key, body: {} });
+    expect(first.status).toBe(200);
+    const reset = await invoke("/v1/friends/code/reset", { friend: key, body: {} });
+    expect(reset.status).toBe(200);
+    expect(reset.json.ownerId).toBe(first.json.ownerId);
+    const authKey = [...kv.keys()].find((name) => name.startsWith("fr:k:"));
+    expect(JSON.parse(kv.get(authKey).value)).toEqual({
+      ownerId: first.json.ownerId,
+      code: reset.json.code,
+    });
+    expect(kv.get(`fr:code:${reset.json.code}`).value).toBe(first.json.ownerId);
+  });
+
+  it("rejects unknown fields on getCode and resetCode", async () => {
+    const key = friendKey("extra");
+    const extra = await invoke("/v1/friends/code", { friend: key, body: { name: "Ada" } });
+    expect(extra.status).toBe(400);
+    expect(extra.json).toEqual({ error: "invalid_body" });
+    expect([...kv.keys()]).toEqual([]);
+
+    const minted = await invoke("/v1/friends/code", { friend: key, body: {} });
+    expect(minted.status).toBe(200);
+    const reset = await invoke("/v1/friends/code/reset", { friend: key, body: { code: minted.json.code } });
+    expect(reset.status).toBe(400);
+    expect(reset.json).toEqual({ error: "invalid_body" });
+    const again = await invoke("/v1/friends/code", { friend: key });
+    expect(again.status).toBe(200);
+    expect(again.json.code).toBe(minted.json.code);
+  });
+
+  it("returns the exact remaining Retry-After inside the open window", async () => {
+    const limiter = new FriendGuessLimiter(sqliteState("key:retry"), {});
+    const start = 1_700_000_000_000;
+    async function attempt(now) {
+      const response = await limiter.fetch(new Request("https://friend-guess.internal/limit", {
+        method: "POST",
+        body: JSON.stringify({ op: "attempt", now }),
+      }));
+      return response.json();
+    }
+    for (let i = 0; i < KEY_LIMIT; i += 1) expect(await attempt(start)).toEqual({ ok: true });
+    // 1500 ms into a 3600 s window: ceil((3600000 - 1500) / 1000) = 3599.
+    expect(await attempt(start + 1500)).toEqual({ ok: false, retryAfterSec: 3599 });
+
+    const key = friendKey("retry");
+    const realNow = Date.now;
+    Date.now = () => start;
+    try {
+      for (let i = 0; i < KEY_LIMIT; i += 1) {
+        const miss = await invoke("/v1/friends/codes/lookup", { friend: key, body: { code: "HHHHHHHH" } });
+        expect(miss.status).toBe(404);
+      }
+      Date.now = () => start + 1500;
+      const limited = await invoke("/v1/friends/codes/lookup", { friend: key, body: { code: "HHHHHHHH" } });
+      expect(limited.status).toBe(429);
+      expect(limited.headers.get("Retry-After")).toBe("3599");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  it("rejects a 32-character friend key with the install-id shape", async () => {
+    // Long enough for FRIEND_KEY_RE, and only the install-id shape check rejects it.
+    const shaped = `id_1234567890_${"a".repeat(18)}`;
+    expect(shaped).toHaveLength(32);
+    const rejected = await invoke("/v1/friends/code", { friend: shaped, body: {} });
+    expect(rejected.status).toBe(401);
+    expect(rejected.json).toEqual({ error: "friend_key_required" });
+    expect([...kv.keys()]).toEqual([]);
+    const plain = await invoke("/v1/friends/code", { friend: "a".repeat(32), body: {} });
+    expect(plain.status).toBe(200);
+  });
+
   it("binds the SQLite guess limiter and advertises PUT on friend CORS", () => {
     const toml = readFileSync(new URL("./wrangler.toml", import.meta.url), "utf8");
     expect(toml).toContain('name = "FRIEND_GUESSES"');
     expect(toml).toContain('class_name = "FriendGuessLimiter"');
+    expect(toml).toContain('tag = "v2-friend-guesses"');
     expect(toml).toMatch(/new_sqlite_classes = \["FriendGuessLimiter"\]/);
     expect(toml).not.toMatch(/^\s*new_classes\s*=/m);
     expect(toml).toContain('binding = "BOARDS"');
