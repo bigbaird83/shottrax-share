@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import worker, { FriendGuessLimiter } from "./worker.js";
@@ -329,12 +330,92 @@ describe("friend codes", () => {
     env.FRIEND_GUESSES = undefined;
     const minted = await invoke("/v1/friends/code", { friend: key });
     expect(minted.status).toBe(200);
+    const codeKey = `fr:code:${minted.json.code}`;
+    let codeReads = 0;
+    const get = env.BOARDS.get.bind(env.BOARDS);
+    env.BOARDS.get = async (name) => {
+      if (name === codeKey) codeReads += 1;
+      return get(name);
+    };
     const unbound = await invoke("/v1/friends/codes/lookup", { friend: key, body: { code: minted.json.code } });
     expect(unbound.status).toBe(503);
     expect(unbound.json).toEqual({ error: "guess_limiter_not_configured" });
+    expect(codeReads).toBe(0);
     env.BOARDS = undefined;
     const noBoards = await invoke("/v1/friends/code", { friend: key });
     expect(noBoards.status).toBe(503);
     expect(noBoards.json).toEqual({ error: "boards_not_configured" });
+  });
+
+  it("does not clear the guess counter when the code is reset", async () => {
+    const key = friendKey("keep");
+    const minted = await invoke("/v1/friends/code", { friend: key });
+    expect(minted.status).toBe(200);
+    for (let i = 0; i < KEY_LIMIT; i += 1) {
+      const miss = await invoke("/v1/friends/codes/lookup", { friend: key, body: { code: "EEEEEEEE" } });
+      expect(miss.status).toBe(404);
+    }
+    const reset = await invoke("/v1/friends/code/reset", { friend: key });
+    expect(reset.status).toBe(200);
+    const still = await invoke("/v1/friends/codes/lookup", { friend: key, body: { code: reset.json.code } });
+    expect(still.status).toBe(429);
+    expect(still.json).toEqual({ error: "rate_limited" });
+  });
+
+  it("does not read a code after the guess limit is spent", async () => {
+    const key = friendKey("noread");
+    const minted = await invoke("/v1/friends/code", { friend: key });
+    const codeKey = `fr:code:${minted.json.code}`;
+    let reads = 0;
+    const get = env.BOARDS.get.bind(env.BOARDS);
+    env.BOARDS.get = async (name) => {
+      if (name === codeKey) reads += 1;
+      return get(name);
+    };
+    for (let i = 0; i < KEY_LIMIT; i += 1) {
+      const hit = await invoke("/v1/friends/codes/lookup", { friend: key, body: { code: minted.json.code } });
+      expect(hit.status).toBe(200);
+    }
+    const before = reads;
+    const limited = await invoke("/v1/friends/codes/lookup", { friend: key, body: { code: minted.json.code } });
+    expect(limited.status).toBe(429);
+    expect(limited.json).toEqual({ error: "rate_limited" });
+    expect(reads).toBe(before);
+  });
+
+  it("rejects an understated body by its UTF-8 size", async () => {
+    const key = friendKey("bytes");
+    const raw = `{"code":"${"é".repeat(2037)}"}`;
+    expect(raw.length).toBeLessThanOrEqual(2048);
+    expect(new TextEncoder().encode(raw).length).toBeGreaterThan(2048);
+    const huge = await invoke("/v1/friends/codes/lookup", {
+      friend: key,
+      body: raw,
+      headers: { "Content-Length": "100" },
+    });
+    expect(huge.status).toBe(413);
+    expect(huge.json).toEqual({ error: "payload_too_large" });
+    const miss = await invoke("/v1/friends/codes/lookup", { friend: key, body: { code: "FFFFFFFF" } });
+    expect(miss.status).toBe(404);
+  });
+
+  it("binds the SQLite guess limiter and advertises PUT on friend CORS", () => {
+    const toml = readFileSync(new URL("./wrangler.toml", import.meta.url), "utf8");
+    expect(toml).toContain('name = "FRIEND_GUESSES"');
+    expect(toml).toContain('class_name = "FriendGuessLimiter"');
+    expect(toml).toMatch(/new_sqlite_classes = \["FriendGuessLimiter"\]/);
+    expect(toml).not.toMatch(/^\s*new_classes\s*=/m);
+    expect(toml).toContain('binding = "BOARDS"');
+  });
+
+  it("answers the friends preflight without a friend key", async () => {
+    const options = await invoke("/v1/friends/code", { method: "OPTIONS" });
+    expect(options.status).toBe(200);
+    expect(options.text).toBe("");
+    expect(options.headers.get("Access-Control-Allow-Methods")).toBe("GET,POST,PUT,OPTIONS");
+    expect(options.headers.get("Access-Control-Allow-Headers")).toContain("Content-Type");
+    expect(options.headers.get("Access-Control-Allow-Headers")).toContain("X-Friend-Key");
+    const reports = await invoke("/v1/course-reports", { method: "OPTIONS" });
+    expect(reports.headers.get("Access-Control-Allow-Methods")).toBe("GET,POST,OPTIONS");
   });
 });

@@ -242,7 +242,8 @@ async function readJsonObject(request, limit, allowEmpty) {
   const declared = Number(request.headers.get("Content-Length"));
   if (Number.isFinite(declared) && declared > limit) return { error: "payload_too_large", status: 413 };
   const raw = await request.text();
-  if (raw.length > limit) return { error: "payload_too_large", status: 413 };
+  // Content-Length can be omitted or understated. The cap is bytes, not UTF-16 units.
+  if (byteLength(raw) > limit) return { error: "payload_too_large", status: 413 };
   if (raw.length === 0) {
     if (allowEmpty) return { value: {} };
     return { error: "invalid_body", status: 400 };
@@ -367,6 +368,10 @@ async function friendIpHash(request) {
   const ip = raw.trim();
   if (!ip || ip.length > 64 || /[\s\r\n]/.test(ip)) return null;
   return sha256Hex(FRIEND_IP_HASH_PREFIX + ip);
+}
+
+function byteLength(text) {
+  return new TextEncoder().encode(text).length;
 }
 
 async function sha256Hex(text) {

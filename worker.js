@@ -4216,7 +4216,11 @@ function corsHeaders(pathname) {
   const courseReports = isCourseReportPath(pathname);
   const friends = isFriendPath(pathname);
   const headers = {
-    "Access-Control-Allow-Methods": courseReports || friends ? "GET,POST,OPTIONS" : "GET,PUT,OPTIONS",
+    "Access-Control-Allow-Methods": friends
+      ? "GET,POST,PUT,OPTIONS"
+      : courseReports
+        ? "GET,POST,OPTIONS"
+        : "GET,PUT,OPTIONS",
     "Access-Control-Allow-Headers": courseReports
       ? "Content-Type, X-Install-Id, Authorization"
       : friends
