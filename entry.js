@@ -30,8 +30,9 @@ export { GolfapiCounter };
 // 4. /gca/*. Both share modules match. golf-proxy can serve /gca/ too, but the
 //    live entry does not send /gca/ there. Resolved: worker.js, not golf-proxy.
 // 5. /golfapi/* except OPTIONS. Live serves golf-proxy; the share module's
-//    golfapi handler is shadowed. Resolved: golf-proxy, including an fr: id
-//    or search. Live does not reserve fr:.
+//    golfapi handler is shadowed. Resolved: golf-proxy. An fr: course id,
+//    coordinates id, or search is 404 before golf-proxy. Live does not do
+//    that; this reservation keeps fr: out of the proxy and its KV.
 // 6. /terrain/*, POST /admin/alert-test, GET /admin/demand, GET /admin/stockpile.
 //    Only golf-proxy serves these. Resolved: golf-proxy.
 // 7. /osm/*. Handlers match aside from bundler formatting. Resolved: worker.js.
@@ -67,6 +68,48 @@ function isPrPath(pathname) {
     pathname === "/admin/demand" ||
     pathname === "/admin/stockpile"
   );
+}
+
+function isFriendToken(value) {
+  if (typeof value !== "string" || value.length === 0) return false;
+  let current = value;
+  for (let i = 0; i < 4; i += 1) {
+    if (current.startsWith("fr:")) return true;
+    let decoded;
+    try {
+      decoded = decodeURIComponent(current);
+    } catch {
+      return false;
+    }
+    if (decoded === current) return false;
+    current = decoded;
+  }
+  return current.startsWith("fr:");
+}
+
+function normalizeSearch(value) {
+  if (typeof value !== "string") return "";
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/** An fr: golfapi id or search must not reach the proxy or its KV. */
+function friendGolfapiBlocked(pathname, url) {
+  if (!pathname.startsWith("/golfapi/v2.3/")) return false;
+  const rest = pathname.replace(/\/+$/, "").slice("/golfapi/v2.3/".length);
+  if (rest === "courses") {
+    const name = url.searchParams.get("name");
+    const query = name != null && name.trim() !== "" ? name : url.searchParams.get("q");
+    return query != null && isFriendToken(normalizeSearch(query));
+  }
+  const match = /^(?:courses|coordinates)\/([^/]+)$/.exec(rest);
+  if (!match) return false;
+  let id = match[1];
+  try {
+    id = decodeURIComponent(id);
+  } catch {
+    // Keep the raw segment. isFriendToken still checks it.
+  }
+  return isFriendToken(id);
 }
 
 function withTimeout(promise, ms) {
@@ -145,6 +188,12 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const { pathname } = url;
+    if (request.method !== "OPTIONS" && friendGolfapiBlocked(pathname, url)) {
+      return withLiveCors(new Response(JSON.stringify({ error: "unknown_route" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      }), pathname);
+    }
     if (request.method !== "OPTIONS" && isPrPath(pathname)) {
       const res = await handleGolfProxy(request, env, ctx);
       if (res) return withLiveCors(res, pathname);
