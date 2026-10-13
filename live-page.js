@@ -12,8 +12,7 @@
  * Only real board codes render: six characters from the app's code alphabet
  * (newShareBoardCode in ShotTraxx src/domain/liveBoard.ts). Anything else under
  * /s/ is a 404 page, and worker.js also refuses reserved BOARDS keys, so the
- * page can never show overlay, course-store, GCA, golfapi counter, or friend
- * (`fr:`) data.
+ * page can never show overlay, course-store, GCA, or golfapi counter data.
  *
  * STORE_LIVE (Worker var, default off): "true" once ShotTraxx™ is live in the
  * App Store. Off hides the Safari App Store banner and the "Track your own round"
