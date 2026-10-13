@@ -1625,15 +1625,56 @@ async function handleGolfapiMeta(request, env, cors) {
   const today = { ...days[days.length - 1], globalCap: limits.globalDay };
   days[days.length - 1] = today;
   const queue = await listKeys(boards, "gqueue:");
+  // Live GET /meta/golfapi includes the billing-cycle and UTC-day counters.
+  // The golfapi request path on the deploy entry is golf-proxy, which does
+  // not write these keys, so a fresh namespace reports zero calls.
+  const billingDay = readConfigInt(env && env.GOLFAPI_BILLING_DAY) ?? 5;
+  const monthBudget = readConfigInt(env && env.GOLFAPI_MONTHLY_BUDGET) ?? 450;
+  const period = golfapiBillingPeriod(now.getTime(), billingDay);
+  const periods = golfapiPeriods(now);
   return golfJson(200, {
     balance: publicBalance(balance),
     asOf: balanceAsOf(balance),
     generatedAt: now.toISOString(),
     globalCap: limits.globalDay,
+    month: {
+      period: period.id,
+      calls: await readPlainCounter(boards, `gq:month:${period.id}`),
+      budget: monthBudget,
+    },
+    day: {
+      date: periods.day,
+      calls: await readPlainCounter(boards, `gq:day:${periods.day}`),
+      cap: limits.globalDay,
+    },
     today,
     days,
     queueLength: queue.length,
   }, cors);
+}
+
+function golfapiBillingPeriod(nowMs, billingDay) {
+  const day = Math.min(28, Math.max(1, Number.isInteger(billingDay) ? billingDay : 5));
+  const date = new Date(nowMs);
+  let year = date.getUTCFullYear();
+  let month = date.getUTCMonth();
+  if (date.getUTCDate() < day) {
+    month -= 1;
+    if (month < 0) {
+      month = 11;
+      year -= 1;
+    }
+  }
+  const startMs = Date.UTC(year, month, day);
+  return { id: new Date(startMs).toISOString().slice(0, 10), startMs };
+}
+
+async function readPlainCounter(boards, key) {
+  try {
+    return clampCount(await boards.get(key));
+  } catch {
+    return 0;
+  }
 }
 
 async function handleGcaMeta(request, env, cors) {
@@ -4222,6 +4263,332 @@ function corsHeaders(pathname) {
   }
   return headers;
 }
+
+
+const PAINT_GREEN_MAX_FROM_COURSE_M = 2000;
+const PAINT_GREEN_MOVE_FLAG_M = 10;
+const PAINT_PENDING_PREFIX = "v1:paint-pending:";
+const PAINT_PENDING_TTL = 60 * 60 * 24 * 180;
+const PAINT_RECORD_TTL = 60 * 60 * 24 * 365;
+export const PAINT_PROMOTE_PATH = "/v1/paint-pending/promote";
+// Live allows osm, manual_verified, gca, and golfapi. opengolf is a main-only
+// source the partial-merge cache already stores, so it stays accepted.
+const PAINT_SOURCES = new Set(["osm", "manual_verified", "gca", "golfapi", "opengolf"]);
+const PAINT_COURSE_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:~-]{0,127}$/;
+const PAINT_GET_PER_MIN_DEFAULT = 120;
+const PAINT_PUT_PER_MIN_DEFAULT = 20;
+const paintRateWindows = new Map();
+
+function paintHotfixLog(evt, fields) {
+  try {
+    console.log(JSON.stringify({ evt, at: new Date().toISOString(), ...fields || {} }));
+  } catch {
+    // Logging never fails a paint request.
+  }
+}
+
+function normalizePaintKeyPart(value) {
+  return String(value ?? "").trim().toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+export function parsePaintKey(key) {
+  if (typeof key !== "string") return { kind: "none" };
+  if (key.startsWith("id:")) {
+    return PAINT_COURSE_KEY_RE.test(key.slice(3)) ? { kind: "ok", key } : { kind: "bad" };
+  }
+  if (key.startsWith("name:")) {
+    const parts = key.slice(5).split("|");
+    if (parts.length !== 3) return { kind: "bad" };
+    const [name, city, state] = parts;
+    if (!name || name.length > 120 || city.length > 80 || state.length > 40) return { kind: "bad" };
+    if (parts.some((part) => part !== normalizePaintKeyPart(part))) return { kind: "bad" };
+    return { kind: "ok", key };
+  }
+  return { kind: "none" };
+}
+
+function paintPoint(p) {
+  return isPlainObject(p) && finiteNumber(p.lat) && finiteNumber(p.lng) && p.lat >= -90 && p.lat <= 90 && p.lng >= -180 && p.lng <= 180;
+}
+
+function paintDistanceM(a, b) {
+  return distanceMeters(a.lat, a.lng, b.lat, b.lng);
+}
+
+function paintMedian(values) {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function paintCentroid(record) {
+  if (!isPlainObject(record) || !Array.isArray(record.holes)) return null;
+  const pts = record.holes.flatMap((h) => isPlainObject(h) ? [h.tee, h.green] : []).filter(paintPoint);
+  if (pts.length === 0) return null;
+  return { lat: paintMedian(pts.map((p) => p.lat)), lng: paintMedian(pts.map((p) => p.lng)) };
+}
+
+function pointFromFields(obj) {
+  if (!isPlainObject(obj)) return null;
+  const lat = Number(obj.latitude ?? obj.lat);
+  const lng = Number(obj.longitude ?? obj.lng ?? obj.lon);
+  if (obj.latitude == null && obj.lat == null || obj.longitude == null && obj.lng == null && obj.lon == null) return null;
+  const point = { lat, lng };
+  if (!paintPoint(point) || lat === 0 && lng === 0) return null;
+  return point;
+}
+
+function coursePointFromBody(text) {
+  let payload;
+  try {
+    payload = typeof text === "string" ? JSON.parse(text) : text;
+  } catch {
+    return null;
+  }
+  if (!isPlainObject(payload)) return null;
+  const candidates = [payload.course, payload.data, payload].filter(isPlainObject);
+  for (const obj of candidates) {
+    const point = pointFromFields(obj.location) || pointFromFields(obj) || (isPlainObject(obj.coordinates) ? pointFromFields(obj.coordinates) : null);
+    if (point) return point;
+  }
+  return null;
+}
+
+async function knownPaintLocation(boards, keys) {
+  for (const key of keys.slice(0, 4)) {
+    if (typeof key !== "string" || !key.startsWith("id:")) continue;
+    const courseKey = key.slice(3);
+    let storeKey = null;
+    let source = null;
+    if (courseKey.startsWith("golfapi:")) {
+      const id = safeGolfapiId(courseKey.slice("golfapi:".length));
+      if (id) {
+        storeKey = courseStoreKey(id);
+        source = "golfapi_store";
+      }
+    } else if (/^\d{1,12}$/.test(courseKey)) {
+      storeKey = gcaStoreKey("course", courseKey);
+      source = "gca_store";
+    }
+    if (!storeKey) continue;
+    let raw = null;
+    try {
+      raw = await boards.get(storeKey);
+    } catch {
+      raw = null;
+    }
+    const point = typeof raw === "string" ? coursePointFromBody(raw) : null;
+    if (point) return { point, source, key };
+  }
+  return null;
+}
+
+function validatePaintPut(raw, urlKey) {
+  if (!isPlainObject(raw)) return { ok: false, error: "not_object" };
+  if (raw.key !== urlKey) return { ok: false, error: "key_mismatch" };
+  if (!PAINT_SOURCES.has(raw.source)) return { ok: false, error: "bad_source" };
+  if (typeof raw.fetchedAt !== "string" || !Number.isFinite(Date.parse(raw.fetchedAt))) return { ok: false, error: "bad_fetchedAt" };
+  if (!Array.isArray(raw.holes) || raw.holes.length === 0 || raw.holes.length > 27) return { ok: false, error: "bad_holes" };
+  const seen = new Set();
+  for (const h of raw.holes) {
+    if (!isPlainObject(h) || !Number.isInteger(h.hole) || h.hole < 1 || h.hole > 18 || seen.has(h.hole)) {
+      return { ok: false, error: "bad_hole" };
+    }
+    seen.add(h.hole);
+    for (const field of ["tee", "green"]) {
+      if (h[field] != null && !paintPoint(h[field])) return { ok: false, error: `bad_${field}`, hole: h.hole };
+    }
+  }
+  const record = { ...raw };
+  if (raw.aliases != null) {
+    const aliases = Array.isArray(raw.aliases) ? raw.aliases : [];
+    const kept = aliases.filter((a) => typeof a === "string" && parsePaintKey(a).kind === "ok");
+    if (kept.length !== aliases.length) paintHotfixLog("paint_aliases_dropped", { key: urlKey, dropped: aliases.length - kept.length });
+    record.aliases = kept;
+  }
+  return { ok: true, record };
+}
+
+function guardPaintGreens(stored, incoming, anchor) {
+  if (anchor) {
+    for (const h of incoming.holes) {
+      if (!paintPoint(h.green)) continue;
+      const meters = paintDistanceM(anchor, h.green);
+      if (meters > PAINT_GREEN_MAX_FROM_COURSE_M) {
+        return { error: "green_too_far", hole: h.hole, meters: Math.round(meters) };
+      }
+    }
+  }
+  const storedByHole = new Map();
+  if (isPlainObject(stored) && Array.isArray(stored.holes)) {
+    for (const h of stored.holes) {
+      const n = holeNumber(h);
+      if (n != null && !storedByHole.has(n) && paintPoint(h.green)) storedByHole.set(n, h);
+    }
+  }
+  const pending = {};
+  const flaggedHoles = [];
+  const holes = incoming.holes.map((h) => {
+    const prior = storedByHole.get(h.hole);
+    if (!prior) return h;
+    if (!paintPoint(h.green)) return { ...h, green: prior.green };
+    const moved = paintDistanceM(prior.green, h.green);
+    if (moved <= PAINT_GREEN_MOVE_FLAG_M) return h;
+    pending[h.hole] = { green: h.green, movedM: Math.round(moved * 10) / 10, source: h.source ?? incoming.source };
+    flaggedHoles.push(h.hole);
+    const kept = { ...h, green: prior.green };
+    if (prior.source) kept.source = prior.source;
+    return kept;
+  });
+  const included = new Set(incoming.holes.map((h) => h.hole));
+  const leftovers = [];
+  if (isPlainObject(stored) && Array.isArray(stored.holes)) {
+    for (const h of stored.holes) {
+      const n = holeNumber(h);
+      if (n == null || included.has(n)) continue;
+      included.add(n);
+      leftovers.push(h);
+    }
+  }
+  if (leftovers.length > 0) {
+    holes.push(...leftovers);
+    holes.sort((a, b) => holeNumber(a) - holeNumber(b));
+  }
+  return { record: { ...incoming, holes }, pending, flaggedHoles, keptHoles: leftovers.length };
+}
+
+function paintRateAllowed(op, ipHash, limitPerMin, nowMs) {
+  const k = `${op}:${ipHash}`;
+  const w = paintRateWindows.get(k);
+  if (!w || nowMs - w.start >= 60000) {
+    paintRateWindows.set(k, { start: nowMs, n: 1 });
+    if (paintRateWindows.size > 5000) {
+      for (const [key, win] of paintRateWindows) if (nowMs - win.start >= 60000) paintRateWindows.delete(key);
+    }
+    return limitPerMin > 0;
+  }
+  w.n += 1;
+  return w.n <= limitPerMin;
+}
+
+function paintPutRequiresInstallId(env) {
+  const raw = env && env.PAINT_PUT_REQUIRE_INSTALL_ID;
+  if (raw == null) return true;
+  if (raw === false) return false;
+  const text = String(raw).trim().toLowerCase();
+  return !(text === "0" || text === "false" || text === "no" || text === "off");
+}
+
+export function resetPaintRateForTests() {
+  paintRateWindows.clear();
+}
+
+export async function handlePaintRoute(request, env, key, ttl, cors) {
+  const boards = env.BOARDS;
+  const parsed = parsePaintKey(key);
+  if (parsed.kind !== "ok") return golfJson(400, { error: "bad_key" }, cors);
+  const op = request.method === "PUT" ? "put" : "get";
+  const installId = readInstallId(request);
+  const ipHash = await readIpHash(request) || "unknown";
+  const ipTag = ipHash.slice(0, 16);
+  if (!installId) {
+    if (op === "put" && paintPutRequiresInstallId(env)) {
+      paintHotfixLog("paint_put_no_install_id", { ip: ipTag, enforced: true });
+      return golfJson(401, { error: "install_id_required" }, cors);
+    }
+    paintHotfixLog(op === "put" ? "paint_put_no_install_id" : "paint_get_no_install_id", { ip: ipTag, enforced: false });
+  }
+  const limit = op === "put"
+    ? readConfigInt(env.PAINT_PUT_PER_MIN) ?? PAINT_PUT_PER_MIN_DEFAULT
+    : readConfigInt(env.PAINT_GET_PER_MIN) ?? PAINT_GET_PER_MIN_DEFAULT;
+  if (!paintRateAllowed(op, ipHash, limit, Date.now())) {
+    paintHotfixLog("paint_rate_limited", { op, ip: ipTag });
+    return golfJson(429, { error: "rate_limited" }, cors, { "Retry-After": "60" });
+  }
+  if (op === "get") {
+    const val = await boards.get(key);
+    if (!val) return new Response("{}", { status: 404, headers: { ...cors, "Content-Type": "application/json" } });
+    const body = await paintGetBody(boards, key, val);
+    return new Response(body, { headers: { ...cors, "Content-Type": "application/json" } });
+  }
+  const body = await request.text();
+  if (!body || body.length > 20000) {
+    return new Response("bad body", { status: 400, headers: cors });
+  }
+  let incoming;
+  try {
+    incoming = JSON.parse(body);
+  } catch {
+    return golfJson(400, { error: "not_json" }, cors);
+  }
+  const valid = validatePaintPut(incoming, key);
+  if (!valid.ok) return golfJson(400, { error: valid.error, ...valid.hole ? { hole: valid.hole } : {} }, cors);
+  const stored = parsePaintRecord(await boards.get(key));
+  const known = await knownPaintLocation(boards, [key, ...valid.record.aliases || []]);
+  const anchor = known ? known.point : paintCentroid(stored) || paintCentroid(valid.record);
+  const guard = guardPaintGreens(stored, valid.record, anchor);
+  if (guard.error) {
+    paintHotfixLog("paint_put_rejected", { key, error: guard.error, hole: guard.hole, meters: guard.meters, anchor: known ? known.source : "centroid" });
+    return golfJson(400, { error: guard.error, hole: guard.hole }, cors);
+  }
+  if (guard.flaggedHoles.length > 0) {
+    const pendingKey = PAINT_PENDING_PREFIX + key;
+    const prior = parsePaintRecord(await boards.get(pendingKey)) || { key, holes: {} };
+    if (!isPlainObject(prior.holes)) prior.holes = {};
+    const user = installId ? (await sha256Hex(`paint-iid:${installId}`)).slice(0, 24) : null;
+    const at = new Date().toISOString();
+    for (const [hole, p] of Object.entries(guard.pending)) prior.holes[hole] = { ...p, at, user };
+    await boards.put(pendingKey, JSON.stringify(prior), { expirationTtl: PAINT_PENDING_TTL });
+    paintHotfixLog("paint_green_flagged", { key, holes: guard.flaggedHoles, pending: guard.pending });
+  }
+  const response = await putPaintRecord(boards, key, JSON.stringify(guard.record), ttl, request, cors);
+  if (guard.flaggedHoles.length > 0) response.headers.set("X-Paint-Flagged-Holes", guard.flaggedHoles.join(","));
+  return response;
+}
+
+async function promotePendingGreen(boards, key, hole) {
+  const pendingKey = PAINT_PENDING_PREFIX + key;
+  const pending = parsePaintRecord(await boards.get(pendingKey));
+  const p = pending && isPlainObject(pending.holes) ? pending.holes[String(hole)] : null;
+  const stored = parsePaintRecord(await boards.get(key));
+  if (!p || !paintPoint(p.green) || !stored) return { ok: false, error: "nothing_pending" };
+  const holes = Array.isArray(stored.holes) ? stored.holes : [];
+  let found = false;
+  stored.holes = holes.map((h) => {
+    if (holeNumber(h) !== hole) return h;
+    found = true;
+    return { ...h, green: p.green };
+  });
+  if (!found) stored.holes.push({ hole, tee: null, green: p.green });
+  await boards.put(key, JSON.stringify(stored), { expirationTtl: PAINT_RECORD_TTL });
+  delete pending.holes[String(hole)];
+  if (Object.keys(pending.holes).length === 0) await boards.delete(pendingKey);
+  else await boards.put(pendingKey, JSON.stringify(pending), { expirationTtl: PAINT_PENDING_TTL });
+  paintHotfixLog("paint_green_promoted", { key, hole, green: p.green });
+  return { ok: true, green: p.green };
+}
+
+export async function handlePaintPendingPromote(request, env, cors) {
+  if (request.method !== "POST") return golfJson(405, { error: "method_not_allowed" }, cors);
+  const denied = await authorizeCourseReports(request, env, cors);
+  if (denied) return denied;
+  const boards = boardsBinding(env);
+  if (!boards || typeof boards.delete !== "function") return golfJson(503, { error: "boards_not_configured" }, cors);
+  let payload;
+  try {
+    payload = JSON.parse(await request.text());
+  } catch {
+    return golfJson(400, { error: "not_json" }, cors);
+  }
+  const key = isPlainObject(payload) && typeof payload.key === "string" ? payload.key : "";
+  const hole = isPlainObject(payload) ? payload.hole : null;
+  if (parsePaintKey(key).kind !== "ok") return golfJson(400, { error: "bad_key" }, cors);
+  if (!Number.isInteger(hole) || hole < 1 || hole > 18) return golfJson(400, { error: "bad_hole" }, cors);
+  const result = await promotePendingGreen(boards, key, hole);
+  if (!result.ok) return golfJson(404, { error: result.error }, cors);
+  return golfJson(200, { ok: true, key, hole, green: result.green }, cors);
+}
+
 
 export default {
   async fetch(request, env, ctx) {
