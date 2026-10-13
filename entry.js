@@ -30,13 +30,11 @@ export { GolfapiCounter };
 // 4. /gca/*. Both share modules match. golf-proxy can serve /gca/ too, but the
 //    live entry does not send /gca/ there. Resolved: worker.js, not golf-proxy.
 // 5. /golfapi/* except OPTIONS. Live serves golf-proxy; the share module's
-//    golfapi handler is shadowed. Resolved: golf-proxy. An fr: course id or
-//    fr: search is 404 before golf-proxy so the #22 reservation still holds
-//    on this path (main-only; live does not reserve fr:).
+//    golfapi handler is shadowed. Resolved: golf-proxy, including an fr: id
+//    or search. Live does not reserve fr:.
 // 6. /terrain/*, POST /admin/alert-test, GET /admin/demand, GET /admin/stockpile.
 //    Only golf-proxy serves these. Resolved: golf-proxy.
 // 7. /osm/*. Handlers match aside from bundler formatting. Resolved: worker.js.
-//    The #22 fr: courseId rejection stays in worker.js.
 // 8. GET /s/{code}. Same page. Unicode escapes in the live bundle are bundler
 //    noise. Resolved: worker.js.
 // 9. /v1/course-reports*. Same handlers. Resolved: worker.js.
@@ -45,13 +43,13 @@ export { GolfapiCounter };
 // 11. GET/PUT paint keys (id:, name:). Live runs handlePaintRoute (install id
 //     on PUT, per-IP rate limit, record shape, green-move guard) and then the
 //     same partial merge. Main's fetch stores the body directly. Resolved:
-//     this entry uses handlePaintRoute. opengolf stays an allowed source
-//     (main-only; live's set is osm, manual_verified, gca, golfapi). A name
+//     this entry uses handlePaintRoute. Allowed sources are osm,
+//     manual_verified, gca, and golfapi. A name
 //     key that is not three normalized parts is 400, which is what live does.
 //     worker.fetch still accepts the older unvalidated paint PUT so the
 //     partial-merge tests keep their direct path.
-// 12. Other board keys. Same reserved prefixes and TTL. fr: is added on the
-//     #22 branch and kept. Resolved: worker.js.
+// 12. Other board keys. Same reserved prefixes and TTL. Live does not reserve
+//     fr:. Resolved: worker.js.
 // 13. scheduled. Both share modules drain the golfapi queue. The live entry
 //     does not call that drain. It runs the stockpile only when the cron is
 //     0 23 * * *. Resolved: that handler, and no 08:00 cron. worker.scheduled
@@ -69,48 +67,6 @@ function isPrPath(pathname) {
     pathname === "/admin/demand" ||
     pathname === "/admin/stockpile"
   );
-}
-
-function isFriendToken(value) {
-  if (typeof value !== "string" || value.length === 0) return false;
-  let current = value;
-  for (let i = 0; i < 4; i += 1) {
-    if (current.startsWith("fr:")) return true;
-    let decoded;
-    try {
-      decoded = decodeURIComponent(current);
-    } catch {
-      return false;
-    }
-    if (decoded === current) return false;
-    current = decoded;
-  }
-  return current.startsWith("fr:");
-}
-
-function normalizeSearch(value) {
-  if (typeof value !== "string") return "";
-  return value.trim().toLowerCase().replace(/\s+/g, " ");
-}
-
-/** #22: an fr: golfapi id or search must not reach the proxy or its KV. */
-function friendGolfapiBlocked(pathname, url) {
-  if (!pathname.startsWith("/golfapi/v2.3/")) return false;
-  const rest = pathname.replace(/\/+$/, "").slice("/golfapi/v2.3/".length);
-  if (rest === "courses") {
-    const name = url.searchParams.get("name");
-    const query = name != null && name.trim() !== "" ? name : url.searchParams.get("q");
-    return query != null && isFriendToken(normalizeSearch(query));
-  }
-  const match = /^(?:courses|coordinates)\/([^/]+)$/.exec(rest);
-  if (!match) return false;
-  let id = match[1];
-  try {
-    id = decodeURIComponent(id);
-  } catch {
-    // Keep the raw segment. isFriendToken still checks it.
-  }
-  return isFriendToken(id);
 }
 
 function withTimeout(promise, ms) {
@@ -189,12 +145,6 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const { pathname } = url;
-    if (request.method !== "OPTIONS" && friendGolfapiBlocked(pathname, url)) {
-      return withLiveCors(new Response(JSON.stringify({ error: "unknown_route" }), {
-        status: 404,
-        headers: { "Content-Type": "application/json" },
-      }), pathname);
-    }
     if (request.method !== "OPTIONS" && isPrPath(pathname)) {
       const res = await handleGolfProxy(request, env, ctx);
       if (res) return withLiveCors(res, pathname);
