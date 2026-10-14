@@ -2256,8 +2256,13 @@ export class GolfapiCounter {
     if (!Number.isFinite(nightCap) || this.creditTenths(body.stockpileDayKey) + cost > nightCap) {
       return { ok: false, reason: 'run_cap' };
     }
+    const monthLimit = Math.round(Number(body.monthCap) * 10);
+    if (!Number.isFinite(monthLimit) || this.creditTenths(body.monthKey) + cost > monthLimit) {
+      return { ok: false, reason: 'app_monthly' };
+    }
     this.addCredits(body.stockpileDayKey, cost);
     this.addCredits(body.stockpileMonthKey, cost);
+    this.addCredits(body.monthKey, cost);
     return { ok: true };
   }
 
@@ -2266,6 +2271,7 @@ export class GolfapiCounter {
     if (Number.isFinite(cost) && cost > 0) {
       this.addCredits(body.stockpileDayKey, -cost);
       this.addCredits(body.stockpileMonthKey, -cost);
+      this.addCredits(body.monthKey, -cost);
     }
     return { ok: true };
   }

@@ -443,6 +443,7 @@ function stockpileChargeBox(golferPulls) {
     dayCap: Number(env.GOLFAPI_DAILY_CAP),
     dayHeadroomTenths: Number(env.GOLFAPI_STOCKPILE_DAY_HEADROOM) * 10,
     runCap: Number(env.GOLFAPI_STOCKPILE_RUN_CREDITS),
+    monthCap: 100000,
     chargeTenths: 10,
   };
   box.putCredits(golferDayKey, golferPulls * 10);
