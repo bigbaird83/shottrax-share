@@ -1345,6 +1345,57 @@ describe('golfapi stockpile', () => {
     assert.equal(counter.sql.map.get(monthKey), '450');
   });
 
+  test('a stockpile charge with no monthCap is refused and changes no credit key', async () => {
+    const counter = new FakeCounter();
+    const monthKey = 'golfapi:credit:month:2026-10-05';
+    const stockpileDayKey = 'golfapi:stockpile:credit:day:2026-10-29';
+    const stockpileMonthKey = 'golfapi:stockpile:credit:month:2026-10-05';
+    counter.sql.map.set(monthKey, '10');
+    counter.sql.map.set(stockpileDayKey, '2');
+    counter.sql.map.set(stockpileMonthKey, '3');
+    const refused = await counterOp(counter, {
+      op: 'stockpileCharge',
+      golferDayKey: 'golfapi:credit:day:2026-10-29',
+      stockpileDayKey,
+      stockpileMonthKey,
+      dayCap: 150,
+      runCap: 800,
+      dayHeadroomTenths: 300,
+      monthKey,
+      chargeTenths: 10,
+    });
+    assert.deepEqual(refused, { ok: false, reason: 'app_monthly' });
+    assert.equal(counter.sql.map.get(monthKey), '10');
+    assert.equal(counter.sql.map.get(stockpileDayKey), '2');
+    assert.equal(counter.sql.map.get(stockpileMonthKey), '3');
+  });
+
+  test("a stockpile charge with monthCap 'abc' is refused and changes no credit key", async () => {
+    const counter = new FakeCounter();
+    const monthKey = 'golfapi:credit:month:2026-10-05';
+    const stockpileDayKey = 'golfapi:stockpile:credit:day:2026-10-29';
+    const stockpileMonthKey = 'golfapi:stockpile:credit:month:2026-10-05';
+    counter.sql.map.set(monthKey, '10');
+    counter.sql.map.set(stockpileDayKey, '2');
+    counter.sql.map.set(stockpileMonthKey, '3');
+    const refused = await counterOp(counter, {
+      op: 'stockpileCharge',
+      golferDayKey: 'golfapi:credit:day:2026-10-29',
+      stockpileDayKey,
+      stockpileMonthKey,
+      dayCap: 150,
+      runCap: 800,
+      dayHeadroomTenths: 300,
+      monthKey,
+      monthCap: 'abc',
+      chargeTenths: 10,
+    });
+    assert.deepEqual(refused, { ok: false, reason: 'app_monthly' });
+    assert.equal(counter.sql.map.get(monthKey), '10');
+    assert.equal(counter.sql.map.get(stockpileDayKey), '2');
+    assert.equal(counter.sql.map.get(stockpileMonthKey), '3');
+  });
+
   test('GOLFAPI_MONTHLY_CAP=300 stops the stockpile at 300', async () => {
     const at = Date.parse('2026-10-29T23:00:00.000Z');
     const plan = {

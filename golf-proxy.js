@@ -2257,7 +2257,7 @@ export class GolfapiCounter {
       return { ok: false, reason: 'run_cap' };
     }
     const monthLimit = Math.round(Number(body.monthCap) * 10);
-    if (this.creditTenths(body.monthKey) + cost > monthLimit) {
+    if (!Number.isFinite(monthLimit) || this.creditTenths(body.monthKey) + cost > monthLimit) {
       return { ok: false, reason: 'app_monthly' };
     }
     this.addCredits(body.stockpileDayKey, cost);
