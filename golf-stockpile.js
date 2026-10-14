@@ -201,8 +201,9 @@ function optionalNumber(env, name) {
  * The window is the last 7 23:00 UTC nights before renewal. `maxDays` is
  * clamped to 7. A night in that window spends
  * (balance - rollover) / nights still left, including tonight, and never more
- * than runCap. The golfer daily and monthly caps are not a stockpile budget.
- * A night spends 0 when golfers have under `headroom` credits of daily room left.
+ * than runCap. A night spends 0 when golfers are already at the monthly cap,
+ * or when they have under `headroom` credits of daily room left. The monthly
+ * cap closes the night; it does not shrink a night that still has room.
  */
 export function stockpileSchedule({
   now,
@@ -230,6 +231,9 @@ export function stockpileSchedule({
   const inWindow = canSpend && runsRemaining > 0 && runsRemaining <= window;
   const startIndex = canSpend ? Math.max(0, runsRemaining - window) : runsRemaining;
   const perDay = window;
+  const monthLimit = Number(monthCap);
+  const monthSpent = Math.max(0, Number(monthUsed) || 0);
+  const monthHasRoom = !Number.isFinite(monthLimit) || monthSpent < monthLimit;
   const runs = [];
   let balance = roundCredit(liveLeft);
   for (let i = startIndex; i < runsRemaining; i += 1) {
@@ -238,7 +242,7 @@ export function stockpileSchedule({
     const above = creditsAboveRollover(balance, rollover);
     let budget = 0;
     const golfersHaveRoom = Number(dailyCap) - used >= Number(headroom);
-    if (golfersHaveRoom && balance > Number(floor) && above >= 1 && Number.isFinite(cap) && cap > 0) {
+    if (monthHasRoom && golfersHaveRoom && balance > Number(floor) && above >= 1 && Number.isFinite(cap) && cap > 0) {
       budget = Math.min(above / daysStill, cap, above);
       budget = roundCredit(Math.max(0, budget));
       if (balance - budget < Number(rollover)) budget = roundCredit(Math.max(0, balance - Number(rollover)));
@@ -619,6 +623,8 @@ export async function runGolfapiStockpile(env, ctx, event = {}, hooks = {}) {
     dayCap,
     runCap,
     dayHeadroomTenths: tenths(headroom),
+    monthCap,
+    monthKey: keys.monthKey,
   };
 
   const kv = env.GOLFAPI_KV;
@@ -662,6 +668,7 @@ export async function runGolfapiStockpile(env, ctx, event = {}, hooks = {}) {
       report.liveLeft = liveLeft;
       if (!schedule.inWindow || schedule.todayBudget < 1) {
         if (Number(liveLeft) <= floor) report.stopped = 'floor';
+        else if (schedule.inWindow && Number(monthUsed) >= Number(monthCap)) report.stopped = 'app_monthly';
         else if (!schedule.inWindow && schedule.daysNeeded <= 0) report.stopped = 'rollover';
         else if (!schedule.inWindow) report.stopped = 'not_yet';
         else report.stopped = 'app_daily';

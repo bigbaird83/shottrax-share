@@ -172,6 +172,58 @@ function jsonResponse(body, status = 200) {
   });
 }
 
+async function runMonthCap(at, monthUsed) {
+  const counter = new FakeCounter();
+  const charges = [];
+  const innerFetch = counter.stub.fetch.bind(counter.stub);
+  counter.stub.fetch = async (request) => {
+    const body = await request.clone().json();
+    if (body.op === 'stockpileCharge') charges.push(body);
+    return innerFetch(request);
+  };
+  const env = {
+    GOLFAPI_KEY: 'golf-secret',
+    GOLFAPI_KV: new FakeKV(),
+    GOLFAPI_COUNTER: counter,
+    GOLFAPI_STOCKPILE_ENABLED: 'true',
+    GOLFAPI_ROLLOVER_CREDITS: '156',
+    GOLFAPI_CREDIT_FLOOR: '50',
+    GOLFAPI_DAILY_CAP: '150',
+    GOLFAPI_STOCKPILE_DAY_HEADROOM: '30',
+    GOLFAPI_STOCKPILE_RUN_CREDITS: '800',
+    GOLFAPI_CYCLE_DAY: '5',
+    ALERT_EMAIL: { async send() {} },
+  };
+  assert.equal(env.GOLFAPI_STOCKPILE_ENABLED, 'true');
+  assert.equal(Object.hasOwn(env, 'GOLFAPI_MONTHLY_CAP'), false);
+  const keys = stockpileKeys(new Date(at), env);
+  counter.sql.map.set(keys.monthKey, String(monthUsed));
+  await seedDemand(counter, keys.cycleId, { courseId: 'month-cap', name: 'Month Cap' });
+  const http = installFetch((url) => {
+    const discovery = url.includes('city=') || url.includes('state=');
+    return jsonResponse(discovery ? { courses: [], apiRequestsLeft: 400 } : {
+      courses: [],
+      courseID: 'month-cap',
+      country: 'US',
+      latitude: 34.7,
+      longitude: -92.2,
+      numHoles: 1,
+      hasGPS: 1,
+      apiRequestsLeft: 400,
+      coordinates: [
+        { hole: 1, poi: 1, latitude: 34.7, longitude: -92.2 },
+        { hole: 1, poi: 11, latitude: 34.71, longitude: -92.21 },
+      ],
+    });
+  });
+  try {
+    const result = await runGolfapiStockpile(env, {}, bulkEvent(at), { overlay: () => ({ kind: 'gap' }) });
+    return { result, counter, keys, charges, calls: http.calls.length };
+  } finally {
+    http.restore();
+  }
+}
+
 describe('golfapi stockpile', () => {
   test('the window is the last 7 nights before renewal, and the bulk is the final hours', () => {
     assert.equal(stockpilePhase(new Date('2026-10-20T23:00:00Z'), 5), 'outside');
@@ -1184,73 +1236,87 @@ describe('golfapi stockpile', () => {
     }
   });
 
-  // KNOWN BUG: monthCap is not enforced in the stockpile path (stockpileSchedule
-  // ignores it, and chargeBody omits monthCap). This pins the bug, not the
-  // intended rule. Flip this test when the bug is fixed. Month-cap finding:
-  // https://github.com/bigbaird83/shottrax-share/pull/25#issuecomment-6156561653
-  test('KNOWN BUG: monthCap is not enforced in the stockpile path', async () => {
+  test('an unset monthly cap allows month usage 449 and stops at 450', async () => {
     const at = Date.parse('2026-10-29T23:00:00.000Z');
-    const runs = [];
-    for (const monthUsed of [449, 450]) {
-      const counter = new FakeCounter();
-      const charges = [];
-      const innerFetch = counter.stub.fetch.bind(counter.stub);
-      counter.stub.fetch = async (request) => {
-        const body = await request.clone().json();
-        if (body.op === 'stockpileCharge') charges.push(body);
-        return innerFetch(request);
-      };
-      const env = {
-        GOLFAPI_KEY: 'golf-secret',
-        GOLFAPI_KV: new FakeKV(),
-        GOLFAPI_COUNTER: counter,
-        GOLFAPI_STOCKPILE_ENABLED: 'true',
-        GOLFAPI_ROLLOVER_CREDITS: '156',
-        GOLFAPI_CREDIT_FLOOR: '50',
-        GOLFAPI_DAILY_CAP: '150',
-        GOLFAPI_STOCKPILE_DAY_HEADROOM: '30',
-        GOLFAPI_STOCKPILE_RUN_CREDITS: '800',
-        GOLFAPI_CYCLE_DAY: '5',
-        ALERT_EMAIL: { async send() {} },
-      };
-      assert.equal(env.GOLFAPI_STOCKPILE_ENABLED, 'true');
-      assert.equal(Object.hasOwn(env, 'GOLFAPI_MONTHLY_CAP'), false);
-      const keys = stockpileKeys(new Date(at), env);
-      counter.sql.map.set(keys.monthKey, String(monthUsed));
-      await seedDemand(counter, keys.cycleId, { courseId: 'month-cap', name: 'Month Cap' });
-      const http = installFetch((url) => {
-        const discovery = url.includes('city=') || url.includes('state=');
-        return jsonResponse(discovery ? { courses: [], apiRequestsLeft: 400 } : {
-          courses: [],
-          courseID: 'month-cap',
-          country: 'US',
-          latitude: 34.7,
-          longitude: -92.2,
-          numHoles: 1,
-          hasGPS: 1,
-          apiRequestsLeft: 400,
-          coordinates: [
-            { hole: 1, poi: 1, latitude: 34.7, longitude: -92.2 },
-            { hole: 1, poi: 11, latitude: 34.71, longitude: -92.21 },
-          ],
-        });
-      });
-      try {
-        const result = await runGolfapiStockpile(env, {}, bulkEvent(at), { overlay: () => ({ kind: 'gap' }) });
-        assert.equal(result.stopped, null, String(monthUsed));
-        assert.equal(result.added, 1, String(monthUsed));
-        assert.equal(result.schedule.todayBudget, 34.9, String(monthUsed));
-        assert.equal(counter.sql.map.get(keys.monthKey), String(monthUsed));
-        assert.equal(charges.length > 0, true, String(monthUsed));
-        assert.equal(charges.every((body) => !Object.hasOwn(body, 'monthCap')), true, String(monthUsed));
-        runs.push({ monthUsed, spent: result.spent, calls: http.calls.length });
-      } finally {
-        http.restore();
-      }
+    const plan = {
+      now: new Date(at),
+      cycleDay: 5,
+      liveLeft: 400,
+      rollover: 156,
+      runCap: 800,
+      dailyCap: 150,
+      headroom: 30,
+      floor: 50,
+      maxDays: 7,
+    };
+    assert.equal(stockpileSchedule({ ...plan, monthCap: 450, monthUsed: 449 }).todayBudget, 34.9);
+    assert.equal(stockpileSchedule({ ...plan, monthCap: 450, monthUsed: 450 }).todayBudget, 0);
+
+    const { env, counter } = baseEnv({ GOLFAPI_STOCKPILE_DRY_RUN: 'true' });
+    delete env.GOLFAPI_MONTHLY_CAP;
+    assert.equal(Object.hasOwn(env, 'GOLFAPI_MONTHLY_CAP'), false);
+    const dryKeys = stockpileKeys(new Date(at), env);
+    counter.sql.map.set(dryKeys.monthKey, '450');
+    await seedDemand(counter, dryKeys.cycleId, { courseId: 'month-cap', name: 'Month Cap' });
+    const quiet = installFetch(() => {
+      throw new Error('a month at the cap must not call golfapi');
+    });
+    try {
+      const dry = await runGolfapiStockpile(env, {}, bulkEvent(at), { liveLeft: 400, overlay: () => ({ kind: 'gap' }) });
+      assert.equal(quiet.calls.length, 0);
+      assert.equal(dry.stopped, 'app_monthly');
+      assert.equal(dry.added, 0);
+      assert.equal(dry.schedule.todayBudget, 0);
+      assert.equal(counter.sql.map.get(dryKeys.monthKey), '450');
+    } finally {
+      quiet.restore();
     }
-    assert.equal(runs[0].spent, runs[1].spent);
-    assert.equal(runs[0].calls, runs[1].calls);
-    assert.equal(runs[1].spent > 0, true);
+
+    const allowed = await runMonthCap(at, 449);
+    assert.equal(allowed.result.stopped, null);
+    assert.equal(allowed.result.added, 1);
+    assert.equal(allowed.result.schedule.todayBudget, 34.9);
+    assert.equal(allowed.counter.sql.map.get(allowed.keys.monthKey), '449');
+    assert.equal(allowed.charges.length > 0, true);
+    assert.equal(allowed.charges.every((body) => body.monthCap === 450), true);
+    assert.equal(allowed.charges.every((body) => body.monthKey === allowed.keys.monthKey), true);
+    assert.equal(allowed.result.spent > 0, true);
+
+    const blocked = await runMonthCap(at, 450);
+    assert.equal(blocked.result.stopped, 'app_monthly');
+    assert.equal(blocked.result.added, 0);
+    assert.equal(blocked.counter.sql.map.get(blocked.keys.monthKey), '450');
+    assert.equal(blocked.counter.sql.map.has(blocked.keys.stockpileDayKey), false);
+    assert.equal(blocked.charges.length > 0, true);
+    assert.equal(blocked.charges[0].monthCap, 450);
+    assert.equal(blocked.charges[0].monthKey, blocked.keys.monthKey);
+  });
+
+  test('the charge body sends monthCap and the counter refuses a charge at the cap', async () => {
+    const counter = new FakeCounter();
+    const monthKey = 'golfapi:credit:month:2026-10-05';
+    const body = {
+      golferDayKey: 'golfapi:credit:day:2026-10-29',
+      stockpileDayKey: 'golfapi:stockpile:credit:day:2026-10-29',
+      stockpileMonthKey: 'golfapi:stockpile:credit:month:2026-10-05',
+      dayCap: 150,
+      runCap: 800,
+      dayHeadroomTenths: 300,
+      monthCap: 450,
+      monthKey,
+    };
+    counter.sql.map.set(monthKey, '449');
+    const onCap = await counterOp(counter, { op: 'stockpileCharge', ...body, chargeTenths: 10 });
+    assert.deepEqual(onCap, { ok: true });
+    assert.equal(counter.sql.map.get(body.stockpileDayKey), '1');
+    assert.equal(counter.sql.map.get(monthKey), '449');
+
+    counter.sql.map.set(monthKey, '450');
+    const over = await counterOp(counter, { op: 'stockpileCharge', ...body, chargeTenths: 1 });
+    assert.deepEqual(over, { ok: false, reason: 'app_monthly' });
+    assert.equal(counter.sql.map.get(body.stockpileDayKey), '1');
+    assert.equal(counter.sql.map.get(body.stockpileMonthKey), '1');
+    assert.equal(counter.sql.map.get(monthKey), '450');
   });
 
   test('a missing run ceiling does not fall back to 80 or call golfapi', async () => {
