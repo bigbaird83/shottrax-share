@@ -6,13 +6,14 @@ const doc = readFileSync(new URL("./friends-api.md", import.meta.url), "utf8");
 const wrangler = readFileSync(new URL("../wrangler.toml", import.meta.url), "utf8");
 const ORIGIN = "https://shottrax-share.bcbaird.workers.dev";
 
-// Requests, accept, remove, block, and rounds stay unserved until a later step.
+// Requests, accept, remove, block, unblock, and rounds stay unserved until a later step.
 // getCode, resetCode, and lookup are served once friend codes land (#24).
 const UNPUBLISHED_FRIEND_CALLS = [
   ["POST", "/v1/friends/requests"],
   ["POST", "/v1/friends/requests/accept"],
   ["POST", "/v1/friends/remove"],
   ["POST", "/v1/friends/block"],
+  ["POST", "/v1/friends/unblock"],
   ["PUT", "/v1/friends/rounds"],
   ["GET", "/v1/friends/rounds"],
 ];
@@ -53,6 +54,34 @@ async function call(path, method) {
 }
 
 describe("friends API contract", () => {
+  it("unblock: never-blocked target is a harmless no-op", () => {
+    expect(doc).toContain("Unblocking someone the caller has not blocked, or an `ownerId` that does not exist, is the same `200` `{ \"ok\": true }` with nothing written");
+  });
+
+  it("unblock: no friendship and no pending request on either side afterward", () => {
+    expect(doc).toContain("Neither side has a friendship or a pending request until a new request is sent.");
+  });
+
+  it("unblock: removes only the caller's block, never the other person's", () => {
+    expect(doc).toContain("It does not touch a block the other person holds on the caller.");
+  });
+
+  it("unblock: a new request from the formerly blocked person goes through", () => {
+    expect(doc).toContain("a request from the person who was blocked is stored as a real pending request the caller can accept. It is no longer quietly dropped.");
+  });
+
+  it("unblock: does not consume a code guess", () => {
+    expect(doc).toMatch(/### unblock[\s\S]*Does not count as a guess, does not read a code, and does not require the guess limiter\./);
+  });
+
+  it("specs unblock as the inverse of block without restoring anything", () => {
+    expect(doc).toContain("`POST /v1/friends/unblock`");
+    expect(doc).toContain("Deletes only the caller's stored block on that person. It does not restore a friendship, and it does not recreate a request");
+    expect(doc).toContain("or an `ownerId` that does not exist, is the same `200` `{ \"ok\": true }` with nothing written");
+    expect(doc).toContain("the caller sends a new request with the normal add flow, and the other person accepts it");
+    expect(doc).toContain("| `unblock(id)` | `POST /v1/friends/unblock` with `{ ownerId }` |");
+  });
+
   it("allows PUT on the friends CORS preflight", () => {
     expect(doc).toContain("CORS for `/v1/friends` allows `GET, POST, PUT, OPTIONS`");
     expect(doc).toContain("headers `Content-Type` and `X-Friend-Key`");

@@ -124,6 +124,26 @@ Same deletion as remove: both sides' shared rounds are deleted in that request, 
 
 The blocked person gets no notice. Their later `sendRequest` and `accept` behave as in those sections: same status and body as if they were not blocked. This call is not the guess limiter's block operation.
 
+### unblock
+
+`POST /v1/friends/unblock`
+
+```json
+{ "ownerId": "<the other person>" }
+```
+
+The phone's `id` is this `ownerId`. Auth, body allowlist, and size limit are the same as block.
+
+Deletes only the caller's stored block on that person. It does not restore a friendship, and it does not recreate a request: the quiet block stored nothing, so there is nothing to bring back. It does not touch a block the other person holds on the caller. Rounds deleted by block stay deleted.
+
+`200` `{ "ok": true }`
+
+Unblocking someone the caller has not blocked, or an `ownerId` that does not exist, is the same `200` `{ "ok": true }` with nothing written. The response does not reveal whether a block or a person existed.
+
+After unblock, the caller's `sendRequest` to that person no longer returns `blocked`. To be friends again, the caller sends a new request with the normal add flow, and the other person accepts it. After unblock, a request from the person who was blocked is stored as a real pending request the caller can accept. It is no longer quietly dropped. Neither side has a friendship or a pending request until a new request is sent.
+
+Does not count as a guess, does not read a code, and does not require the guess limiter. This call is not the guess limiter's reset operation.
+
 ### publishRound
 
 `PUT /v1/friends/rounds`
@@ -276,6 +296,7 @@ ShotTraxx PR #533 `src/domain/friendsApi.ts` returns `FriendsApiResult` on every
 | `accept({ id, name })` | `POST /v1/friends/requests/accept` with `{ ownerId }` only |
 | `remove(id)` | `POST /v1/friends/remove` with `{ ownerId }` |
 | `block(id)` | `POST /v1/friends/block` with `{ ownerId }` |
+| `unblock(id)` | `POST /v1/friends/unblock` with `{ ownerId }` |
 | `publishRound({ round, share })` | `PUT /v1/friends/rounds`. `share: true` and a round publishes it. `share: false` and `round: null` unshares and deletes the caller's shared rounds. |
 | `fetchRounds()` | `GET /v1/friends/rounds` → `{ rounds }` |
 
