@@ -2262,6 +2262,7 @@ export class GolfapiCounter {
     }
     this.addCredits(body.stockpileDayKey, cost);
     this.addCredits(body.stockpileMonthKey, cost);
+    this.addCredits(body.monthKey, cost);
     return { ok: true };
   }
 
@@ -2270,6 +2271,7 @@ export class GolfapiCounter {
     if (Number.isFinite(cost) && cost > 0) {
       this.addCredits(body.stockpileDayKey, -cost);
       this.addCredits(body.stockpileMonthKey, -cost);
+      this.addCredits(body.monthKey, -cost);
     }
     return { ok: true };
   }
