@@ -4,8 +4,9 @@
  * only. Guess counts live in FriendGuessLimiter (SQLite Durable Object),
  * one object per friend-key hash and one per IP hash.
  *
- * Served here: getCode, resetCode, and code lookup. Requests, block, and
- * rounds are specified in the friends contract and are not routed yet.
+ * Served here: getCode, resetCode, code lookup, sendRequest, accept, block,
+ * and unblock. Remove and shared-round publish stay unrouted. Block is quiet
+ * for the blocked person. Unblock deletes only the caller's block.
  */
 
 export const FRIEND_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -21,6 +22,7 @@ const COURSE_CACHE_PREFIXES = ["id:", "name:", "osm:", "gq:", "gapi:", "gqueue:"
 const FRIEND_KEY_RE = /^[A-Za-z0-9_-]{32,64}$/;
 const INSTALL_ID_RE = /^id_\d+_[a-z0-9]+$/i;
 const CODE_RE = /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}$/;
+const OWNER_ID_RE = /^[A-Za-z0-9_-]{22}$/;
 
 const GUESS_SCHEMA = `CREATE TABLE IF NOT EXISTS guess_limit (
   id INTEGER PRIMARY KEY,
@@ -146,6 +148,10 @@ const FRIEND_ROUTES = {
   "/v1/friends/code": { POST: getCode },
   "/v1/friends/code/reset": { POST: resetCode },
   "/v1/friends/codes/lookup": { POST: lookupCode },
+  "/v1/friends/requests": { POST: sendRequest },
+  "/v1/friends/requests/accept": { POST: acceptRequest },
+  "/v1/friends/block": { POST: blockPerson },
+  "/v1/friends/unblock": { POST: unblockPerson },
 };
 
 async function getCode(request, env, cors) {
@@ -199,20 +205,177 @@ async function lookupCode(request, env, cors) {
   if (unknownFields(parsed.value, ["code"])) return friendJson(400, { error: "invalid_body" }, cors);
   const code = normalizeFriendCode(parsed.value.code);
   if (!code) return friendJson(400, { error: "invalid_body" }, cors);
-  const now = Date.now();
-  const keyName = await limiterNameForFriendKey(friendKey);
-  const keyAttempt = await guessAttempt(env, keyName, now);
-  if (!keyAttempt.ok) return rateLimited(cors, keyAttempt.retryAfterSec);
-  const ipHash = await friendIpHash(request);
-  if (ipHash) {
-    const ipAttempt = await guessAttempt(env, `ip:${ipHash}`, now);
-    if (!ipAttempt.ok) return rateLimited(cors, ipAttempt.retryAfterSec);
-  }
+  const limited = await consumeGuess(request, env, friendKey, cors);
+  if (limited) return limited;
   const ownerId = await friendGet(boards, friendKvKey("code", code));
   if (typeof ownerId !== "string" || ownerId.length === 0) {
     return friendJson(404, { error: "code_not_found" }, cors);
   }
   return friendJson(200, { ownerId }, cors);
+}
+
+async function sendRequest(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const parsed = await readJsonObject(request, FRIEND_BODY_LIMIT, false);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (unknownFields(parsed.value, ["code"])) return friendJson(400, { error: "invalid_body" }, cors);
+  const code = normalizeFriendCode(parsed.value.code);
+  if (!code) return friendJson(400, { error: "invalid_body" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  // Own code is rejected before the limiter and does not consume a guess.
+  if (caller.code === code) return friendJson(400, { error: "invalid_body" }, cors);
+  if (!guessNamespace(env)) return friendJson(503, { error: "guess_limiter_not_configured" }, cors);
+  const limited = await consumeGuess(request, env, friendKey, cors);
+  if (limited) return limited;
+  const ownerId = await friendGet(boards, friendKvKey("code", code));
+  if (typeof ownerId !== "string" || ownerId.length === 0) {
+    return friendJson(404, { error: "code_not_found" }, cors);
+  }
+  if (await hasBlock(boards, caller.ownerId, ownerId)) {
+    return friendJson(409, { error: "blocked" }, cors);
+  }
+  // Quiet block: same pending body as a real request, and nothing is stored.
+  if (await hasBlock(boards, ownerId, caller.ownerId)) {
+    return friendJson(200, { status: "pending", ownerId }, cors);
+  }
+  if (await areFriends(boards, caller.ownerId, ownerId)) {
+    return friendJson(200, { status: "friends", ownerId }, cors);
+  }
+  const reqKey = requestKey(ownerId, caller.ownerId);
+  const pending = await friendGet(boards, reqKey);
+  if (typeof pending === "string" && pending.length > 0) {
+    return friendJson(200, { status: "pending", ownerId }, cors);
+  }
+  await friendPut(boards, reqKey, "pending");
+  return friendJson(200, { status: "pending", ownerId }, cors);
+}
+
+async function acceptRequest(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const parsed = await readJsonObject(request, FRIEND_BODY_LIMIT, false);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (unknownFields(parsed.value, ["ownerId"])) return friendJson(400, { error: "invalid_body" }, cors);
+  const ownerId = readOwnerId(parsed.value.ownerId);
+  if (!ownerId) return friendJson(400, { error: "invalid_body" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  if (ownerId === caller.ownerId) return friendJson(400, { error: "invalid_body" }, cors);
+  // The opener who blocked the inviter hears blocked, even if no request remains.
+  if (await hasBlock(boards, caller.ownerId, ownerId)) {
+    return friendJson(409, { error: "blocked" }, cors);
+  }
+  if (await hasBlock(boards, ownerId, caller.ownerId)) {
+    return friendJson(409, { error: "not_friends" }, cors);
+  }
+  const reqKey = requestKey(caller.ownerId, ownerId);
+  const pending = await friendGet(boards, reqKey);
+  if (typeof pending !== "string" || pending.length === 0) {
+    return friendJson(409, { error: "not_friends" }, cors);
+  }
+  await friendPut(boards, friendKvKey("friend", `${caller.ownerId}:${ownerId}`), "1");
+  await friendPut(boards, friendKvKey("friend", `${ownerId}:${caller.ownerId}`), "1");
+  await friendDelete(boards, reqKey);
+  return friendJson(200, { status: "friends", ownerId }, cors);
+}
+
+async function blockPerson(request, env, cors) {
+  const ready = await readyOwnerCall(request, env, cors);
+  if (ready.error) return ready.error;
+  const { boards, caller, ownerId } = ready;
+  await deleteIfPresent(boards, friendKvKey("friend", `${caller.ownerId}:${ownerId}`));
+  await deleteIfPresent(boards, friendKvKey("friend", `${ownerId}:${caller.ownerId}`));
+  await deleteIfPresent(boards, requestKey(ownerId, caller.ownerId));
+  await deleteIfPresent(boards, requestKey(caller.ownerId, ownerId));
+  await deleteOwnedRounds(boards, caller.ownerId);
+  await deleteOwnedRounds(boards, ownerId);
+  await friendPut(boards, friendKvKey("block", `${caller.ownerId}:${ownerId}`), "1");
+  return friendJson(200, { ok: true }, cors);
+}
+
+async function unblockPerson(request, env, cors) {
+  const ready = await readyOwnerCall(request, env, cors);
+  if (ready.error) return ready.error;
+  const { boards, caller, ownerId } = ready;
+  // Only the caller's block. No friendship, request, round, or guess-limiter change.
+  const key = friendKvKey("block", `${caller.ownerId}:${ownerId}`);
+  const current = await friendGet(boards, key);
+  if (typeof current === "string" && current.length > 0) await friendDelete(boards, key);
+  return friendJson(200, { ok: true }, cors);
+}
+
+async function readyOwnerCall(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return { error: friendJson(401, { error: "friend_key_required" }, cors) };
+  const boards = boardsBinding(env);
+  if (!boards) return { error: friendJson(503, { error: "boards_not_configured" }, cors) };
+  const parsed = await readJsonObject(request, FRIEND_BODY_LIMIT, false);
+  if (parsed.error) return { error: friendJson(parsed.status, { error: parsed.error }, cors) };
+  if (unknownFields(parsed.value, ["ownerId"])) return { error: friendJson(400, { error: "invalid_body" }, cors) };
+  const ownerId = readOwnerId(parsed.value.ownerId);
+  if (!ownerId) return { error: friendJson(400, { error: "invalid_body" }, cors) };
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return { error: friendJson(401, { error: "friend_key_required" }, cors) };
+  if (ownerId === caller.ownerId) return { error: friendJson(400, { error: "invalid_body" }, cors) };
+  return { boards, caller, ownerId };
+}
+
+function readOwnerId(raw) {
+  if (typeof raw !== "string" || !OWNER_ID_RE.test(raw)) return null;
+  return raw;
+}
+
+async function loadCaller(boards, friendKey) {
+  const keyHash = await sha256Hex(FRIEND_KEY_HASH_PREFIX + friendKey);
+  return parseAuth(await friendGet(boards, friendKvKey("k", keyHash)));
+}
+
+function requestKey(recipientOwnerId, requesterOwnerId) {
+  return friendKvKey("req", `${recipientOwnerId}:${requesterOwnerId}`);
+}
+
+async function hasBlock(boards, blockerOwnerId, blockedOwnerId) {
+  const raw = await friendGet(boards, friendKvKey("block", `${blockerOwnerId}:${blockedOwnerId}`));
+  return typeof raw === "string" && raw.length > 0;
+}
+
+async function areFriends(boards, leftOwnerId, rightOwnerId) {
+  const raw = await friendGet(boards, friendKvKey("friend", `${leftOwnerId}:${rightOwnerId}`));
+  return typeof raw === "string" && raw.length > 0;
+}
+
+async function deleteIfPresent(boards, key) {
+  const raw = await friendGet(boards, key);
+  if (typeof raw === "string" && raw.length > 0) await friendDelete(boards, key);
+}
+
+async function deleteOwnedRounds(boards, ownerId) {
+  const prefix = `fr:round:${ownerId}:`;
+  for (const name of await listByPrefix(boards, prefix)) {
+    if (name.startsWith(prefix)) await friendDelete(boards, name);
+  }
+}
+
+async function listByPrefix(boards, prefix) {
+  if (!boards || typeof boards.list !== "function") return [];
+  const names = [];
+  let cursor;
+  for (let pageNo = 0; pageNo < 20; pageNo += 1) {
+    const page = await boards.list(cursor ? { prefix, cursor } : { prefix });
+    const keys = page && Array.isArray(page.keys) ? page.keys : [];
+    for (const entry of keys) {
+      if (entry && typeof entry.name === "string") names.push(entry.name);
+    }
+    if (!page || page.list_complete !== false || !page.cursor) break;
+    cursor = page.cursor;
+  }
+  return names;
 }
 
 function readFriendKey(request) {
@@ -274,6 +437,18 @@ function guessNamespace(env) {
   return ns;
 }
 
+async function consumeGuess(request, env, friendKey, cors) {
+  const now = Date.now();
+  const keyAttempt = await guessAttempt(env, await limiterNameForFriendKey(friendKey), now);
+  if (!keyAttempt.ok) return rateLimited(cors, keyAttempt.retryAfterSec);
+  const ipHash = await friendIpHash(request);
+  if (ipHash) {
+    const ipAttempt = await guessAttempt(env, `ip:${ipHash}`, now);
+    if (!ipAttempt.ok) return rateLimited(cors, ipAttempt.retryAfterSec);
+  }
+  return null;
+}
+
 async function guessAttempt(env, name, now) {
   const ns = guessNamespace(env);
   const stub = ns.get(ns.idFromName(name));
@@ -288,7 +463,9 @@ async function guessAttempt(env, name, now) {
 }
 
 function friendKvKey(kind, id) {
-  if (kind !== "k" && kind !== "code") throw new Error("friend_namespace");
+  if (kind !== "k" && kind !== "code" && kind !== "req" && kind !== "friend" && kind !== "round" && kind !== "block") {
+    throw new Error("friend_namespace");
+  }
   if (typeof id !== "string" || id.length < 1) throw new Error("friend_namespace");
   const key = `fr:${kind}:${id}`;
   assertFriendNamespace(key);

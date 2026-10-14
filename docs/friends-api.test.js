@@ -6,14 +6,9 @@ const doc = readFileSync(new URL("./friends-api.md", import.meta.url), "utf8");
 const wrangler = readFileSync(new URL("../wrangler.toml", import.meta.url), "utf8");
 const ORIGIN = "https://shottrax-share.bcbaird.workers.dev";
 
-// Requests, accept, remove, block, unblock, and rounds stay unserved until a later step.
-// getCode, resetCode, and lookup are served once friend codes land (#24).
+// Remove and shared rounds stay unserved. Codes, requests, accept, block, and unblock are served.
 const UNPUBLISHED_FRIEND_CALLS = [
-  ["POST", "/v1/friends/requests"],
-  ["POST", "/v1/friends/requests/accept"],
   ["POST", "/v1/friends/remove"],
-  ["POST", "/v1/friends/block"],
-  ["POST", "/v1/friends/unblock"],
   ["PUT", "/v1/friends/rounds"],
   ["GET", "/v1/friends/rounds"],
 ];
@@ -21,6 +16,10 @@ const FRIEND_CODE_CALLS = [
   ["POST", "/v1/friends/code"],
   ["POST", "/v1/friends/code/reset"],
   ["POST", "/v1/friends/codes/lookup"],
+  ["POST", "/v1/friends/requests"],
+  ["POST", "/v1/friends/requests/accept"],
+  ["POST", "/v1/friends/block"],
+  ["POST", "/v1/friends/unblock"],
 ];
 
 function boards() {

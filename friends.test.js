@@ -107,6 +107,11 @@ describe("friend codes", () => {
         async delete(key) {
           kv.delete(key);
         },
+        async list(options = {}) {
+          const prefix = typeof options.prefix === "string" ? options.prefix : "";
+          const names = [...kv.keys()].filter((name) => name.startsWith(prefix)).sort();
+          return { keys: names.map((name) => ({ name })), list_complete: true };
+        },
       },
       FRIEND_GUESSES: createLimiterNamespace(),
     };
@@ -320,7 +325,7 @@ describe("friend codes", () => {
     const method = await invoke("/v1/friends/code", { method: "GET", friend: friendKey("get") });
     expect(method.status).toBe(405);
     expect(method.json).toEqual({ error: "method_not_allowed" });
-    const later = await invoke("/v1/friends/requests", { friend: friendKey("later"), body: { code: "AAAAAAAA" } });
+    const later = await invoke("/v1/friends/remove", { friend: friendKey("later"), body: { ownerId: "k3mR9xQ2nB8wL4pT6vYs1A" } });
     expect(later.status).toBe(404);
     expect(later.json).toEqual({ error: "unknown_route" });
 
@@ -504,5 +509,389 @@ describe("friend codes", () => {
     expect(options.headers.get("Access-Control-Allow-Headers")).toContain("X-Friend-Key");
     const reports = await invoke("/v1/course-reports", { method: "OPTIONS" });
     expect(reports.headers.get("Access-Control-Allow-Methods")).toBe("GET,POST,OPTIONS");
+  });
+
+  function rows(prefix) {
+    return [...kv.keys()].filter((name) => name.startsWith(prefix)).sort();
+  }
+
+  function kvSnapshot() {
+    return [...kv.entries()].map(([key, row]) => `${key}=${row.value}`).sort();
+  }
+
+  async function mint(suffix) {
+    const key = friendKey(suffix);
+    const created = await invoke("/v1/friends/code", { friend: key, body: {} });
+    expect(created.status).toBe(200);
+    return { key, code: created.json.code, ownerId: created.json.ownerId };
+  }
+
+  it("quiet block looks like a sent request and stores nothing", async () => {
+    const opener = await mint("quiet-opener");
+    const inviter = await mint("quiet-inviter");
+    const controlFrom = await mint("quiet-from");
+    const controlTo = await mint("quiet-to");
+    const blocked = await invoke("/v1/friends/block", { friend: inviter.key, body: { ownerId: opener.ownerId } });
+    expect(blocked.status).toBe(200);
+    expect(blocked.json).toEqual({ ok: true });
+
+    const real = await invoke("/v1/friends/requests", { friend: controlFrom.key, body: { code: controlTo.code } });
+    const quiet = await invoke("/v1/friends/requests", {
+      friend: opener.key,
+      body: { code: inviter.code },
+      headers: { "X-Display-Name": DISPLAY_NAME, "X-Install-Id": INSTALL_ID },
+    });
+    expect(quiet.status).toBe(real.status);
+    expect(quiet.status).toBe(200);
+    expect(Object.keys(quiet.json)).toEqual(Object.keys(real.json));
+    expect(quiet.json).toEqual({ status: "pending", ownerId: inviter.ownerId });
+    expect(real.json).toEqual({ status: "pending", ownerId: controlTo.ownerId });
+    expect(quiet.headers.get("Content-Type")).toBe(real.headers.get("Content-Type"));
+    expect(quiet.headers.get("Cache-Control")).toBe("no-store");
+    expect(quiet.text).not.toContain("blocked");
+    expect(quiet.text).not.toContain("error");
+    expect(rows("fr:req:")).toEqual([`fr:req:${controlTo.ownerId}:${controlFrom.ownerId}`]);
+    expect(kv.has(`fr:req:${inviter.ownerId}:${opener.ownerId}`)).toBe(false);
+
+    const told = await invoke("/v1/friends/requests/accept", { friend: opener.key, body: { ownerId: inviter.ownerId } });
+    expect(told.status).toBe(409);
+    expect(told.json).toEqual({ error: "not_friends" });
+    expect(told.text).not.toContain("blocked");
+    expect(rows("fr:friend:")).toEqual([]);
+    assertAnonymous(quiet.text + told.text + blocked.text);
+  });
+
+  it("opener gets 409 blocked when they have blocked the inviter", async () => {
+    const opener = await mint("open-opener");
+    const inviter = await mint("open-inviter");
+    const sent = await invoke("/v1/friends/requests", { friend: inviter.key, body: { code: opener.code } });
+    expect(sent.json).toEqual({ status: "pending", ownerId: opener.ownerId });
+    expect(kv.has(`fr:req:${opener.ownerId}:${inviter.ownerId}`)).toBe(true);
+
+    const blocked = await invoke("/v1/friends/block", { friend: opener.key, body: { ownerId: inviter.ownerId } });
+    expect(blocked.json).toEqual({ ok: true });
+    expect(kv.has(`fr:req:${opener.ownerId}:${inviter.ownerId}`)).toBe(false);
+    expect(kv.has(`fr:req:${inviter.ownerId}:${opener.ownerId}`)).toBe(false);
+    expect(kv.get(`fr:block:${opener.ownerId}:${inviter.ownerId}`).value).toBe("1");
+
+    const opened = await invoke("/v1/friends/requests/accept", { friend: opener.key, body: { ownerId: inviter.ownerId } });
+    expect(opened.status).toBe(409);
+    expect(opened.json).toEqual({ error: "blocked" });
+    expect(rows("fr:friend:")).toEqual([]);
+
+    const again = await invoke("/v1/friends/requests", { friend: opener.key, body: { code: inviter.code } });
+    expect(again.status).toBe(409);
+    expect(again.json).toEqual({ error: "blocked" });
+    expect(rows("fr:req:")).toEqual([]);
+  });
+
+  it("unblocking someone you never blocked writes nothing", async () => {
+    const caller = await mint("noop-caller");
+    const other = await mint("noop-other");
+    const missing = "zzzzzzzzzzzzzzzzzzzzzz";
+    const before = kvSnapshot();
+    const unknown = await invoke("/v1/friends/unblock", { friend: caller.key, body: { ownerId: missing } });
+    expect(unknown.status).toBe(200);
+    expect(unknown.json).toEqual({ ok: true });
+    expect(unknown.text).not.toContain(missing);
+    expect(kvSnapshot()).toEqual(before);
+    const never = await invoke("/v1/friends/unblock", { friend: caller.key, body: { ownerId: other.ownerId } });
+    expect(never.status).toBe(200);
+    expect(never.json).toEqual({ ok: true });
+    expect(never.text).not.toContain("blocked");
+    expect(kvSnapshot()).toEqual(before);
+    expect(rows("fr:block:")).toEqual([]);
+  });
+
+  it("after unblock neither side is friends or has a pending request", async () => {
+    const left = await mint("gone-left");
+    const right = await mint("gone-right");
+    const sent = await invoke("/v1/friends/requests", { friend: left.key, body: { code: right.code } });
+    expect(sent.json).toEqual({ status: "pending", ownerId: right.ownerId });
+    const accepted = await invoke("/v1/friends/requests/accept", { friend: right.key, body: { ownerId: left.ownerId } });
+    expect(accepted.json).toEqual({ status: "friends", ownerId: left.ownerId });
+    expect(kv.has(`fr:friend:${left.ownerId}:${right.ownerId}`)).toBe(true);
+    expect(kv.has(`fr:friend:${right.ownerId}:${left.ownerId}`)).toBe(true);
+    const bystander = "c".repeat(22);
+    kv.set(`fr:round:${left.ownerId}:round_left`, { value: "{\"id\":\"round_left\"}" });
+    kv.set(`fr:round:${right.ownerId}:round_right`, { value: "{\"id\":\"round_right\"}" });
+    kv.set(`fr:round:${bystander}:round_other`, { value: "{\"id\":\"round_other\"}" });
+    kv.set("id:14322", { value: "{\"holes\":1}" });
+
+    const blocked = await invoke("/v1/friends/block", { friend: left.key, body: { ownerId: right.ownerId } });
+    expect(blocked.json).toEqual({ ok: true });
+    expect(rows("fr:friend:")).toEqual([]);
+    expect(rows("fr:req:")).toEqual([]);
+    expect(kv.has(`fr:round:${left.ownerId}:round_left`)).toBe(false);
+    expect(kv.has(`fr:round:${right.ownerId}:round_right`)).toBe(false);
+    expect(kv.get(`fr:round:${bystander}:round_other`).value).toBe("{\"id\":\"round_other\"}");
+    expect(kv.get("id:14322").value).toBe("{\"holes\":1}");
+    expect(kv.has(`fr:code:${left.code}`)).toBe(true);
+    expect(kv.has(`fr:code:${right.code}`)).toBe(true);
+
+    const cleared = await invoke("/v1/friends/unblock", { friend: left.key, body: { ownerId: right.ownerId } });
+    expect(cleared.json).toEqual({ ok: true });
+    expect(rows("fr:friend:")).toEqual([]);
+    expect(rows("fr:req:")).toEqual([]);
+    expect(rows("fr:block:")).toEqual([]);
+    expect(kv.has(`fr:round:${left.ownerId}:round_left`)).toBe(false);
+    expect(kv.has(`fr:round:${right.ownerId}:round_right`)).toBe(false);
+    expect(kv.get(`fr:round:${bystander}:round_other`).value).toBe("{\"id\":\"round_other\"}");
+    const still = await invoke("/v1/friends/requests/accept", { friend: right.key, body: { ownerId: left.ownerId } });
+    expect(still.status).toBe(409);
+    expect(still.json).toEqual({ error: "not_friends" });
+    const lookup = await invoke("/v1/friends/codes/lookup", { friend: friendKey("gone-look"), body: { code: left.code } });
+    expect(lookup.status).toBe(200);
+    expect(lookup.json).toEqual({ ownerId: left.ownerId });
+  });
+
+  it("unblock removes only the caller's block", async () => {
+    const caller = await mint("only-caller");
+    const other = await mint("only-other");
+    expect((await invoke("/v1/friends/block", { friend: caller.key, body: { ownerId: other.ownerId } })).json).toEqual({ ok: true });
+    expect((await invoke("/v1/friends/block", { friend: other.key, body: { ownerId: caller.ownerId } })).json).toEqual({ ok: true });
+    const callerBlock = `fr:block:${caller.ownerId}:${other.ownerId}`;
+    const otherBlock = `fr:block:${other.ownerId}:${caller.ownerId}`;
+    expect(kv.get(callerBlock).value).toBe("1");
+    expect(kv.get(otherBlock).value).toBe("1");
+
+    const cleared = await invoke("/v1/friends/unblock", { friend: caller.key, body: { ownerId: other.ownerId } });
+    expect(cleared.json).toEqual({ ok: true });
+    expect(kv.has(callerBlock)).toBe(false);
+    expect(kv.get(otherBlock).value).toBe("1");
+
+    const quiet = await invoke("/v1/friends/requests", { friend: caller.key, body: { code: other.code } });
+    expect(quiet.status).toBe(200);
+    expect(quiet.json).toEqual({ status: "pending", ownerId: other.ownerId });
+    expect(quiet.text).not.toContain("blocked");
+    expect(kv.has(`fr:req:${other.ownerId}:${caller.ownerId}`)).toBe(false);
+
+    const refused = await invoke("/v1/friends/requests", { friend: other.key, body: { code: caller.code } });
+    expect(refused.status).toBe(409);
+    expect(refused.json).toEqual({ error: "blocked" });
+  });
+
+  it("after unblock a request from the blocked person is stored and can be accepted", async () => {
+    const caller = await mint("again-caller");
+    const other = await mint("again-other");
+    expect((await invoke("/v1/friends/block", { friend: caller.key, body: { ownerId: other.ownerId } })).status).toBe(200);
+    const hidden = await invoke("/v1/friends/requests", { friend: other.key, body: { code: caller.code } });
+    expect(hidden.status).toBe(200);
+    expect(hidden.json).toEqual({ status: "pending", ownerId: caller.ownerId });
+    expect(rows("fr:req:")).toEqual([]);
+
+    const cleared = await invoke("/v1/friends/unblock", { friend: caller.key, body: { ownerId: other.ownerId } });
+    expect(cleared.json).toEqual({ ok: true });
+    const sent = await invoke("/v1/friends/requests", { friend: other.key, body: { code: caller.code } });
+    expect(sent.status).toBe(200);
+    expect(sent.json).toEqual({ status: "pending", ownerId: caller.ownerId });
+    expect(kv.get(`fr:req:${caller.ownerId}:${other.ownerId}`).value).toBe("pending");
+    expect(rows("fr:req:")).toEqual([`fr:req:${caller.ownerId}:${other.ownerId}`]);
+
+    const accepted = await invoke("/v1/friends/requests/accept", { friend: caller.key, body: { ownerId: other.ownerId } });
+    expect(accepted.status).toBe(200);
+    expect(accepted.json).toEqual({ status: "friends", ownerId: other.ownerId });
+    expect(kv.has(`fr:friend:${caller.ownerId}:${other.ownerId}`)).toBe(true);
+    expect(kv.has(`fr:friend:${other.ownerId}:${caller.ownerId}`)).toBe(true);
+    expect(rows("fr:req:")).toEqual([]);
+
+    const repeat = await invoke("/v1/friends/requests", { friend: other.key, body: { code: caller.code } });
+    expect(repeat.json).toEqual({ status: "friends", ownerId: caller.ownerId });
+    expect(rows("fr:req:")).toEqual([]);
+  });
+
+  it("unblock does not consume a code guess", async () => {
+    const caller = await mint("guess-caller");
+    const other = await mint("guess-other");
+    await invoke("/v1/friends/block", { friend: caller.key, body: { ownerId: other.ownerId } });
+    for (let i = 0; i < KEY_LIMIT - 1; i += 1) {
+      const miss = await invoke("/v1/friends/codes/lookup", { friend: caller.key, body: { code: "NNNNNNNN" } });
+      expect(miss.status).toBe(404);
+    }
+    for (let i = 0; i < KEY_LIMIT + 4; i += 1) {
+      const cleared = await invoke("/v1/friends/unblock", { friend: caller.key, body: { ownerId: other.ownerId } });
+      expect(cleared.status).toBe(200);
+      expect(cleared.json).toEqual({ ok: true });
+    }
+    const eighth = await invoke("/v1/friends/codes/lookup", { friend: caller.key, body: { code: "NNNNNNNN" } });
+    expect(eighth.status).toBe(404);
+    const ninth = await invoke("/v1/friends/codes/lookup", { friend: caller.key, body: { code: "NNNNNNNN" } });
+    expect(ninth.status).toBe(429);
+    expect(ninth.json).toEqual({ error: "rate_limited" });
+
+    const ip = "203.0.113.44";
+    for (let i = 0; i < IP_LIMIT - 1; i += 1) {
+      const miss = await invoke("/v1/friends/codes/lookup", {
+        friend: friendKey(`ipg${i}`),
+        ip,
+        body: { code: "PPPPPPPP" },
+      });
+      expect(miss.status).toBe(404);
+    }
+    for (let i = 0; i < IP_LIMIT; i += 1) {
+      const cleared = await invoke("/v1/friends/unblock", {
+        friend: caller.key,
+        ip,
+        body: { ownerId: other.ownerId },
+      });
+      expect(cleared.status).toBe(200);
+    }
+    const lastIp = await invoke("/v1/friends/codes/lookup", {
+      friend: friendKey("ipg-last"),
+      ip,
+      body: { code: "PPPPPPPP" },
+    });
+    expect(lastIp.status).toBe(404);
+    const overIp = await invoke("/v1/friends/codes/lookup", {
+      friend: friendKey("ipg-over"),
+      ip,
+      body: { code: "PPPPPPPP" },
+    });
+    expect(overIp.status).toBe(429);
+    expect(overIp.json).toEqual({ error: "rate_limited" });
+  });
+
+  it("unblock does not reset the limiter, read a code, or require the limiter", async () => {
+    const caller = await mint("reset-caller");
+    const other = await mint("reset-other");
+    await invoke("/v1/friends/block", { friend: caller.key, body: { ownerId: other.ownerId } });
+    for (let i = 0; i < KEY_LIMIT; i += 1) {
+      expect((await invoke("/v1/friends/codes/lookup", { friend: caller.key, body: { code: "QQQQQQQQ" } })).status).toBe(404);
+    }
+    expect((await invoke("/v1/friends/codes/lookup", { friend: caller.key, body: { code: "QQQQQQQQ" } })).status).toBe(429);
+    let codeReads = 0;
+    const get = env.BOARDS.get.bind(env.BOARDS);
+    env.BOARDS.get = async (name) => {
+      if (String(name).startsWith("fr:code:")) codeReads += 1;
+      return get(name);
+    };
+    const cleared = await invoke("/v1/friends/unblock", { friend: caller.key, body: { ownerId: other.ownerId } });
+    expect(cleared.status).toBe(200);
+    expect(cleared.json).toEqual({ ok: true });
+    expect(codeReads).toBe(0);
+    const still = await invoke("/v1/friends/codes/lookup", { friend: caller.key, body: { code: "QQQQQQQQ" } });
+    expect(still.status).toBe(429);
+    expect(still.json).toEqual({ error: "rate_limited" });
+
+    const fresh = await mint("reset-fresh");
+    const target = await mint("reset-target");
+    await invoke("/v1/friends/block", { friend: fresh.key, body: { ownerId: target.ownerId } });
+    env.FRIEND_GUESSES = undefined;
+    codeReads = 0;
+    const unbound = await invoke("/v1/friends/unblock", { friend: fresh.key, body: { ownerId: target.ownerId } });
+    expect(unbound.status).toBe(200);
+    expect(unbound.json).toEqual({ ok: true });
+    expect(codeReads).toBe(0);
+    expect(kv.has(`fr:block:${fresh.ownerId}:${target.ownerId}`)).toBe(false);
+    expect(kv.has(`fr:code:${fresh.code}`)).toBe(true);
+  });
+
+  it("sendRequest spends a guess and hides a block once the caller is limited", async () => {
+    const opener = await mint("hide-opener");
+    const inviter = await mint("hide-inviter");
+    const blockedPerson = await mint("hide-quiet");
+    await invoke("/v1/friends/block", { friend: opener.key, body: { ownerId: inviter.ownerId } });
+    await invoke("/v1/friends/block", { friend: opener.key, body: { ownerId: blockedPerson.ownerId } });
+    for (let i = 0; i < KEY_LIMIT; i += 1) {
+      expect((await invoke("/v1/friends/codes/lookup", { friend: opener.key, body: { code: "RRRRRRRR" } })).status).toBe(404);
+    }
+    let codeReads = 0;
+    const get = env.BOARDS.get.bind(env.BOARDS);
+    env.BOARDS.get = async (name) => {
+      if (String(name).startsWith("fr:code:")) codeReads += 1;
+      return get(name);
+    };
+    const limited = await invoke("/v1/friends/requests", { friend: opener.key, body: { code: inviter.code } });
+    expect(limited.status).toBe(429);
+    expect(limited.json).toEqual({ error: "rate_limited" });
+    expect(limited.text).not.toContain("blocked");
+    expect(codeReads).toBe(0);
+
+    for (let i = 0; i < KEY_LIMIT; i += 1) {
+      expect((await invoke("/v1/friends/codes/lookup", { friend: blockedPerson.key, body: { code: "TTTTTTTT" } })).status).toBe(404);
+    }
+    const quietLimited = await invoke("/v1/friends/requests", { friend: blockedPerson.key, body: { code: opener.code } });
+    expect(quietLimited.status).toBe(429);
+    expect(quietLimited.json).toEqual({ error: "rate_limited" });
+    expect(quietLimited.text).not.toContain("blocked");
+
+    const own = await mint("hide-own");
+    codeReads = 0;
+    for (let i = 0; i < KEY_LIMIT; i += 1) {
+      const bad = await invoke("/v1/friends/requests", { friend: own.key, body: { code: own.code } });
+      expect(bad.status).toBe(400);
+      expect(bad.json).toEqual({ error: "invalid_body" });
+    }
+    expect(codeReads).toBe(0);
+    const still = await invoke("/v1/friends/codes/lookup", { friend: own.key, body: { code: "SSSSSSSS" } });
+    expect(still.status).toBe(404);
+  });
+
+  it("does not store a second pending request", async () => {
+    const from = await mint("dup-from");
+    const to = await mint("dup-to");
+    const first = await invoke("/v1/friends/requests", { friend: from.key, body: { code: to.code } });
+    const second = await invoke("/v1/friends/requests", { friend: from.key, body: { code: to.code } });
+    expect(second.status).toBe(200);
+    expect(second.json).toEqual(first.json);
+    expect(rows("fr:req:")).toEqual([`fr:req:${to.ownerId}:${from.ownerId}`]);
+    const named = await invoke("/v1/friends/requests", { friend: from.key, body: { code: to.code, name: DISPLAY_NAME } });
+    expect(named.status).toBe(400);
+    expect(named.json).toEqual({ error: "invalid_body" });
+    expect(rows("fr:req:")).toHaveLength(1);
+  });
+
+  it("block and unblock reject a bad body before changing a block", async () => {
+    const caller = await mint("body-caller");
+    const other = await mint("body-other");
+    expect((await invoke("/v1/friends/block", { friend: caller.key, body: { ownerId: other.ownerId } })).status).toBe(200);
+    const blockKey = `fr:block:${caller.ownerId}:${other.ownerId}`;
+    const named = await invoke("/v1/friends/unblock", {
+      friend: caller.key,
+      body: { ownerId: other.ownerId, name: DISPLAY_NAME },
+    });
+    expect(named.status).toBe(400);
+    expect(named.json).toEqual({ error: "invalid_body" });
+    expect(kv.get(blockKey).value).toBe("1");
+    const huge = await invoke("/v1/friends/block", { friend: caller.key, body: { ownerId: "x".repeat(3000) } });
+    expect(huge.status).toBe(413);
+    expect(huge.json).toEqual({ error: "payload_too_large" });
+    expect(kv.get(blockKey).value).toBe("1");
+    const self = await invoke("/v1/friends/block", { friend: caller.key, body: { ownerId: caller.ownerId } });
+    expect(self.status).toBe(400);
+    expect(self.json).toEqual({ error: "invalid_body" });
+    expect(rows("fr:block:")).toEqual([blockKey]);
+    const method = await invoke("/v1/friends/unblock", { method: "DELETE", friend: caller.key });
+    expect(method.status).toBe(405);
+    expect(method.json).toEqual({ error: "method_not_allowed" });
+    expect(kv.get(blockKey).value).toBe("1");
+    const missing = await invoke("/v1/friends/block", {});
+    expect(missing.status).toBe(401);
+    expect(missing.json).toEqual({ error: "friend_key_required" });
+    env.BOARDS = undefined;
+    const down = await invoke("/v1/friends/unblock", { friend: caller.key, body: { ownerId: other.ownerId } });
+    expect(down.status).toBe(503);
+    expect(down.json).toEqual({ error: "boards_not_configured" });
+  });
+
+  it("serves block and unblock from the deploy entry", async () => {
+    const caller = await mint("entry-block");
+    const other = await mint("entry-other");
+    const response = await entry.fetch(new Request(`${ORIGIN}/v1/friends/block`, {
+      method: "POST",
+      headers: { "X-Friend-Key": caller.key, "Content-Type": "application/json" },
+      body: JSON.stringify({ ownerId: other.ownerId }),
+    }), env, { waitUntil() {} });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
+    expect(kv.get(`fr:block:${caller.ownerId}:${other.ownerId}`).value).toBe("1");
+    const cleared = await entry.fetch(new Request(`${ORIGIN}/v1/friends/unblock`, {
+      method: "POST",
+      headers: { "X-Friend-Key": caller.key, "Content-Type": "application/json" },
+      body: JSON.stringify({ ownerId: other.ownerId }),
+    }), env, { waitUntil() {} });
+    expect(cleared.status).toBe(200);
+    expect(await cleared.json()).toEqual({ ok: true });
+    expect(kv.has(`fr:block:${caller.ownerId}:${other.ownerId}`)).toBe(false);
   });
 });
