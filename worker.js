@@ -1,5 +1,8 @@
+import { FriendGuessLimiter, handleFriends, isFriendPath } from "./friends.js";
 import { applyGcaScorecardCorrection } from "./gca-corrections.js";
 import { handleLivePage, isLiveBoardCode } from "./live-page.js";
+
+export { FriendGuessLimiter };
 
 /**
  * Golf vendor proxy, inlined from ShotTraxx worker-golf-proxy.js.
@@ -346,7 +349,7 @@ const GOLFAPI_LATENCY_KINDS = ["search", "course", "coordinates"];
 const GOLFAPI_IP_PREFIX = "shottrax-golfapi-ip-v1:";
 const GOLFAPI_SEARCH_PREFIX = "shottrax-golfapi-search-v1:";
 const GOLFAPI_BALANCE_KEY = "gq:balance";
-const RESERVED_BOARD_PREFIXES = ["osm:", "gq:", "gapi:", "gqueue:", "gca:", "cr:"];
+const RESERVED_BOARD_PREFIXES = ["osm:", "gq:", "gapi:", "gqueue:", "gca:", "cr:", "fr:"];
 const GOLFAPI_REASONS = [
   "device_day",
   "device_week",
@@ -4177,11 +4180,18 @@ async function handleCourseReports(request, url, env, cors) {
 
 function corsHeaders(pathname) {
   const courseReports = isCourseReportPath(pathname);
+  const friends = isFriendPath(pathname);
   const headers = {
-    "Access-Control-Allow-Methods": courseReports ? "GET,POST,OPTIONS" : "GET,PUT,OPTIONS",
+    "Access-Control-Allow-Methods": friends
+      ? "GET,POST,PUT,OPTIONS"
+      : courseReports
+        ? "GET,POST,OPTIONS"
+        : "GET,PUT,OPTIONS",
     "Access-Control-Allow-Headers": courseReports
       ? "Content-Type, X-Install-Id, Authorization"
-      : "Content-Type, X-Install-Id",
+      : friends
+        ? "Content-Type, X-Friend-Key, X-Install-Id"
+        : "Content-Type, X-Install-Id",
   };
   if (!pathname.startsWith("/gca/") && !pathname.startsWith("/golfapi/")) {
     headers["Access-Control-Allow-Origin"] = "*";
@@ -4550,6 +4560,10 @@ export default {
     // /v1/... would otherwise be a KV key named "v1" (POST 405, GET reads that board).
     if (isCourseReportPath(requestUrl.pathname)) {
       return handleCourseReports(request, requestUrl, env, cors);
+    }
+    // Friend codes before the /v1 catch-all. Counts stay in FRIEND_GUESSES, not KV.
+    if (isFriendPath(requestUrl.pathname)) {
+      return handleFriends(request, requestUrl, env, cors);
     }
     if (requestUrl.pathname.startsWith("/v1/")) {
       return golfJson(404, { error: "unknown_route" }, cors);

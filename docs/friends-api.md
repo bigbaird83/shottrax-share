@@ -10,15 +10,17 @@ Auth is the anonymous friend key in the `X-Friend-Key` header. It is a fresh ran
 
 The header value is 32 to 64 characters from `A–Z`, `a–z`, `0–9`, `_`, and `-`. The Worker rejects a missing or bad value with `401` `{ "error": "friend_key_required" }`. It also rejects that code when the value equals `X-Install-Id`, or when it has the install-id shape `id_<digits>_<base36>`. `X-Install-Id` is ignored. It is not stored.
 
+Every friends call except `getCode` returns `401` `{ "error": "friend_key_required" }` when that key has no minted code. `getCode` is the call that mints one. Lookup checks this before it spends a guess and before it reads `fr:code:`.
+
 The raw friend key is never written to KV and never returned. The Worker stores only SHA-256 of a fixed prefix plus the key, under an `fr:` key. Responses never include a name, email, phone, install id, or the friend key.
 
 Request bodies are JSON objects. A field that is not in that call's allowlist, including a `null` placeholder, is `400` `{ "error": "invalid_body" }`. JSON that does not parse, a non-object, or a wrong type is the same error. The one accepted null is unshare: `{ "share": false, "round": null }`. A body over the call's size limit is `413` `{ "error": "payload_too_large" }`. The limit is 2048 bytes, except `publishRound`, which is 8192. An empty body is allowed only where this document says so.
 
-`GET` and `POST` are the methods below, plus `PUT` for `publishRound`. `OPTIONS` is the CORS preflight: status `200`, empty body, no friend key, and no KV read or write. Any other method on a known friends path is `405` `{ "error": "method_not_allowed" }`. A path under `/v1/friends` that this document does not list is `404` `{ "error": "unknown_route" }`. Existing `/v1/course-reports` is unchanged.
+`GET` and `POST` are the methods below, plus `PUT` for `publishRound`. `OPTIONS` is the CORS preflight: status `200`, empty body, no friend key, and no KV read or write. `OPTIONS` on an unknown `/v1/friends/*` path also returns `200`. Any other method on a known friends path is `405` `{ "error": "method_not_allowed" }`. A path under `/v1/friends` that this document does not list is `404` `{ "error": "unknown_route" }`. Existing `/v1/course-reports` is unchanged.
 
 If `BOARDS` is not bound, a call that needs it is `503` `{ "error": "boards_not_configured" }`. Code lookup (and later `sendRequest`, which uses that lookup) needs the guess limiter. If that binding is missing, the call fails closed with `503` `{ "error": "guess_limiter_not_configured" }` and does not read the code.
 
-Responses are JSON, `Cache-Control: no-store`. A limited call also sends `Retry-After` in seconds. CORS for `/v1/friends` allows `GET, POST, PUT, OPTIONS` and the headers `Content-Type` and `X-Friend-Key`.
+Responses are JSON, `Cache-Control: no-store`. A limited call also sends `Retry-After` in seconds. CORS for `/v1/friends` allows `GET, POST, PUT, OPTIONS` and the headers `Content-Type` and `X-Friend-Key`, and also `X-Install-Id`.
 
 ## Friend codes
 
@@ -42,7 +44,7 @@ Body: empty, or `{}`. No other fields.
 { "code": "AB3K7NP2", "ownerId": "k3mR9xQ2nB8wL4pT6vYs1A" }
 ```
 
-Does not count as a guess. Does not require the guess limiter.
+Does not count as a guess. Does not require the guess limiter when `CF-Connecting-IP` is absent. When that header is present, `getCode` allows 30 calls per IP hash per 60 minutes. That counter is a separate `FriendGuessLimiter` object whose name starts with `ipget:`, not the 24-lookup IP object. A missing limiter fails closed with `guess_limiter_not_configured` and does not mint. A missing key, a bad key, or `invalid_body` does not consume one of the 30. Over the limit is `429` `{ "error": "rate_limited" }` and `Retry-After`.
 
 ### resetCode
 
@@ -102,7 +104,9 @@ No pending request: `409` `{ "error": "not_friends" }`. The caller already block
 
 The phone's `id` is this `ownerId`.
 
-Deletes the friendship and deletes shared rounds on both sides in that request. Fetch no longer returns those rounds.
+Deletes the friendship (both `fr:friend:` rows and both `fr:friends:` lists) and deletes only the caller's shared rounds. The other person's rounds stay for their remaining friends. Fetch no longer returns the caller's rounds to anyone.
+
+This is Brian's approved behavior as of Oct 17, 2026, 5:37 PM CT. It replaces his earlier answer that remove and block wipe both people's shared rounds for every friend. There is no per-friend share list.
 
 `200` `{ "ok": true }`
 
@@ -118,7 +122,9 @@ No accepted friendship: `409` `{ "error": "not_friends" }`.
 
 The phone's `id` is this `ownerId`.
 
-Same deletion as remove: both sides' shared rounds are deleted in that request, and access ends immediately. The block is stored for the caller.
+Requires an accepted friendship (both `fr:friend:` rows). Otherwise `409` `{ "error": "not_friends" }` and nothing is written: no block row and no round delete. A key that only learned an `ownerId` from lookup cannot block that person.
+
+The block row is stored first. Then the friendship rows and both friend lists are deleted, then pending request rows, then only the caller's round list. A failure after the block row is stored must not leave the pair with the friendship already gone and no block. The other person's rounds stay for their remaining friends. Access ends immediately. The block is stored for the caller. Same as remove: caller-only round deletion is Brian's approved behavior as of Oct 17, 2026, 5:37 PM CT, replacing the earlier both-people answer.
 
 `200` `{ "ok": true }`
 
@@ -156,7 +162,11 @@ Publish when sharing is on:
 { "share": true, "round": { "id": "round_7Kp2", "courseName": "Greystone", "playedOn": "2026-10-11", "gross": 82, "toPar": 10, "holes": [] } }
 ```
 
-`round` uses the shared-round allowlist. The Worker sets `ownerId` from the friend key. A client `ownerId` must match that id or the body is `invalid_body`. The same `id` replaces the previous round.
+`round` uses the shared-round allowlist. The Worker sets `ownerId` from the friend key. A client `ownerId` must match that id or the body is `invalid_body`. The same `id` replaces the previous round and refreshes the 365-day TTL on that owner's one round-list value.
+
+An owner can store 100 shared rounds. A new `id` past that cap is `409` `{ "error": "round_limit" }` and stores nothing. Replacing an existing `id` is still allowed at the cap. The cap is checked before the per-IP publish limit, so a full list returns `round_limit` rather than `rate_limited`.
+
+When `CF-Connecting-IP` is present, publish and unshare share a limit of 60 calls per IP hash per 60 minutes. That counter is a separate `FriendGuessLimiter` object whose name starts with `ippub:`. It is not the code-guess counter. A missing limiter fails closed with `guess_limiter_not_configured` and does not write. No IP header skips this limit. `invalid_body` does not consume one of the 60. Over the limit is `429` `{ "error": "rate_limited" }` and `Retry-After`.
 
 `200` `{ "ok": true, "id": "<round id>" }`
 
@@ -182,7 +192,9 @@ No body.
 
 `200` `{ "rounds": [ ] }`
 
-Each entry is a stored round from an accepted friend, plus the caller's own published rounds. Rounds removed or blocked are already gone. Omitted stat fields stay omitted. The response is the full list. There is no cursor.
+Each entry is a stored round from an accepted friend, plus the caller's own published rounds. Rounds the caller removed, blocked, or unshared are already gone. The other person's rounds are not deleted by remove or block, so that person's other friends still fetch them. Omitted stat fields stay omitted. A stored round that fails the allowlist, including one that carries GPS, is omitted on read. The response is the full list. There is no cursor. Rounds are sorted by `playedOn`, then `ownerId`, then `id`, ascending.
+
+Fetch reads `3 + 2N + F` KV values and does not list. `N` is the caller's friend-list length. `F` is how many of those friends are unblocked in both directions (`F` ≤ `N`). The reads are 1 auth row, 1 `fr:friends:` list, 1 own `fr:rounds:` value, 2 block checks per friend, and 1 round-list read per unblocked friend. When nobody is blocked, that is `3 + 3N` gets.
 
 ## Code lookup
 
@@ -192,7 +204,7 @@ Each entry is a stored round from an accepted friend, plus the caller's own publ
 { "code": "AB3K7NP2" }
 ```
 
-This is the resolve `sendRequest` uses. Both calls share one guess counter per friend key and one per IP.
+This is the resolve `sendRequest` uses. Both calls share one guess counter per friend key and one per IP. The friend key must already have a minted code, or the call is `401` `{ "error": "friend_key_required" }` and does not spend a guess.
 
 `200` `{ "ownerId": "<public id>" }`
 
@@ -212,8 +224,12 @@ One SQLite-backed Durable Object, class `FriendGuessLimiter`, binding `FRIEND_GU
 |---|---|---|
 | Friend key | 8 lookups | 60 minutes |
 | IP hash, when `CF-Connecting-IP` is present | 24 lookups | 60 minutes |
+| IP hash, `getCode` (`ipget:`) | 30 calls | 60 minutes |
+| IP hash, `publishRound` including unshare (`ippub:`) | 60 calls | 60 minutes |
 
-Either limit returns `rate_limited`. The window is from the first counted lookup in the current window. `Retry-After` is the seconds left in that window. After the window, the next lookup starts at 1.
+Either lookup limit returns `rate_limited`. The window is from the first counted lookup in the current window. `Retry-After` is the seconds left in that window. After the window, the next lookup starts at 1.
+
+The 8-guess per-key limit is easy to get around by rotating friend keys. The 24-per-hour per-IP limit is the real control. `getCode` and `publishRound` do not spend either guess counter. They use their own per-IP objects on the same `FriendGuessLimiter` class and the same `FRIEND_GUESSES` binding.
 
 The object supports three operations. Only `attempt` is used by lookup. The other two exist so a later step can clear or stop a guesser without an eventually consistent counter:
 
@@ -231,7 +247,7 @@ Allowlist at the top level: `id`, `ownerId`, `courseName`, `playedOn`, `gross`, 
 |---|---|
 | `id` | String, 1–64 characters, `[A-Za-z0-9_-]`. |
 | `ownerId` | The publisher's public id. |
-| `courseName` | String, trimmed, 1–200 characters. |
+| `courseName` | String, already trimmed, 1–200 characters. ASCII control characters (U+0000–U+001F and U+007F) are rejected. |
 | `playedOn` | `YYYY-MM-DD`. |
 | `gross` | Integer, 1–200. |
 | `toPar` | Integer, −40 through 200. |
@@ -247,7 +263,7 @@ Each hole allowlist: `hole`, `score`, `par`, and the optional stats below.
 | `fir` | Boolean. Present only when the golfer turned FIR sharing on. |
 | `gir` | Boolean. Present only when GIR sharing is on. |
 | `putts` | Integer, 0–10. Present only when putts sharing is on. |
-| `clubs` | Array of 1–8 strings. Each string is 1–8 characters. Present only when club sharing is on. |
+| `clubs` | Array of 1–8 strings. Each string matches `^[A-Za-z0-9][A-Za-z0-9 +./-]{0,7}$` (1–8 characters; a letter or digit, then letters, digits, space, `+`, `.`, `/`, or `-`). Present only when club sharing is on. |
 
 `fir`, `gir`, `putts`, and `clubs` live on the hole. When that share switch is off, the field is omitted on every hole. The Worker does not store or return `null` for it. A present `null` is `invalid_body`. A switch can be on while a single hole omits the stat (no fairway, no putts entered). The Worker never fills the hole in.
 
@@ -270,7 +286,9 @@ Example with FIR and putts on, and GIR and clubs off:
 }
 ```
 
-League scores are these shared rounds. The Worker keeps one for up to 1 year (`expirationTtl` of 365 days) or until `remove`, `block`, or unshare (`share: false` with `round: null`) deletes it, whichever comes first. Text filtering for league titles and report notes is not part of this contract. Those fields are unknown today. Filtering comes later.
+League scores are these shared rounds. The Worker keeps one owner's rounds in one KV value for up to 1 year (`expirationTtl` of 365 days) or until `remove`, `block`, or unshare (`share: false` with `round: null`) deletes it, whichever comes first. Replacing a round refreshes that TTL. Text filtering for league titles and report notes is not part of this contract. Those fields are unknown today. Filtering comes later.
+
+An accepted friendship is capped at 50 friends per owner. `accept` checks both `fr:friends:` lists before it writes. If either person would go past 50, the call is `409` `{ "error": "friend_limit" }`, the pending request stays, and no friendship row is written.
 
 ## Storage
 
@@ -278,9 +296,13 @@ Friend rows use the `fr:` prefix only. The keys this API writes are:
 
 - `fr:k:<sha256>` — `{ "ownerId", "code" }` for the friend key. No name and no raw key.
 - `fr:code:<CODE>` — the `ownerId` string. `resetCode` deletes the old key before it responds.
-- `fr:req:`, `fr:friend:`, and `fr:round:` — requests, accepted friendships, and rounds, when those calls are built.
+- `fr:req:<recipient>:<requester>` — a pending request. The value is `pending`.
+- `fr:friend:<a>:<b>` — one direction of an accepted friendship. The value is `1`. Both directions are required.
+- `fr:friends:<ownerId>` — JSON array of the other owner ids. This is the fetch index and the 50-friend cap. `accept` writes both lists. `remove` and `block` take the other person out of both lists.
+- `fr:block:<blocker>:<blocked>` — the caller's block. The value is `1`.
+- `fr:rounds:<ownerId>` — JSON array of that owner's shared rounds, one value, `expirationTtl` of 365 days. This replaces per-round `fr:round:<owner>:<id>` keys.
 
-None of these routes read or write `id:`, `name:`, `osm:`, `gq:`, `gapi:`, `gqueue:`, `gca:`, or `cr:`. Board `GET` / `PUT` / `DELETE` still refuse `fr:`, so a board path cannot read a friend row. Guess counts live in the Durable Object, not in KV.
+None of these routes read or write `id:`, `name:`, `osm:`, `gq:`, `gapi:`, `gqueue:`, `gca:`, or `cr:`. Board `GET`, `PUT`, and `DELETE` reserve the `fr:` prefix and return `400` with no KV read or write. That includes a percent-encoded path (`fr%3A` and `fr%3a`), so a board path cannot read, replace, or forge a friend row. Guess counts live in the Durable Object, not in KV.
 
 ## Phone draft differences
 
@@ -300,6 +322,6 @@ ShotTraxx PR #533 `src/domain/friendsApi.ts` returns `FriendsApiResult` on every
 | `publishRound({ round, share })` | `PUT /v1/friends/rounds`. `share: true` and a round publishes it. `share: false` and `round: null` unshares and deletes the caller's shared rounds. |
 | `fetchRounds()` | `GET /v1/friends/rounds` → `{ rounds }` |
 
-`off` is the phone switch. No request is sent. `todo` is a call the phone has not finished, or a server that is not ready: `unknown_route`, `boards_not_configured`, `guess_limiter_not_configured`. `refused` is every other error: `friend_key_required`, `invalid_body`, `payload_too_large`, `method_not_allowed`, `code_not_found`, `not_friends`, `rate_limited`, and `blocked`.
+`off` is the phone switch. No request is sent. `todo` is a call the phone has not finished, or a server that is not ready: `unknown_route`, `boards_not_configured`, `guess_limiter_not_configured`. `refused` is every other error: `friend_key_required`, `invalid_body`, `payload_too_large`, `method_not_allowed`, `code_not_found`, `not_friends`, `friend_limit`, `round_limit`, `rate_limited`, and `blocked`.
 
 `blocked` is returned only to the person who blocked, and the phone maps it to `refused`, the same reason it uses for `code_not_found` and `not_friends`. The blocked person never receives `blocked`. Their `sendRequest` is the normal `200` pending body, and their `accept` is `not_friends`. That is a success or a `refused`, not a block.

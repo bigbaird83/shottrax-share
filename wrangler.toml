@@ -19,9 +19,20 @@ id = "587c98f5372647a88bc9418aa076827a"
 name = "GOLFAPI_COUNTER"
 class_name = "GolfapiCounter"
 
+# Exact friend-code guess counters. One SQLite Durable Object per friend-key hash
+# and per IP hash. Workers Free only supports SQLite-backed Durable Objects,
+# so this class is created with new_sqlite_classes (not new_classes).
+[[durable_objects.bindings]]
+name = "FRIEND_GUESSES"
+class_name = "FriendGuessLimiter"
+
 [[migrations]]
 tag = "v1-golfapi-counter"
 new_sqlite_classes = ["GolfapiCounter"]
+
+[[migrations]]
+tag = "v2-friend-guesses"
+new_sqlite_classes = ["FriendGuessLimiter"]
 
 [[send_email]]
 name = "ALERT_EMAIL"

@@ -5,8 +5,18 @@
 // An fr: golfapi id or search is 404 before that proxy.
 import live from "./live-shottrax-share.js";
 import { coverageFromOverlayResponse, handleGolfProxy, GolfapiCounter, runGolfapiStockpile, STOCKPILE_CRON } from "./golf-proxy.js";
+import { FriendGuessLimiter, handleFriends, isFriendPath } from "./friends.js";
 
 export { GolfapiCounter };
+export { FriendGuessLimiter };
+
+function friendCors() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET,POST,PUT,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, X-Friend-Key, X-Install-Id",
+  };
+}
 
 function isPrPath(p) {
   return (
@@ -132,6 +142,11 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const { pathname } = url;
+    if (isFriendPath(pathname)) {
+      const cors = friendCors();
+      if (request.method === "OPTIONS") return new Response(null, { headers: cors });
+      return handleFriends(request, url, env, cors);
+    }
     if (request.method !== "OPTIONS" && friendGolfapiBlocked(pathname, url)) {
       return withLiveCors(new Response(JSON.stringify({ error: "unknown_route" }), {
         status: 404,
