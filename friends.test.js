@@ -101,8 +101,11 @@ describe("friend codes", () => {
           const row = kv.get(key);
           return row ? row.value : null;
         },
-        async put(key, value) {
-          kv.set(key, { value });
+        async put(key, value, options) {
+          kv.set(key, {
+            value,
+            expirationTtl: options && Number.isFinite(options.expirationTtl) ? options.expirationTtl : undefined,
+          });
         },
         async delete(key) {
           kv.delete(key);
@@ -325,7 +328,7 @@ describe("friend codes", () => {
     const method = await invoke("/v1/friends/code", { method: "GET", friend: friendKey("get") });
     expect(method.status).toBe(405);
     expect(method.json).toEqual({ error: "method_not_allowed" });
-    const later = await invoke("/v1/friends/remove", { friend: friendKey("later"), body: { ownerId: "k3mR9xQ2nB8wL4pT6vYs1A" } });
+    const later = await invoke("/v1/friends/decline", { friend: friendKey("later"), body: { ownerId: "k3mR9xQ2nB8wL4pT6vYs1A" } });
     expect(later.status).toBe(404);
     expect(later.json).toEqual({ error: "unknown_route" });
 
@@ -893,5 +896,709 @@ describe("friend codes", () => {
     expect(cleared.status).toBe(200);
     expect(await cleared.json()).toEqual({ ok: true });
     expect(kv.has(`fr:block:${caller.ownerId}:${other.ownerId}`)).toBe(false);
+  });
+
+  function baseRound(overrides = {}) {
+    return {
+      id: "round_7Kp2",
+      courseName: "Greystone",
+      playedOn: "2026-10-11",
+      gross: 82,
+      toPar: 10,
+      holes: [
+        { hole: 1, score: 4, par: 4 },
+        { hole: 2, score: 6, par: 5 },
+      ],
+      ...overrides,
+    };
+  }
+
+  function putRound(friend, round) {
+    return invoke("/v1/friends/rounds", { method: "PUT", friend, body: { share: true, round } });
+  }
+
+  function fetchRounds(friend, headers) {
+    return invoke("/v1/friends/rounds", { method: "GET", friend, headers });
+  }
+
+  async function befriend(from, to) {
+    const sent = await invoke("/v1/friends/requests", { friend: from.key, body: { code: to.code } });
+    expect(sent.json).toEqual({ status: "pending", ownerId: to.ownerId });
+    const accepted = await invoke("/v1/friends/requests/accept", { friend: to.key, body: { ownerId: from.ownerId } });
+    expect(accepted.json).toEqual({ status: "friends", ownerId: from.ownerId });
+  }
+
+  function roundKey(ownerId, id) {
+    return `fr:round:${ownerId}:${id}`;
+  }
+
+  it("remove without a friendship is 409 and deletes nothing", async () => {
+    const caller = await mint("rm-none");
+    const other = await mint("rm-other");
+    const bystander = await mint("rm-bystander");
+    expect((await putRound(caller.key, baseRound({ id: "round_caller" }))).status).toBe(200);
+    expect((await putRound(other.key, baseRound({ id: "round_other" }))).status).toBe(200);
+    expect((await putRound(bystander.key, baseRound({ id: "round_by" }))).status).toBe(200);
+    const before = kvSnapshot();
+    const removed = await invoke("/v1/friends/remove", {
+      friend: caller.key,
+      body: { ownerId: other.ownerId },
+      headers: { "X-Display-Name": DISPLAY_NAME, "X-Install-Id": INSTALL_ID },
+    });
+    expect(removed.status).toBe(409);
+    expect(removed.json).toEqual({ error: "not_friends" });
+    expect(removed.text).not.toContain("blocked");
+    expect(kvSnapshot()).toEqual(before);
+    const unknown = "zzzzzzzzzzzzzzzzzzzzzz";
+    const missing = await invoke("/v1/friends/remove", { friend: caller.key, body: { ownerId: unknown } });
+    expect(missing.status).toBe(409);
+    expect(missing.json).toEqual({ error: "not_friends" });
+    expect(missing.text).not.toContain(unknown);
+    expect(kv.has(roundKey(caller.ownerId, "round_caller"))).toBe(true);
+    expect(kv.has(roundKey(other.ownerId, "round_other"))).toBe(true);
+    expect(kv.has(roundKey(bystander.ownerId, "round_by"))).toBe(true);
+    assertAnonymous(removed.text + missing.text);
+  });
+
+  it("remove requires both friendship rows", async () => {
+    const caller = await mint("rm-one");
+    const other = await mint("rm-two");
+    kv.set(`fr:friend:${caller.ownerId}:${other.ownerId}`, { value: "1" });
+    kv.set(roundKey(other.ownerId, "round_keep"), { value: "{\"id\":\"round_keep\"}" });
+    const forwardOnly = await invoke("/v1/friends/remove", { friend: caller.key, body: { ownerId: other.ownerId } });
+    expect(forwardOnly.status).toBe(409);
+    expect(forwardOnly.json).toEqual({ error: "not_friends" });
+    expect(kv.get(`fr:friend:${caller.ownerId}:${other.ownerId}`).value).toBe("1");
+    expect(kv.has(roundKey(other.ownerId, "round_keep"))).toBe(true);
+    kv.delete(`fr:friend:${caller.ownerId}:${other.ownerId}`);
+    kv.set(`fr:friend:${other.ownerId}:${caller.ownerId}`, { value: "1" });
+    const reverseOnly = await invoke("/v1/friends/remove", { friend: caller.key, body: { ownerId: other.ownerId } });
+    expect(reverseOnly.status).toBe(409);
+    expect(kv.get(`fr:friend:${other.ownerId}:${caller.ownerId}`).value).toBe("1");
+    expect(kv.has(roundKey(other.ownerId, "round_keep"))).toBe(true);
+  });
+
+  it("remove deletes the friendship and both sides' rounds", async () => {
+    const left = await mint("rm-left");
+    const right = await mint("rm-right");
+    const third = await mint("rm-third");
+    const bystander = await mint("rm-watch");
+    await befriend(left, right);
+    await befriend(left, third);
+    expect((await putRound(left.key, baseRound({ id: "round_left", playedOn: "2026-10-02" }))).status).toBe(200);
+    expect((await putRound(right.key, baseRound({ id: "round_right", playedOn: "2026-10-03" }))).status).toBe(200);
+    expect((await putRound(third.key, baseRound({ id: "round_third", playedOn: "2026-10-04" }))).status).toBe(200);
+    expect((await putRound(bystander.key, baseRound({ id: "round_by" }))).status).toBe(200);
+    kv.set(`fr:req:${right.ownerId}:${left.ownerId}`, { value: "pending" });
+    kv.set(`fr:block:${bystander.ownerId}:${left.ownerId}`, { value: "1" });
+    const removed = await invoke("/v1/friends/remove", { friend: left.key, body: { ownerId: right.ownerId } });
+    expect(removed.status).toBe(200);
+    expect(removed.json).toEqual({ ok: true });
+    expect(removed.headers.get("Cache-Control")).toBe("no-store");
+    expect(kv.has(`fr:friend:${left.ownerId}:${right.ownerId}`)).toBe(false);
+    expect(kv.has(`fr:friend:${right.ownerId}:${left.ownerId}`)).toBe(false);
+    expect(kv.has(`fr:friend:${left.ownerId}:${third.ownerId}`)).toBe(true);
+    expect(kv.has(`fr:friend:${third.ownerId}:${left.ownerId}`)).toBe(true);
+    expect(kv.has(roundKey(left.ownerId, "round_left"))).toBe(false);
+    expect(kv.has(roundKey(right.ownerId, "round_right"))).toBe(false);
+    expect(kv.has(roundKey(third.ownerId, "round_third"))).toBe(true);
+    expect(kv.has(roundKey(bystander.ownerId, "round_by"))).toBe(true);
+    expect(kv.get(`fr:req:${right.ownerId}:${left.ownerId}`).value).toBe("pending");
+    expect(kv.get(`fr:block:${bystander.ownerId}:${left.ownerId}`).value).toBe("1");
+    expect(rows("fr:block:").filter((name) => name.includes(right.ownerId))).toEqual([]);
+    const leftFetch = await fetchRounds(left.key);
+    const rightFetch = await fetchRounds(right.key);
+    const thirdFetch = await fetchRounds(third.key);
+    expect(leftFetch.json.rounds.map((round) => round.id)).toEqual(["round_third"]);
+    expect(rightFetch.json).toEqual({ rounds: [] });
+    expect(thirdFetch.json.rounds.map((round) => round.id)).toEqual(["round_third"]);
+    expect(thirdFetch.text).not.toContain("round_left");
+    expect(thirdFetch.text).not.toContain("round_right");
+    expect([...kv.keys()].filter((name) => name.startsWith("fr:round:")).every((name) => name.startsWith("fr:"))).toBe(true);
+  });
+
+  it("publish rejects an unknown field and stores nothing", async () => {
+    const caller = await mint("pub-unknown");
+    kv.set("id:14322", { value: "{\"holes\":1}" });
+    kv.set("name:greystone", { value: "{\"course\":1}" });
+    const named = await putRound(caller.key, baseRound({ name: DISPLAY_NAME }));
+    expect(named.status).toBe(400);
+    expect(named.json).toEqual({ error: "invalid_body" });
+    const noted = await invoke("/v1/friends/rounds", {
+      method: "PUT",
+      friend: caller.key,
+      body: { share: true, round: baseRound(), note: "league" },
+    });
+    expect(noted.status).toBe(400);
+    expect(noted.json).toEqual({ error: "invalid_body" });
+    expect(rows("fr:round:")).toEqual([]);
+    expect(kv.get("id:14322").value).toBe("{\"holes\":1}");
+    expect(kv.get("name:greystone").value).toBe("{\"course\":1}");
+    assertAnonymous(named.text);
+  });
+
+  it("publish rejects a GPS field and stores nothing", async () => {
+    const caller = await mint("pub-gps");
+    const fields = ["lat", "lon", "lng", "gps", "photo", "photos", "name", "playerName", "email"];
+    for (const field of fields) {
+      const roundLevel = await putRound(caller.key, baseRound({ [field]: "secret" }));
+      expect(roundLevel.status, field).toBe(400);
+      expect(roundLevel.json).toEqual({ error: "invalid_body" });
+      const holeLevel = await putRound(caller.key, baseRound({
+        holes: [{ hole: 1, score: 4, par: 4, [field]: field === "lat" ? 33.5 : "secret" }],
+      }));
+      expect(holeLevel.status, `hole ${field}`).toBe(400);
+      expect(holeLevel.json).toEqual({ error: "invalid_body" });
+    }
+    expect(rows("fr:round:")).toEqual([]);
+  });
+
+  it("publish rejects more than 18 holes", async () => {
+    const caller = await mint("pub-19");
+    const holes = Array.from({ length: 19 }, (_, index) => ({ hole: index + 1, score: 4, par: 4 }));
+    const published = await putRound(caller.key, baseRound({ holes }));
+    expect(published.status).toBe(400);
+    expect(published.json).toEqual({ error: "invalid_body" });
+    expect(rows("fr:round:")).toEqual([]);
+  });
+
+  it("publish rejects an empty hole list", async () => {
+    const caller = await mint("pub-empty");
+    const published = await putRound(caller.key, baseRound({ holes: [] }));
+    expect(published.status).toBe(400);
+    expect(published.json).toEqual({ error: "invalid_body" });
+    expect(rows("fr:round:")).toEqual([]);
+  });
+
+  it("a round may have fewer than 18 holes", async () => {
+    const caller = await mint("pub-nine");
+    const holes = Array.from({ length: 9 }, (_, index) => ({ hole: index + 1, score: 4, par: 4 }));
+    const published = await putRound(caller.key, baseRound({ id: "round_nine", holes }));
+    expect(published.status).toBe(200);
+    expect(published.json).toEqual({ ok: true, id: "round_nine" });
+    const stored = JSON.parse(kv.get(roundKey(caller.ownerId, "round_nine")).value);
+    expect(stored.holes).toHaveLength(9);
+    expect(stored.holes.map((hole) => hole.hole)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(JSON.stringify(stored.holes)).not.toContain("null");
+    const full = Array.from({ length: 18 }, (_, index) => ({ hole: index + 1, score: 5, par: 4 }));
+    expect((await putRound(caller.key, baseRound({ id: "round_full", holes: full }))).status).toBe(200);
+  });
+
+  it("omitted fir gir putts and clubs stay omitted", async () => {
+    const caller = await mint("pub-stats");
+    const round = baseRound({
+      id: "round_stats",
+      holes: [
+        { hole: 1, score: 4, par: 4, fir: true, putts: 2 },
+        { hole: 2, score: 6, par: 5, fir: false, gir: true, putts: 0, clubs: ["7i", "PW"] },
+      ],
+    });
+    const published = await putRound(caller.key, round);
+    expect(published.status).toBe(200);
+    const stored = JSON.parse(kv.get(roundKey(caller.ownerId, "round_stats")).value);
+    expect(stored.holes[0]).toEqual({ hole: 1, score: 4, par: 4, fir: true, putts: 2 });
+    expect(stored.holes[0]).not.toHaveProperty("gir");
+    expect(stored.holes[0]).not.toHaveProperty("clubs");
+    expect(stored.holes[1]).toEqual({ hole: 2, score: 6, par: 5, fir: false, gir: true, putts: 0, clubs: ["7i", "PW"] });
+    expect(JSON.stringify(stored)).not.toContain("null");
+    const fetched = await fetchRounds(caller.key);
+    expect(fetched.json.rounds[0].holes[0]).not.toHaveProperty("gir");
+    expect(fetched.json.rounds[0].holes[0]).not.toHaveProperty("clubs");
+    expect(fetched.json.rounds[0].holes[1].clubs).toEqual(["7i", "PW"]);
+  });
+
+  it("a null stat is invalid_body", async () => {
+    const caller = await mint("pub-null");
+    for (const extra of [{ fir: null }, { gir: null }, { putts: null }, { clubs: null }]) {
+      const published = await putRound(caller.key, baseRound({ holes: [{ hole: 1, score: 4, par: 4, ...extra }] }));
+      expect(published.status).toBe(400);
+      expect(published.json).toEqual({ error: "invalid_body" });
+    }
+    expect(rows("fr:round:")).toEqual([]);
+  });
+
+  it("a client ownerId must match the friend key", async () => {
+    const caller = await mint("pub-owner");
+    const other = await mint("pub-owner-other");
+    const mismatch = await putRound(caller.key, baseRound({ ownerId: other.ownerId }));
+    expect(mismatch.status).toBe(400);
+    expect(mismatch.json).toEqual({ error: "invalid_body" });
+    expect(rows("fr:round:")).toEqual([]);
+    const matched = await putRound(caller.key, baseRound({ ownerId: caller.ownerId, id: "round_match" }));
+    expect(matched.status).toBe(200);
+    const omitted = await putRound(caller.key, baseRound({ id: "round_omit" }));
+    expect(omitted.status).toBe(200);
+    const stored = JSON.parse(kv.get(roundKey(caller.ownerId, "round_omit")).value);
+    expect(stored.ownerId).toBe(caller.ownerId);
+    expect(stored.ownerId).not.toBe(other.ownerId);
+    expect(Object.keys(stored)).toEqual(["id", "ownerId", "courseName", "playedOn", "gross", "toPar", "holes"]);
+  });
+
+  it("share false with a round is invalid and deletes nothing", async () => {
+    const caller = await mint("unshare-bad");
+    expect((await putRound(caller.key, baseRound({ id: "round_keep" }))).status).toBe(200);
+    const rejected = await invoke("/v1/friends/rounds", {
+      method: "PUT",
+      friend: caller.key,
+      body: { share: false, round: baseRound({ id: "round_keep" }) },
+    });
+    expect(rejected.status).toBe(400);
+    expect(rejected.json).toEqual({ error: "invalid_body" });
+    expect(kv.has(roundKey(caller.ownerId, "round_keep"))).toBe(true);
+    const missing = await invoke("/v1/friends/rounds", {
+      method: "PUT",
+      friend: caller.key,
+      body: { share: false },
+    });
+    expect(missing.status).toBe(400);
+    expect(kv.has(roundKey(caller.ownerId, "round_keep"))).toBe(true);
+  });
+
+  it("share true with a null round is invalid", async () => {
+    const caller = await mint("pub-null-round");
+    const rejected = await invoke("/v1/friends/rounds", {
+      method: "PUT",
+      friend: caller.key,
+      body: { share: true, round: null },
+    });
+    expect(rejected.status).toBe(400);
+    expect(rejected.json).toEqual({ error: "invalid_body" });
+    const text = await invoke("/v1/friends/rounds", {
+      method: "PUT",
+      friend: caller.key,
+      body: { share: "true", round: baseRound() },
+    });
+    expect(text.status).toBe(400);
+    expect(rows("fr:round:")).toEqual([]);
+  });
+
+  it("unshare deletes only the caller's rounds", async () => {
+    const caller = await mint("unshare-me");
+    const friend = await mint("unshare-friend");
+    await befriend(caller, friend);
+    expect((await putRound(caller.key, baseRound({ id: "round_me" }))).status).toBe(200);
+    expect((await putRound(caller.key, baseRound({ id: "round_me_2" }))).status).toBe(200);
+    expect((await putRound(friend.key, baseRound({ id: "round_them" }))).status).toBe(200);
+    const cleared = await invoke("/v1/friends/rounds", {
+      method: "PUT",
+      friend: caller.key,
+      body: { share: false, round: null },
+    });
+    expect(cleared.status).toBe(200);
+    expect(cleared.json).toEqual({ ok: true });
+    expect(rows("fr:round:")).toEqual([roundKey(friend.ownerId, "round_them")]);
+    expect(kv.has(`fr:friend:${caller.ownerId}:${friend.ownerId}`)).toBe(true);
+    const alone = await mint("unshare-alone");
+    expect((await putRound(alone.key, baseRound({ id: "round_alone" }))).status).toBe(200);
+    const solo = await invoke("/v1/friends/rounds", {
+      method: "PUT",
+      friend: alone.key,
+      body: { share: false, round: null },
+    });
+    expect(solo.json).toEqual({ ok: true });
+    expect(kv.has(roundKey(alone.ownerId, "round_alone"))).toBe(false);
+  });
+
+  it("publishing does not create a friendship", async () => {
+    const from = await mint("pub-pend-from");
+    const to = await mint("pub-pend-to");
+    expect((await invoke("/v1/friends/requests", { friend: from.key, body: { code: to.code } })).json.status).toBe("pending");
+    const published = await putRound(from.key, baseRound({ id: "round_pending" }));
+    expect(published.status).toBe(200);
+    expect(rows("fr:friend:")).toEqual([]);
+    expect(rows("fr:req:")).toEqual([`fr:req:${to.ownerId}:${from.ownerId}`]);
+    const fetched = await fetchRounds(to.key);
+    expect(fetched.json).toEqual({ rounds: [] });
+    const own = await fetchRounds(from.key);
+    expect(own.json.rounds.map((round) => round.id)).toEqual(["round_pending"]);
+  });
+
+  it("a non-friend fetch returns only the caller's rounds", async () => {
+    const caller = await mint("fetch-me");
+    const stranger = await mint("fetch-stranger");
+    expect((await putRound(caller.key, baseRound({ id: "round_me" }))).status).toBe(200);
+    expect((await putRound(stranger.key, baseRound({ id: "round_them", playedOn: "2026-09-01" }))).status).toBe(200);
+    const fetched = await fetchRounds(caller.key);
+    expect(fetched.status).toBe(200);
+    expect(Object.keys(fetched.json)).toEqual(["rounds"]);
+    expect(fetched.json.rounds.map((round) => round.id)).toEqual(["round_me"]);
+    expect(fetched.json.rounds.map((round) => round.ownerId)).toEqual([caller.ownerId]);
+    expect(fetched.headers.get("Cache-Control")).toBe("no-store");
+    expect(fetched.text).not.toContain(stranger.key);
+    expect(fetched.text).not.toContain("round_them");
+  });
+
+  it("a one-sided friendship cannot fetch", async () => {
+    const caller = await mint("fetch-side");
+    const other = await mint("fetch-other-side");
+    expect((await putRound(other.key, baseRound({ id: "round_hidden" }))).status).toBe(200);
+    kv.set(`fr:friend:${caller.ownerId}:${other.ownerId}`, { value: "1" });
+    const fetched = await fetchRounds(caller.key);
+    expect(fetched.json.rounds).toEqual([]);
+    expect(kv.has(roundKey(other.ownerId, "round_hidden"))).toBe(true);
+  });
+
+  it("only accepted friends can fetch each other's rounds", async () => {
+    const left = await mint("fetch-left");
+    const right = await mint("fetch-right");
+    const far = await mint("fetch-far");
+    expect((await putRound(left.key, baseRound({ id: "round_left", playedOn: "2026-10-03" }))).status).toBe(200);
+    const before = await fetchRounds(right.key);
+    expect(before.json.rounds).toEqual([]);
+    await befriend(left, right);
+    await befriend(right, far);
+    expect((await putRound(right.key, baseRound({ id: "round_right", playedOn: "2026-10-01" }))).status).toBe(200);
+    expect((await putRound(far.key, baseRound({ id: "round_far", playedOn: "2026-10-02" }))).status).toBe(200);
+    const leftFetch = await fetchRounds(left.key);
+    expect(leftFetch.json.rounds.map((round) => round.id)).toEqual(["round_right", "round_left"]);
+    expect(leftFetch.json.rounds.map((round) => round.ownerId)).toEqual([right.ownerId, left.ownerId]);
+    const rightFetch = await fetchRounds(right.key);
+    expect(rightFetch.json.rounds.map((round) => round.id)).toEqual(["round_right", "round_far", "round_left"]);
+    const farFetch = await fetchRounds(far.key);
+    expect(farFetch.json.rounds.map((round) => round.id)).toEqual(["round_right", "round_far"]);
+    expect(farFetch.text).not.toContain("round_left");
+  });
+
+  it("a block hides rounds even when the friendship row remains", async () => {
+    const opener = await mint("hide-opener");
+    const other = await mint("hide-other");
+    await befriend(opener, other);
+    expect((await putRound(opener.key, baseRound({ id: "round_opener" }))).status).toBe(200);
+    expect((await putRound(other.key, baseRound({ id: "round_other" }))).status).toBe(200);
+    kv.set(`fr:block:${opener.ownerId}:${other.ownerId}`, { value: "1" });
+    const openerFetch = await fetchRounds(opener.key);
+    const otherFetch = await fetchRounds(other.key);
+    expect(openerFetch.json.rounds.map((round) => round.id)).toEqual(["round_opener"]);
+    expect(otherFetch.json.rounds.map((round) => round.id)).toEqual(["round_other"]);
+    expect(openerFetch.text).not.toContain("blocked");
+    expect(otherFetch.text).not.toContain("blocked");
+  });
+
+  it("after block neither side can fetch the other's new round", async () => {
+    const opener = await mint("blk-opener");
+    const other = await mint("blk-other");
+    await befriend(opener, other);
+    expect((await putRound(opener.key, baseRound({ id: "round_old_opener" }))).status).toBe(200);
+    expect((await putRound(other.key, baseRound({ id: "round_old_other" }))).status).toBe(200);
+    const blocked = await invoke("/v1/friends/block", { friend: opener.key, body: { ownerId: other.ownerId } });
+    expect(blocked.json).toEqual({ ok: true });
+    expect(kv.has(roundKey(opener.ownerId, "round_old_opener"))).toBe(false);
+    expect(kv.has(roundKey(other.ownerId, "round_old_other"))).toBe(false);
+    expect((await putRound(other.key, baseRound({ id: "round_new_other" }))).status).toBe(200);
+    expect((await putRound(opener.key, baseRound({ id: "round_new_opener" }))).status).toBe(200);
+    const openerFetch = await fetchRounds(opener.key);
+    const otherFetch = await fetchRounds(other.key);
+    expect(openerFetch.json.rounds.map((round) => round.id)).toEqual(["round_new_opener"]);
+    expect(otherFetch.json.rounds.map((round) => round.id)).toEqual(["round_new_other"]);
+    expect(rows("fr:friend:")).toEqual([]);
+  });
+
+  it("fetch returns the full list with no cursor", async () => {
+    const caller = await mint("fetch-sort");
+    const friend = await mint("fetch-sort-friend");
+    await befriend(caller, friend);
+    expect((await putRound(caller.key, baseRound({ id: "round_late", playedOn: "2026-10-12" }))).status).toBe(200);
+    expect((await putRound(caller.key, baseRound({ id: "round_aaa", playedOn: "2026-10-12" }))).status).toBe(200);
+    expect((await putRound(friend.key, baseRound({ id: "round_early", playedOn: "2026-10-01" }))).status).toBe(200);
+    const fetched = await fetchRounds(caller.key);
+    expect(fetched.status).toBe(200);
+    expect(fetched.json.rounds.map((round) => round.id)).toEqual(["round_early", "round_aaa", "round_late"]);
+    expect(fetched.json).not.toHaveProperty("cursor");
+    expect(fetched.text).not.toContain("cursor");
+  });
+
+  it("fetch omits a stored round that carries GPS", async () => {
+    const caller = await mint("fetch-poison");
+    expect((await putRound(caller.key, baseRound({ id: "round_clean" }))).status).toBe(200);
+    kv.set(roundKey(caller.ownerId, "round_gps"), {
+      value: JSON.stringify(baseRound({ id: "round_gps", ownerId: caller.ownerId, lat: 33.5 })),
+    });
+    const fetched = await fetchRounds(caller.key);
+    expect(fetched.json.rounds.map((round) => round.id)).toEqual(["round_clean"]);
+    expect(fetched.text).not.toContain("lat");
+  });
+
+  it("publish rejects a body over 8192 bytes", async () => {
+    const caller = await mint("pub-size");
+    const over = `{"share":true,"round":"${"a".repeat(8192)}"}`;
+    expect(new TextEncoder().encode(over).length).toBeGreaterThan(8192);
+    const huge = await invoke("/v1/friends/rounds", {
+      method: "PUT",
+      friend: caller.key,
+      body: over,
+      headers: { "Content-Length": "100" },
+    });
+    expect(huge.status).toBe(413);
+    expect(huge.json).toEqual({ error: "payload_too_large" });
+    const declared = await invoke("/v1/friends/rounds", {
+      method: "PUT",
+      friend: caller.key,
+      body: { share: true, round: baseRound() },
+      headers: { "Content-Length": "9000" },
+    });
+    expect(declared.status).toBe(413);
+    const under = await invoke("/v1/friends/rounds", {
+      method: "PUT",
+      friend: caller.key,
+      body: "{\"share\":true}",
+    });
+    expect(under.status).toBe(400);
+    expect(under.json).toEqual({ error: "invalid_body" });
+    expect(rows("fr:round:")).toEqual([]);
+    const wide = `{"share":true,"round":"${"é".repeat(4090)}"}`;
+    expect(wide.length).toBeLessThanOrEqual(8192);
+    expect(new TextEncoder().encode(wide).length).toBeGreaterThan(8192);
+    const utf8 = await invoke("/v1/friends/rounds", { method: "PUT", friend: caller.key, body: wide });
+    expect(utf8.status).toBe(413);
+    expect(rows("fr:round:")).toEqual([]);
+  });
+
+  it("remove rejects a body over 2048 bytes", async () => {
+    const caller = await mint("rm-size");
+    const other = await mint("rm-size-other");
+    await befriend(caller, other);
+    expect((await putRound(caller.key, baseRound({ id: "round_keep" }))).status).toBe(200);
+    const huge = await invoke("/v1/friends/remove", { friend: caller.key, body: { ownerId: "x".repeat(3000) } });
+    expect(huge.status).toBe(413);
+    expect(huge.json).toEqual({ error: "payload_too_large" });
+    const named = await invoke("/v1/friends/remove", {
+      friend: caller.key,
+      body: { ownerId: other.ownerId, name: DISPLAY_NAME },
+    });
+    expect(named.status).toBe(400);
+    expect(named.json).toEqual({ error: "invalid_body" });
+    expect(kv.has(`fr:friend:${caller.ownerId}:${other.ownerId}`)).toBe(true);
+    expect(kv.has(roundKey(caller.ownerId, "round_keep"))).toBe(true);
+    const self = await invoke("/v1/friends/remove", { friend: caller.key, body: { ownerId: caller.ownerId } });
+    expect(self.status).toBe(400);
+    expect(self.json).toEqual({ error: "invalid_body" });
+    const method = await invoke("/v1/friends/remove", { method: "DELETE", friend: caller.key });
+    expect(method.status).toBe(405);
+    expect(method.json).toEqual({ error: "method_not_allowed" });
+    const missing = await invoke("/v1/friends/remove", { body: { ownerId: other.ownerId } });
+    expect(missing.status).toBe(401);
+    expect(missing.json).toEqual({ error: "friend_key_required" });
+    expect(kv.has(roundKey(caller.ownerId, "round_keep"))).toBe(true);
+  });
+
+  it("the same round id replaces the previous round", async () => {
+    const caller = await mint("pub-replace");
+    expect((await putRound(caller.key, baseRound({ id: "round_7Kp2", gross: 82 }))).status).toBe(200);
+    const again = await putRound(caller.key, baseRound({ id: "round_7Kp2", gross: 90, toPar: 18 }));
+    expect(again.status).toBe(200);
+    expect(again.json).toEqual({ ok: true, id: "round_7Kp2" });
+    expect(rows("fr:round:")).toEqual([roundKey(caller.ownerId, "round_7Kp2")]);
+    const stored = JSON.parse(kv.get(roundKey(caller.ownerId, "round_7Kp2")).value);
+    expect(stored.gross).toBe(90);
+    expect(stored.toPar).toBe(18);
+    expect(kv.get(roundKey(caller.ownerId, "round_7Kp2")).expirationTtl).toBe(365 * 24 * 60 * 60);
+  });
+
+  it("publish stores a round for one year", async () => {
+    const caller = await mint("pub-ttl");
+    const published = await putRound(caller.key, baseRound());
+    expect(published.status).toBe(200);
+    const row = kv.get(roundKey(caller.ownerId, "round_7Kp2"));
+    expect(row.expirationTtl).toBe(365 * 24 * 60 * 60);
+    expect(row.value).not.toContain(caller.key);
+    expect([...kv.keys()].filter((name) => !name.startsWith("fr:k:") && !name.startsWith("fr:code:") && !name.startsWith("fr:round:"))).toEqual([]);
+  });
+
+  it("duplicate hole numbers are invalid", async () => {
+    const caller = await mint("pub-dup-hole");
+    const published = await putRound(caller.key, baseRound({
+      holes: [
+        { hole: 1, score: 4, par: 4 },
+        { hole: 1, score: 5, par: 4 },
+      ],
+    }));
+    expect(published.status).toBe(400);
+    expect(published.json).toEqual({ error: "invalid_body" });
+    expect(rows("fr:round:")).toEqual([]);
+  });
+
+  it("hole 19 is invalid", async () => {
+    const caller = await mint("pub-hole-19");
+    const published = await putRound(caller.key, baseRound({
+      holes: [{ hole: 19, score: 4, par: 4 }],
+    }));
+    expect(published.status).toBe(400);
+    expect(published.json).toEqual({ error: "invalid_body" });
+    const zero = await putRound(caller.key, baseRound({ holes: [{ hole: 0, score: 4, par: 4 }] }));
+    expect(zero.status).toBe(400);
+    expect(rows("fr:round:")).toEqual([]);
+  });
+
+  it("clubs reject a punctuation string", async () => {
+    const caller = await mint("pub-clubs");
+    const named = await putRound(caller.key, baseRound({
+      holes: [{ hole: 1, score: 4, par: 4, clubs: ["Pines!"] }],
+    }));
+    expect(named.status).toBe(400);
+    expect(named.json).toEqual({ error: "invalid_body" });
+    const empty = await putRound(caller.key, baseRound({
+      holes: [{ hole: 1, score: 4, par: 4, clubs: [] }],
+    }));
+    expect(empty.status).toBe(400);
+    const tooMany = await putRound(caller.key, baseRound({
+      holes: [{ hole: 1, score: 4, par: 4, clubs: ["1", "2", "3", "4", "5", "6", "7", "8", "9"] }],
+    }));
+    expect(tooMany.status).toBe(400);
+    const long = await putRound(caller.key, baseRound({
+      holes: [{ hole: 1, score: 4, par: 4, clubs: ["123456789"] }],
+    }));
+    expect(long.status).toBe(400);
+    expect(rows("fr:round:")).toEqual([]);
+    const ok = await putRound(caller.key, baseRound({
+      id: "round_clubs",
+      holes: [{ hole: 1, score: 4, par: 4, clubs: ["Driver", "3-wood", "PW"] }],
+    }));
+    expect(ok.status).toBe(200);
+    const stored = JSON.parse(kv.get(roundKey(caller.ownerId, "round_clubs")).value);
+    expect(stored.holes[0].clubs).toEqual(["Driver", "3-wood", "PW"]);
+  });
+
+  it("round field bounds follow the allowlist", async () => {
+    const caller = await mint("pub-bounds");
+    const bad = [
+      baseRound({ gross: 0 }),
+      baseRound({ gross: 201 }),
+      baseRound({ gross: 82.5 }),
+      baseRound({ gross: "82" }),
+      baseRound({ toPar: -41 }),
+      baseRound({ toPar: 201 }),
+      baseRound({ courseName: "" }),
+      baseRound({ courseName: " Greystone" }),
+      baseRound({ courseName: "x".repeat(201) }),
+      baseRound({ playedOn: "2026-02-31" }),
+      baseRound({ playedOn: "10/11/2026" }),
+      baseRound({ id: "" }),
+      baseRound({ id: "a".repeat(65) }),
+      baseRound({ id: "round 1" }),
+      baseRound({ holes: [{ hole: 1, score: 0, par: 4 }] }),
+      baseRound({ holes: [{ hole: 1, score: 21, par: 4 }] }),
+      baseRound({ holes: [{ hole: 1, score: 4, par: 2 }] }),
+      baseRound({ holes: [{ hole: 1, score: 4, par: 7 }] }),
+      baseRound({ holes: [{ hole: 1, score: 4, par: 4, putts: -1 }] }),
+      baseRound({ holes: [{ hole: 1, score: 4, par: 4, putts: 11 }] }),
+    ];
+    for (const round of bad) {
+      const published = await putRound(caller.key, round);
+      expect(published.status).toBe(400);
+      expect(published.json).toEqual({ error: "invalid_body" });
+    }
+    expect(rows("fr:round:")).toEqual([]);
+    const edges = await putRound(caller.key, baseRound({
+      id: "a".repeat(64),
+      courseName: "y".repeat(200),
+      playedOn: "2026-02-28",
+      gross: 1,
+      toPar: -40,
+      holes: [{ hole: 18, score: 1, par: 3, putts: 0 }],
+    }));
+    expect(edges.status).toBe(200);
+    const high = await putRound(caller.key, baseRound({
+      id: "round_high",
+      gross: 200,
+      toPar: 200,
+      holes: [{ hole: 1, score: 20, par: 6, putts: 10 }],
+    }));
+    expect(high.status).toBe(200);
+  });
+
+  it("a fetch with a declared body is invalid", async () => {
+    const caller = await mint("fetch-body");
+    expect((await putRound(caller.key, baseRound())).status).toBe(200);
+    const small = await fetchRounds(caller.key, { "Content-Length": "2" });
+    expect(small.status).toBe(400);
+    expect(small.json).toEqual({ error: "invalid_body" });
+    const huge = await fetchRounds(caller.key, { "Content-Length": "3000" });
+    expect(huge.status).toBe(413);
+    expect(huge.json).toEqual({ error: "payload_too_large" });
+    expect(kv.has(roundKey(caller.ownerId, "round_7Kp2"))).toBe(true);
+    const empty = await fetchRounds(caller.key, { "Content-Length": "0" });
+    expect(empty.status).toBe(200);
+    expect(empty.json.rounds).toHaveLength(1);
+    const method = await invoke("/v1/friends/rounds", { method: "POST", friend: caller.key, body: { share: true, round: baseRound() } });
+    expect(method.status).toBe(405);
+    expect(method.json).toEqual({ error: "method_not_allowed" });
+    expect(rows("fr:round:")).toEqual([roundKey(caller.ownerId, "round_7Kp2")]);
+  });
+
+  it("remove publish and fetch do not use the guess limiter", async () => {
+    const caller = await mint("limit-caller");
+    const other = await mint("limit-other");
+    await befriend(caller, other);
+    for (let i = 0; i < KEY_LIMIT - 1; i += 1) {
+      const miss = await invoke("/v1/friends/codes/lookup", { friend: caller.key, body: { code: "GGGGGGGG" } });
+      expect(miss.status).toBe(404);
+    }
+    const limited = await invoke("/v1/friends/codes/lookup", { friend: caller.key, body: { code: "GGGGGGGG" } });
+    expect(limited.status).toBe(429);
+    const published = await putRound(caller.key, baseRound({ id: "round_limited" }));
+    expect(published.status).toBe(200);
+    const fetched = await fetchRounds(caller.key);
+    expect(fetched.status).toBe(200);
+    expect(fetched.json.rounds.map((round) => round.id)).toEqual(["round_limited"]);
+    env.FRIEND_GUESSES = undefined;
+    const still = await putRound(other.key, baseRound({ id: "round_unbound" }));
+    expect(still.status).toBe(200);
+    const seen = await fetchRounds(caller.key);
+    expect(seen.status).toBe(200);
+    expect(seen.json.rounds.map((round) => round.id).sort()).toEqual(["round_limited", "round_unbound"]);
+    const removed = await invoke("/v1/friends/remove", { friend: caller.key, body: { ownerId: other.ownerId } });
+    expect(removed.status).toBe(200);
+    expect(removed.json).toEqual({ ok: true });
+    const fresh = friendKey("no-code-yet");
+    expect((await invoke("/v1/friends/remove", { friend: fresh, body: { ownerId: other.ownerId } })).status).toBe(401);
+    expect((await putRound(fresh, baseRound())).status).toBe(401);
+    expect((await fetchRounds(fresh)).status).toBe(401);
+    env.BOARDS = undefined;
+    expect((await fetchRounds(caller.key)).json).toEqual({ error: "boards_not_configured" });
+    expect((await putRound(caller.key, baseRound())).json).toEqual({ error: "boards_not_configured" });
+  });
+
+  it("serves remove and rounds from the deploy entry", async () => {
+    const caller = await mint("entry-round");
+    const other = await mint("entry-round-other");
+    await befriend(caller, other);
+    const published = await entry.fetch(new Request(`${ORIGIN}/v1/friends/rounds`, {
+      method: "PUT",
+      headers: { "X-Friend-Key": caller.key, "Content-Type": "application/json" },
+      body: JSON.stringify({ share: true, round: baseRound({ id: "round_entry" }) }),
+    }), env, { waitUntil() {} });
+    expect(published.status).toBe(200);
+    expect(await published.json()).toEqual({ ok: true, id: "round_entry" });
+    const fetched = await entry.fetch(new Request(`${ORIGIN}/v1/friends/rounds`, {
+      method: "GET",
+      headers: { "X-Friend-Key": other.key },
+    }), env, { waitUntil() {} });
+    expect(fetched.status).toBe(200);
+    const body = await fetched.json();
+    expect(body.rounds.map((round) => round.id)).toEqual(["round_entry"]);
+    const options = await entry.fetch(new Request(`${ORIGIN}/v1/friends/rounds`, { method: "OPTIONS" }), env, { waitUntil() {} });
+    expect(options.status).toBe(200);
+    expect(await options.text()).toBe("");
+    expect(options.headers.get("Access-Control-Allow-Methods")).toBe("GET,POST,PUT,OPTIONS");
+    expect(options.headers.get("Access-Control-Allow-Headers")).toContain("Content-Type");
+    expect(options.headers.get("Access-Control-Allow-Headers")).toContain("X-Friend-Key");
+    const removed = await entry.fetch(new Request(`${ORIGIN}/v1/friends/remove`, {
+      method: "POST",
+      headers: { "X-Friend-Key": caller.key, "Content-Type": "application/json" },
+      body: JSON.stringify({ ownerId: other.ownerId }),
+    }), env, { waitUntil() {} });
+    expect(removed.status).toBe(200);
+    expect(await removed.json()).toEqual({ ok: true });
+    expect(kv.has(roundKey(caller.ownerId, "round_entry"))).toBe(false);
+  });
+
+  it("keeps the stockpile flag false and adds no binding", () => {
+    const toml = readFileSync(new URL("./wrangler.toml", import.meta.url), "utf8");
+    const source = readFileSync(new URL("./friends.js", import.meta.url), "utf8");
+    expect(toml).toContain('GOLFAPI_STOCKPILE_ENABLED = "false"');
+    expect(toml).toContain('name = "FRIEND_GUESSES"');
+    expect(toml).not.toContain("FRIEND_ROUNDS");
+    expect(source).not.toContain("FRIEND_ROUNDS");
+    expect(source).not.toContain("wrangler deploy");
   });
 });

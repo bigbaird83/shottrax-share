@@ -6,11 +6,9 @@ const doc = readFileSync(new URL("./friends-api.md", import.meta.url), "utf8");
 const wrangler = readFileSync(new URL("../wrangler.toml", import.meta.url), "utf8");
 const ORIGIN = "https://shottrax-share.bcbaird.workers.dev";
 
-// Remove and shared rounds stay unserved. Codes, requests, accept, block, and unblock are served.
+// An unlisted friends path stays unserved. Codes, requests, accept, block, unblock, remove, and rounds are served.
 const UNPUBLISHED_FRIEND_CALLS = [
-  ["POST", "/v1/friends/remove"],
-  ["PUT", "/v1/friends/rounds"],
-  ["GET", "/v1/friends/rounds"],
+  ["POST", "/v1/friends/decline"],
 ];
 const FRIEND_CODE_CALLS = [
   ["POST", "/v1/friends/code"],
@@ -20,6 +18,9 @@ const FRIEND_CODE_CALLS = [
   ["POST", "/v1/friends/requests/accept"],
   ["POST", "/v1/friends/block"],
   ["POST", "/v1/friends/unblock"],
+  ["POST", "/v1/friends/remove"],
+  ["PUT", "/v1/friends/rounds"],
+  ["GET", "/v1/friends/rounds"],
 ];
 
 function boards() {
@@ -139,7 +140,7 @@ describe("friends API contract", () => {
     }
   });
 
-  it("does not serve the friends routes and does not write KV", async () => {
+  it("serves the friends routes without writing outside fr:", async () => {
     for (const [method, path] of UNPUBLISHED_FRIEND_CALLS) {
       const { response, writes } = await call(path, method);
       expect(response.status, `${method} ${path}`).toBe(404);
