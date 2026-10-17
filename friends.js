@@ -5,8 +5,9 @@
  * one object per friend-key hash and one per IP hash.
  *
  * Served here: getCode, resetCode, code lookup, sendRequest, accept, block,
- * and unblock. Remove and shared-round publish stay unrouted. Block is quiet
- * for the blocked person. Unblock deletes only the caller's block.
+ * unblock, remove, publishRound, and fetchRounds. Block is quiet for the
+ * blocked person. Unblock deletes only the caller's block. Remove deletes the
+ * friendship and both sides' shared rounds. Rounds live under fr:round: only.
  */
 
 export const FRIEND_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -18,6 +19,11 @@ const FRIEND_KEY_PREFIX = "fr:";
 const FRIEND_KEY_HASH_PREFIX = "shottrax-friend-key-v1:";
 const FRIEND_IP_HASH_PREFIX = "shottrax-friend-guess-ip-v1:";
 const FRIEND_BODY_LIMIT = 2048;
+const PUBLISH_BODY_LIMIT = 8192;
+const ROUND_TTL_SECONDS = 365 * 24 * 60 * 60;
+const ROUND_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const PLAYED_ON_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+const CLUB_RE = /^[A-Za-z0-9][A-Za-z0-9 +./-]{0,7}$/;
 const COURSE_CACHE_PREFIXES = ["id:", "name:", "osm:", "gq:", "gapi:", "gqueue:", "gca:", "cr:"];
 const FRIEND_KEY_RE = /^[A-Za-z0-9_-]{32,64}$/;
 const INSTALL_ID_RE = /^id_\d+_[a-z0-9]+$/i;
@@ -152,6 +158,8 @@ const FRIEND_ROUTES = {
   "/v1/friends/requests/accept": { POST: acceptRequest },
   "/v1/friends/block": { POST: blockPerson },
   "/v1/friends/unblock": { POST: unblockPerson },
+  "/v1/friends/remove": { POST: removeFriend },
+  "/v1/friends/rounds": { PUT: publishRound, GET: fetchRounds },
 };
 
 async function getCode(request, env, cors) {
@@ -310,6 +318,74 @@ async function unblockPerson(request, env, cors) {
   return friendJson(200, { ok: true }, cors);
 }
 
+async function removeFriend(request, env, cors) {
+  const ready = await readyOwnerCall(request, env, cors);
+  if (ready.error) return ready.error;
+  const { boards, caller, ownerId } = ready;
+  const forward = await areFriends(boards, caller.ownerId, ownerId);
+  const reverse = await areFriends(boards, ownerId, caller.ownerId);
+  if (!forward || !reverse) return friendJson(409, { error: "not_friends" }, cors);
+  await friendDelete(boards, friendKvKey("friend", `${caller.ownerId}:${ownerId}`));
+  await friendDelete(boards, friendKvKey("friend", `${ownerId}:${caller.ownerId}`));
+  await deleteOwnedRounds(boards, caller.ownerId);
+  await deleteOwnedRounds(boards, ownerId);
+  return friendJson(200, { ok: true }, cors);
+}
+
+async function publishRound(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const parsed = await readJsonObject(request, PUBLISH_BODY_LIMIT, false);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (unknownFields(parsed.value, ["share", "round"])) return friendJson(400, { error: "invalid_body" }, cors);
+  if (!Object.hasOwn(parsed.value, "share") || !Object.hasOwn(parsed.value, "round")) {
+    return friendJson(400, { error: "invalid_body" }, cors);
+  }
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const { share, round } = parsed.value;
+  if (share === false && round === null) {
+    await deleteOwnedRounds(boards, caller.ownerId);
+    return friendJson(200, { ok: true }, cors);
+  }
+  if (share !== true || round == null || typeof round !== "object" || Array.isArray(round)) {
+    return friendJson(400, { error: "invalid_body" }, cors);
+  }
+  const stored = sanitizeRound(round, caller.ownerId);
+  if (!stored) return friendJson(400, { error: "invalid_body" }, cors);
+  await friendPut(boards, friendKvKey("round", `${caller.ownerId}:${stored.id}`), JSON.stringify(stored), {
+    expirationTtl: ROUND_TTL_SECONDS,
+  });
+  return friendJson(200, { ok: true, id: stored.id }, cors);
+}
+
+async function fetchRounds(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const declared = Number(request.headers.get("Content-Length"));
+  if (Number.isFinite(declared) && declared > FRIEND_BODY_LIMIT) {
+    return friendJson(413, { error: "payload_too_large" }, cors);
+  }
+  if (Number.isFinite(declared) && declared > 0) return friendJson(400, { error: "invalid_body" }, cors);
+  const parsed = await readJsonObject(request, FRIEND_BODY_LIMIT, true);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (!parsed.empty) return friendJson(400, { error: "invalid_body" }, cors);
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const rounds = await loadOwnedRounds(boards, caller.ownerId);
+  for (const otherId of await acceptedFriendIds(boards, caller.ownerId)) {
+    if (await hasBlock(boards, caller.ownerId, otherId)) continue;
+    if (await hasBlock(boards, otherId, caller.ownerId)) continue;
+    rounds.push(...await loadOwnedRounds(boards, otherId));
+  }
+  rounds.sort(compareRounds);
+  return friendJson(200, { rounds }, cors);
+}
+
 async function readyOwnerCall(request, env, cors) {
   const friendKey = readFriendKey(request);
   if (!friendKey) return { error: friendJson(401, { error: "friend_key_required" }, cors) };
@@ -348,6 +424,134 @@ async function hasBlock(boards, blockerOwnerId, blockedOwnerId) {
 async function areFriends(boards, leftOwnerId, rightOwnerId) {
   const raw = await friendGet(boards, friendKvKey("friend", `${leftOwnerId}:${rightOwnerId}`));
   return typeof raw === "string" && raw.length > 0;
+}
+
+async function acceptedFriendIds(boards, ownerId) {
+  const prefix = `fr:friend:${ownerId}:`;
+  const ids = [];
+  for (const name of await listByPrefix(boards, prefix)) {
+    if (!name.startsWith(prefix)) continue;
+    const otherId = name.slice(prefix.length);
+    if (!OWNER_ID_RE.test(otherId)) continue;
+    if (!(await areFriends(boards, otherId, ownerId))) continue;
+    ids.push(otherId);
+  }
+  return ids;
+}
+
+async function loadOwnedRounds(boards, ownerId) {
+  const prefix = `fr:round:${ownerId}:`;
+  const rounds = [];
+  for (const name of await listByPrefix(boards, prefix)) {
+    if (!name.startsWith(prefix)) continue;
+    const roundId = name.slice(prefix.length);
+    const round = parseStoredRound(await friendGet(boards, name), ownerId, roundId);
+    if (round) rounds.push(round);
+  }
+  return rounds;
+}
+
+function parseStoredRound(raw, ownerId, roundId) {
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  const round = sanitizeRound(parsed, ownerId);
+  if (!round || round.id !== roundId) return null;
+  return round;
+}
+
+function sanitizeRound(round, callerOwnerId) {
+  if (round == null || typeof round !== "object" || Array.isArray(round)) return null;
+  if (unknownFields(round, ["id", "ownerId", "courseName", "playedOn", "gross", "toPar", "holes"])) return null;
+  if (typeof round.id !== "string" || !ROUND_ID_RE.test(round.id)) return null;
+  if (Object.hasOwn(round, "ownerId") && round.ownerId !== callerOwnerId) return null;
+  if (!validCourseName(round.courseName)) return null;
+  if (!validPlayedOn(round.playedOn)) return null;
+  if (!Number.isInteger(round.gross) || round.gross < 1 || round.gross > 200) return null;
+  if (!Number.isInteger(round.toPar) || round.toPar < -40 || round.toPar > 200) return null;
+  if (!Array.isArray(round.holes) || round.holes.length < 1 || round.holes.length > 18) return null;
+  const holes = [];
+  const seen = new Set();
+  for (const hole of round.holes) {
+    const clean = sanitizeHole(hole);
+    if (!clean) return null;
+    if (seen.has(clean.hole)) return null;
+    seen.add(clean.hole);
+    holes.push(clean);
+  }
+  return {
+    id: round.id,
+    ownerId: callerOwnerId,
+    courseName: round.courseName,
+    playedOn: round.playedOn,
+    gross: round.gross,
+    toPar: round.toPar,
+    holes,
+  };
+}
+
+function sanitizeHole(hole) {
+  if (hole == null || typeof hole !== "object" || Array.isArray(hole)) return null;
+  if (unknownFields(hole, ["hole", "score", "par", "fir", "gir", "putts", "clubs"])) return null;
+  if (!Number.isInteger(hole.hole) || hole.hole < 1 || hole.hole > 18) return null;
+  if (!Number.isInteger(hole.score) || hole.score < 1 || hole.score > 20) return null;
+  if (!Number.isInteger(hole.par) || hole.par < 3 || hole.par > 6) return null;
+  const clean = { hole: hole.hole, score: hole.score, par: hole.par };
+  if (Object.hasOwn(hole, "fir")) {
+    if (typeof hole.fir !== "boolean") return null;
+    clean.fir = hole.fir;
+  }
+  if (Object.hasOwn(hole, "gir")) {
+    if (typeof hole.gir !== "boolean") return null;
+    clean.gir = hole.gir;
+  }
+  if (Object.hasOwn(hole, "putts")) {
+    if (!Number.isInteger(hole.putts) || hole.putts < 0 || hole.putts > 10) return null;
+    clean.putts = hole.putts;
+  }
+  if (Object.hasOwn(hole, "clubs")) {
+    if (!validClubs(hole.clubs)) return null;
+    clean.clubs = hole.clubs.slice();
+  }
+  return clean;
+}
+
+function validClubs(clubs) {
+  if (!Array.isArray(clubs) || clubs.length < 1 || clubs.length > 8) return false;
+  return clubs.every((club) => typeof club === "string" && CLUB_RE.test(club));
+}
+
+function validCourseName(value) {
+  if (typeof value !== "string") return false;
+  if (value !== value.trim()) return false;
+  if (value.length < 1 || value.length > 200) return false;
+  if (/[\u0000-\u001F\u007F]/.test(value)) return false;
+  return true;
+}
+
+function validPlayedOn(value) {
+  if (typeof value !== "string") return false;
+  const match = PLAYED_ON_RE.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+}
+
+function compareRounds(left, right) {
+  if (left.playedOn < right.playedOn) return -1;
+  if (left.playedOn > right.playedOn) return 1;
+  if (left.ownerId < right.ownerId) return -1;
+  if (left.ownerId > right.ownerId) return 1;
+  if (left.id < right.id) return -1;
+  if (left.id > right.id) return 1;
+  return 0;
 }
 
 async function deleteIfPresent(boards, key) {
@@ -408,7 +612,7 @@ async function readJsonObject(request, limit, allowEmpty) {
   // Content-Length can be omitted or understated. The cap is bytes, not UTF-16 units.
   if (byteLength(raw) > limit) return { error: "payload_too_large", status: 413 };
   if (raw.length === 0) {
-    if (allowEmpty) return { value: {} };
+    if (allowEmpty) return { value: {}, empty: true };
     return { error: "invalid_body", status: 400 };
   }
   let parsed;
@@ -420,7 +624,7 @@ async function readJsonObject(request, limit, allowEmpty) {
   if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
     return { error: "invalid_body", status: 400 };
   }
-  return { value: parsed };
+  return { value: parsed, empty: false };
 }
 
 function boardsBinding(env) {
@@ -483,9 +687,10 @@ async function friendGet(boards, key) {
   return boards.get(key);
 }
 
-async function friendPut(boards, key, value) {
+async function friendPut(boards, key, value, options) {
   assertFriendNamespace(key);
-  await boards.put(key, value);
+  if (options) await boards.put(key, value, options);
+  else await boards.put(key, value);
 }
 
 async function friendDelete(boards, key) {
