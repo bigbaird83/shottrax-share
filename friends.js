@@ -6,14 +6,20 @@
  *
  * Served here: getCode, resetCode, code lookup, sendRequest, accept, block,
  * unblock, remove, publishRound, and fetchRounds. Block is quiet for the
- * blocked person. Unblock deletes only the caller's block. Remove deletes the
- * friendship and both sides' shared rounds. Rounds live under fr:round: only.
+ * blocked person. Unblock deletes only the caller's block. Block requires a
+ * friendship and stores the block row before it deletes that friendship.
+ * Remove and block delete only the caller's shared rounds. One fr:rounds:
+ * value holds an owner's rounds. One fr:friends: value is that owner's list.
  */
 
 export const FRIEND_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 export const FRIEND_CODE_GUESS_LIMIT = 8;
 export const FRIEND_IP_GUESS_LIMIT = 24;
+export const FRIEND_GETCODE_IP_LIMIT = 30;
+export const FRIEND_PUBLISH_IP_LIMIT = 60;
 export const FRIEND_GUESS_WINDOW_MS = 60 * 60 * 1000;
+export const FRIEND_CAP = 50;
+export const ROUND_CAP = 100;
 
 const FRIEND_KEY_PREFIX = "fr:";
 const FRIEND_KEY_HASH_PREFIX = "shottrax-friend-key-v1:";
@@ -46,12 +52,20 @@ export async function limiterNameForFriendKey(friendKey) {
   return `key:${await sha256Hex(FRIEND_KEY_HASH_PREFIX + friendKey)}`;
 }
 
+function limitForDurableObjectName(name) {
+  // Longer prefixes first. "ipget:" and "ippub:" must not inherit the "ip:" guess cap.
+  if (name.startsWith("ipget:")) return FRIEND_GETCODE_IP_LIMIT;
+  if (name.startsWith("ippub:")) return FRIEND_PUBLISH_IP_LIMIT;
+  if (name.startsWith("ip:")) return FRIEND_IP_GUESS_LIMIT;
+  return FRIEND_CODE_GUESS_LIMIT;
+}
+
 export class FriendGuessLimiter {
   constructor(ctx, env) {
     this.ctx = ctx;
     this.env = env;
     const name = ctx && ctx.id && typeof ctx.id.name === "string" ? ctx.id.name : "";
-    this.limit = name.startsWith("ip:") ? FRIEND_IP_GUESS_LIMIT : FRIEND_CODE_GUESS_LIMIT;
+    this.limit = limitForDurableObjectName(name);
     this.#ready = ctx.blockConcurrencyWhile(async () => {
       this.#ensure();
     });
@@ -168,6 +182,8 @@ async function getCode(request, env, cors) {
   const parsed = await readJsonObject(request, FRIEND_BODY_LIMIT, true);
   if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
   if (unknownFields(parsed.value, [])) return friendJson(400, { error: "invalid_body" }, cors);
+  const limited = await consumeIpAction(request, env, "ipget:", cors);
+  if (limited) return limited;
   const boards = boardsBinding(env);
   if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
   const keyHash = await sha256Hex(FRIEND_KEY_HASH_PREFIX + friendKey);
@@ -213,6 +229,8 @@ async function lookupCode(request, env, cors) {
   if (unknownFields(parsed.value, ["code"])) return friendJson(400, { error: "invalid_body" }, cors);
   const code = normalizeFriendCode(parsed.value.code);
   if (!code) return friendJson(400, { error: "invalid_body" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
   const limited = await consumeGuess(request, env, friendKey, cors);
   if (limited) return limited;
   const ownerId = await friendGet(boards, friendKvKey("code", code));
@@ -287,8 +305,15 @@ async function acceptRequest(request, env, cors) {
   if (typeof pending !== "string" || pending.length === 0) {
     return friendJson(409, { error: "not_friends" }, cors);
   }
+  const callerIds = await loadFriendIds(boards, caller.ownerId);
+  const otherIds = await loadFriendIds(boards, ownerId);
+  if (friendListWouldExceed(callerIds, ownerId) || friendListWouldExceed(otherIds, caller.ownerId)) {
+    return friendJson(409, { error: "friend_limit" }, cors);
+  }
   await friendPut(boards, friendKvKey("friend", `${caller.ownerId}:${ownerId}`), "1");
   await friendPut(boards, friendKvKey("friend", `${ownerId}:${caller.ownerId}`), "1");
+  await saveFriendIds(boards, caller.ownerId, addFriendId(callerIds, ownerId));
+  await saveFriendIds(boards, ownerId, addFriendId(otherIds, caller.ownerId));
   await friendDelete(boards, reqKey);
   return friendJson(200, { status: "friends", ownerId }, cors);
 }
@@ -297,13 +322,18 @@ async function blockPerson(request, env, cors) {
   const ready = await readyOwnerCall(request, env, cors);
   if (ready.error) return ready.error;
   const { boards, caller, ownerId } = ready;
-  await deleteIfPresent(boards, friendKvKey("friend", `${caller.ownerId}:${ownerId}`));
-  await deleteIfPresent(boards, friendKvKey("friend", `${ownerId}:${caller.ownerId}`));
+  const forward = await areFriends(boards, caller.ownerId, ownerId);
+  const reverse = await areFriends(boards, ownerId, caller.ownerId);
+  if (!forward || !reverse) return friendJson(409, { error: "not_friends" }, cors);
+  // Store the block first. A failure later must not leave this pair with no block.
+  await friendPut(boards, friendKvKey("block", `${caller.ownerId}:${ownerId}`), "1");
+  await friendDelete(boards, friendKvKey("friend", `${caller.ownerId}:${ownerId}`));
+  await friendDelete(boards, friendKvKey("friend", `${ownerId}:${caller.ownerId}`));
+  await saveFriendIds(boards, caller.ownerId, removeFriendId(await loadFriendIds(boards, caller.ownerId), ownerId));
+  await saveFriendIds(boards, ownerId, removeFriendId(await loadFriendIds(boards, ownerId), caller.ownerId));
   await deleteIfPresent(boards, requestKey(ownerId, caller.ownerId));
   await deleteIfPresent(boards, requestKey(caller.ownerId, ownerId));
   await deleteOwnedRounds(boards, caller.ownerId);
-  await deleteOwnedRounds(boards, ownerId);
-  await friendPut(boards, friendKvKey("block", `${caller.ownerId}:${ownerId}`), "1");
   return friendJson(200, { ok: true }, cors);
 }
 
@@ -327,8 +357,9 @@ async function removeFriend(request, env, cors) {
   if (!forward || !reverse) return friendJson(409, { error: "not_friends" }, cors);
   await friendDelete(boards, friendKvKey("friend", `${caller.ownerId}:${ownerId}`));
   await friendDelete(boards, friendKvKey("friend", `${ownerId}:${caller.ownerId}`));
+  await saveFriendIds(boards, caller.ownerId, removeFriendId(await loadFriendIds(boards, caller.ownerId), ownerId));
+  await saveFriendIds(boards, ownerId, removeFriendId(await loadFriendIds(boards, ownerId), caller.ownerId));
   await deleteOwnedRounds(boards, caller.ownerId);
-  await deleteOwnedRounds(boards, ownerId);
   return friendJson(200, { ok: true }, cors);
 }
 
@@ -347,6 +378,8 @@ async function publishRound(request, env, cors) {
   if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
   const { share, round } = parsed.value;
   if (share === false && round === null) {
+    const limited = await consumeIpAction(request, env, "ippub:", cors);
+    if (limited) return limited;
     await deleteOwnedRounds(boards, caller.ownerId);
     return friendJson(200, { ok: true }, cors);
   }
@@ -355,7 +388,14 @@ async function publishRound(request, env, cors) {
   }
   const stored = sanitizeRound(round, caller.ownerId);
   if (!stored) return friendJson(400, { error: "invalid_body" }, cors);
-  await friendPut(boards, friendKvKey("round", `${caller.ownerId}:${stored.id}`), JSON.stringify(stored), {
+  const existing = await loadOwnedRounds(boards, caller.ownerId);
+  const index = existing.findIndex((item) => item.id === stored.id);
+  if (index >= 0) existing[index] = stored;
+  else if (existing.length >= ROUND_CAP) return friendJson(409, { error: "round_limit" }, cors);
+  else existing.push(stored);
+  const limited = await consumeIpAction(request, env, "ippub:", cors);
+  if (limited) return limited;
+  await friendPut(boards, friendKvKey("rounds", caller.ownerId), JSON.stringify(existing), {
     expirationTtl: ROUND_TTL_SECONDS,
   });
   return friendJson(200, { ok: true, id: stored.id }, cors);
@@ -376,10 +416,12 @@ async function fetchRounds(request, env, cors) {
   if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
   const caller = await loadCaller(boards, friendKey);
   if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const friendIds = await loadFriendIds(boards, caller.ownerId);
   const rounds = await loadOwnedRounds(boards, caller.ownerId);
-  for (const otherId of await acceptedFriendIds(boards, caller.ownerId)) {
-    if (await hasBlock(boards, caller.ownerId, otherId)) continue;
-    if (await hasBlock(boards, otherId, caller.ownerId)) continue;
+  for (const otherId of friendIds) {
+    const blockedByCaller = await hasBlock(boards, caller.ownerId, otherId);
+    const blockedByOther = await hasBlock(boards, otherId, caller.ownerId);
+    if (blockedByCaller || blockedByOther) continue;
     rounds.push(...await loadOwnedRounds(boards, otherId));
   }
   rounds.sort(compareRounds);
@@ -426,42 +468,68 @@ async function areFriends(boards, leftOwnerId, rightOwnerId) {
   return typeof raw === "string" && raw.length > 0;
 }
 
-async function acceptedFriendIds(boards, ownerId) {
-  const prefix = `fr:friend:${ownerId}:`;
-  const ids = [];
-  for (const name of await listByPrefix(boards, prefix)) {
-    if (!name.startsWith(prefix)) continue;
-    const otherId = name.slice(prefix.length);
-    if (!OWNER_ID_RE.test(otherId)) continue;
-    if (!(await areFriends(boards, otherId, ownerId))) continue;
-    ids.push(otherId);
-  }
-  return ids;
-}
-
-async function loadOwnedRounds(boards, ownerId) {
-  const prefix = `fr:round:${ownerId}:`;
-  const rounds = [];
-  for (const name of await listByPrefix(boards, prefix)) {
-    if (!name.startsWith(prefix)) continue;
-    const roundId = name.slice(prefix.length);
-    const round = parseStoredRound(await friendGet(boards, name), ownerId, roundId);
-    if (round) rounds.push(round);
-  }
-  return rounds;
-}
-
-function parseStoredRound(raw, ownerId, roundId) {
-  if (typeof raw !== "string" || raw.length === 0) return null;
+async function loadFriendIds(boards, ownerId) {
+  const raw = await friendGet(boards, friendKvKey("friends", ownerId));
+  if (typeof raw !== "string" || raw.length === 0) return [];
   let parsed;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return null;
+    return [];
   }
-  const round = sanitizeRound(parsed, ownerId);
-  if (!round || round.id !== roundId) return null;
-  return round;
+  if (!Array.isArray(parsed)) return [];
+  const ids = [];
+  const seen = new Set();
+  for (const item of parsed) {
+    if (typeof item !== "string" || !OWNER_ID_RE.test(item) || item === ownerId || seen.has(item)) continue;
+    seen.add(item);
+    ids.push(item);
+  }
+  return ids;
+}
+
+async function saveFriendIds(boards, ownerId, ids) {
+  const key = friendKvKey("friends", ownerId);
+  if (ids.length === 0) {
+    await deleteIfPresent(boards, key);
+    return;
+  }
+  await friendPut(boards, key, JSON.stringify(ids));
+}
+
+function friendListWouldExceed(ids, otherId) {
+  return !ids.includes(otherId) && ids.length >= FRIEND_CAP;
+}
+
+function addFriendId(ids, otherId) {
+  if (ids.includes(otherId)) return ids;
+  return [...ids, otherId];
+}
+
+function removeFriendId(ids, otherId) {
+  return ids.filter((id) => id !== otherId);
+}
+
+async function loadOwnedRounds(boards, ownerId) {
+  const raw = await friendGet(boards, friendKvKey("rounds", ownerId));
+  if (typeof raw !== "string" || raw.length === 0) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  const rounds = [];
+  const seen = new Set();
+  for (const item of parsed) {
+    if (item == null || typeof item !== "object" || Array.isArray(item)) continue;
+    const round = sanitizeRound(item, ownerId);
+    if (!round || seen.has(round.id)) continue;
+    seen.add(round.id);
+    rounds.push(round);
+  }
+  return rounds;
 }
 
 function sanitizeRound(round, callerOwnerId) {
@@ -560,26 +628,7 @@ async function deleteIfPresent(boards, key) {
 }
 
 async function deleteOwnedRounds(boards, ownerId) {
-  const prefix = `fr:round:${ownerId}:`;
-  for (const name of await listByPrefix(boards, prefix)) {
-    if (name.startsWith(prefix)) await friendDelete(boards, name);
-  }
-}
-
-async function listByPrefix(boards, prefix) {
-  if (!boards || typeof boards.list !== "function") return [];
-  const names = [];
-  let cursor;
-  for (let pageNo = 0; pageNo < 20; pageNo += 1) {
-    const page = await boards.list(cursor ? { prefix, cursor } : { prefix });
-    const keys = page && Array.isArray(page.keys) ? page.keys : [];
-    for (const entry of keys) {
-      if (entry && typeof entry.name === "string") names.push(entry.name);
-    }
-    if (!page || page.list_complete !== false || !page.cursor) break;
-    cursor = page.cursor;
-  }
-  return names;
+  await deleteIfPresent(boards, friendKvKey("rounds", ownerId));
 }
 
 function readFriendKey(request) {
@@ -641,6 +690,15 @@ function guessNamespace(env) {
   return ns;
 }
 
+async function consumeIpAction(request, env, prefix, cors) {
+  const ipHash = await friendIpHash(request);
+  if (!ipHash) return null;
+  if (!guessNamespace(env)) return friendJson(503, { error: "guess_limiter_not_configured" }, cors);
+  const attempt = await guessAttempt(env, `${prefix}${ipHash}`, Date.now());
+  if (!attempt.ok) return rateLimited(cors, attempt.retryAfterSec);
+  return null;
+}
+
 async function consumeGuess(request, env, friendKey, cors) {
   const now = Date.now();
   const keyAttempt = await guessAttempt(env, await limiterNameForFriendKey(friendKey), now);
@@ -667,7 +725,16 @@ async function guessAttempt(env, name, now) {
 }
 
 function friendKvKey(kind, id) {
-  if (kind !== "k" && kind !== "code" && kind !== "req" && kind !== "friend" && kind !== "round" && kind !== "block") {
+  if (
+    kind !== "k" &&
+    kind !== "code" &&
+    kind !== "req" &&
+    kind !== "friend" &&
+    kind !== "friends" &&
+    kind !== "round" &&
+    kind !== "rounds" &&
+    kind !== "block"
+  ) {
     throw new Error("friend_namespace");
   }
   if (typeof id !== "string" || id.length < 1) throw new Error("friend_namespace");

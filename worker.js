@@ -349,7 +349,7 @@ const GOLFAPI_LATENCY_KINDS = ["search", "course", "coordinates"];
 const GOLFAPI_IP_PREFIX = "shottrax-golfapi-ip-v1:";
 const GOLFAPI_SEARCH_PREFIX = "shottrax-golfapi-search-v1:";
 const GOLFAPI_BALANCE_KEY = "gq:balance";
-const RESERVED_BOARD_PREFIXES = ["osm:", "gq:", "gapi:", "gqueue:", "gca:", "cr:"];
+const RESERVED_BOARD_PREFIXES = ["osm:", "gq:", "gapi:", "gqueue:", "gca:", "cr:", "fr:"];
 const GOLFAPI_REASONS = [
   "device_day",
   "device_week",
