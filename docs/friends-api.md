@@ -1,6 +1,6 @@
 # Friends API
 
-Contract for anonymous friends on the ShotTraxx share Worker. The phone draft is ShotTraxx PR #533, file `src/domain/friendsApi.ts`, on that PR's branch (commit `dde1414eb8dd81e14e8b39198643e92ca60f45a4`, which put the network calls behind `FriendsApi`). This document wins. The phone will match it. This PR does not serve the routes.
+Contract for anonymous friends on the ShotTraxx share Worker. The phone draft is ShotTraxx PR #533, file `src/domain/friendsApi.ts`, on that PR's branch (commit `dde1414eb8dd81e14e8b39198643e92ca60f45a4`, which put the network calls behind `FriendsApi`). This document wins. The phone will match it. The Worker serves the calls in this document.
 
 PR #533 is titled Friends/Groups. This contract is friends only. It does not define groups, league membership, or chat.
 
@@ -76,7 +76,38 @@ Already friends: `200` `{ "status": "friends", "ownerId": "<their ownerId>" }` a
 
 The caller's own code is `400` `{ "error": "invalid_body" }`. That check is made before the guess limiter and does not consume a guess.
 
-Quiet block: if the target has blocked the caller, the response is the same `200` pending body as a real request. Nothing is stored for the target to accept, and the body is not `blocked`. If the caller has blocked the target, the caller gets `409` `{ "error": "blocked" }`. They already know.
+Quiet block: if the target has blocked the caller, the response is the same `200` pending body as a real request. Nothing is stored for the target to accept, and the body is not `blocked`. If the caller has blocked the target, the caller gets `409` `{ "error": "blocked" }`. They already know. That swallowed send is not a row, so `GET /v1/friends/requests` cannot list it. See listRequests.
+
+### listRequests
+
+`GET /v1/friends/requests`
+
+No body. `Content-Length` greater than 0 is `400` `{ "error": "invalid_body" }`. `Content-Length` greater than 2048 is `413` `{ "error": "payload_too_large" }`. A non-empty body with no `Content-Length` is the same `invalid_body`. Empty, or `Content-Length: 0`, is allowed.
+
+Auth is `X-Friend-Key`, the same as the other friends routes. A missing or bad key, or a key with no minted code, is `401` `{ "error": "friend_key_required" }`. Those failures do not consume the read limit below and do not list KV.
+
+`200`
+
+```json
+{
+  "incoming": [ { "ownerId": "p9Lq2mZ8nB4wK6tR1vYs0C" } ],
+  "outgoing": [ { "ownerId": "k3mR9xQ2nB8wL4pT6vYs1A" } ]
+}
+```
+
+`incoming` is pending requests other people sent the caller. `outgoing` is pending requests the caller sent. Each entry is the other person's `ownerId` only. The stored row is the string `pending`. It has no display name and no created time, so this route does not add those fields. The raw value is not returned. A friend code, a friend key, a raw KV key, and anyone who is not the other party of that request are not returned.
+
+A requester the caller has blocked is left out of `incoming`. A stored outgoing row is still returned to the sender when the recipient has a block row. Hiding it would tell the sender they were blocked.
+
+Sort: `incoming` and `outgoing` are each sorted by `ownerId` ascending, using JavaScript string order (UTF-16 code units). `ownerId` is unique in each list. There is no cursor. The response is the full set of stored rows this scan can see.
+
+KV reads, no KV writes. One list of prefix `fr:req:` (the requester id is the key suffix, so a per-caller prefix cannot see outgoing rows), then a get of each matching row and, for each non-empty incoming row, one block get. Formula: `1 + I + B + O` gets and `P` lists. `P = max(1, ceil(R / 1000))` is the number of list pages, and `R` is every `fr:req:` key in `BOARDS`. `I` is how many of those keys name the caller as recipient (each is one value get). `B` is how many of those values are a non-empty string (each is one `fr:block:<caller>:<requester>` get). `O` is how many name the caller as requester and someone else as recipient (each is one value get). The `1` is the auth row. Keys that belong to two other people are not gotten. No `put` and no `delete`.
+
+The read limit is 60 calls per friend key per 60 minutes (`keyreq:` on `FriendGuessLimiter`) and 60 per IP hash per 60 minutes when `CF-Connecting-IP` is present (`ipreq:`). No IP header skips the IP limit. A missing `FRIEND_GUESSES` binding is `503` `{ "error": "guess_limiter_not_configured" }` and does not list. Over the limit is `429` `{ "error": "rate_limited" }` and `Retry-After`, and that request does not list. `invalid_body` and `payload_too_large` do not consume a call. These objects are not the code-guess, `ipget:`, or `ippub:` counters.
+
+If `BOARDS` is missing, or it has no `list`, the call is `503` `{ "error": "boards_not_configured" }`.
+
+Open question, not implemented. A quiet-block `sendRequest` returns `200` pending and stores nothing. This GET can only list stored `fr:req:` rows, so the sender's outgoing list does not include that person. Building the row from `fr:block:*:<sender>` would also list people who blocked the sender and were never sent a new request, which reveals the block. This route does not do that. Smallest follow-up, if Brian wants the swallowed send to stay visible: on the quiet-block branch only, write `fr:out:<sender>:<recipient>` = `pending` (no display fields, no created time). Outgoing GET would list that prefix. Incoming GET would keep reading only `fr:req:`, so the recipient still sees nothing and still cannot accept it. When to delete that marker (a later real request to the same person, a TTL, or the sender's code reset) is the open point. Storing the normal `fr:req:` row on the quiet-block path is smaller and needs no new key, and incoming GET already hides a requester the caller blocked, but after unblock that row would be acceptable without a new send. That contradicts the current sentence that a quiet block stores nothing. The same `fr:out:<sender>:` prefix would also drop the global `fr:req:` scan down to a per-caller list.
 
 ### accept
 
@@ -149,6 +180,28 @@ Unblocking someone the caller has not blocked, or an `ownerId` that does not exi
 After unblock, the caller's `sendRequest` to that person no longer returns `blocked`. To be friends again, the caller sends a new request with the normal add flow, and the other person accepts it. After unblock, a request from the person who was blocked is stored as a real pending request the caller can accept. It is no longer quietly dropped. Neither side has a friendship or a pending request until a new request is sent.
 
 Does not count as a guess, does not read a code, and does not require the guess limiter. This call is not the guess limiter's reset operation.
+
+### listFriends
+
+`GET /v1/friends/list`
+
+No body. The `Content-Length` rules, auth errors, and `boards_not_configured` error match `GET /v1/friends/rounds` and listRequests. A missing limiter is `503` `{ "error": "guess_limiter_not_configured" }` and does not read the friend list.
+
+`200`
+
+```json
+{ "friends": [ { "ownerId": "k3mR9xQ2nB8wL4pT6vYs1A" } ] }
+```
+
+Each entry is a current friend: an id in the caller's `fr:friends:` list, with both `fr:friend:` rows present (`fr:friend:<caller>:<friend>` and `fr:friend:<friend>:<caller>`). That is the accepted pair `accept` writes and the pair `remove` and `block` require. One row without the other is not a friend and is not listed. A block in either direction hides the friend, the same rule `fetchRounds` uses when it skips a friend's rounds. The response is at most 50 friends. Only the first 50 ids in the stored array are inspected, in that stored order, and ids past the cap are ignored.
+
+`since` is the friendship's created time when a row stores one. Today each `fr:friend:` value is the string `1`, and the `fr:friends:` array is only ids, so no created time is stored. The field is omitted. An entry is `{ "ownerId" }` only. No friend code, friend key, raw KV key, name, or other person's data is returned.
+
+Sort: `friends` is sorted by `ownerId` ascending, JavaScript string order. There is no cursor.
+
+KV reads, no KV writes, no list. Formula: `2 + N + P + 2M` gets. `N` is the number of ids inspected, `N = min(length of fr:friends:<caller>, 50)`. `P` is how many of those have a caller→friend row, so the reverse row is read. `M` is how many have both rows, so both block rows are read (`M ≤ P ≤ N`). The `2` is the auth row and the `fr:friends:` value. A clean list, every inspected id a mutual friend whether or not a block remains, is `2 + 4N` gets. No `put` and no `delete`.
+
+The read limit is 60 calls per friend key per 60 minutes (`keylist:`) and 60 per IP hash per 60 minutes when `CF-Connecting-IP` is present (`iplist:`). It does not share the listRequests counters, the code-guess counters, `ipget:`, or `ippub:`. No IP header skips the IP limit. Over the limit is `429` `{ "error": "rate_limited" }` and `Retry-After`, and that request does not read the friend list. A bad body does not consume a call.
 
 ### publishRound
 
@@ -226,10 +279,14 @@ One SQLite-backed Durable Object, class `FriendGuessLimiter`, binding `FRIEND_GU
 | IP hash, when `CF-Connecting-IP` is present | 24 lookups | 60 minutes |
 | IP hash, `getCode` (`ipget:`) | 30 calls | 60 minutes |
 | IP hash, `publishRound` including unshare (`ippub:`) | 60 calls | 60 minutes |
+| Friend key, `GET /v1/friends/requests` (`keyreq:`) | 60 calls | 60 minutes |
+| IP hash, `GET /v1/friends/requests` (`ipreq:`), when `CF-Connecting-IP` is present | 60 calls | 60 minutes |
+| Friend key, `GET /v1/friends/list` (`keylist:`) | 60 calls | 60 minutes |
+| IP hash, `GET /v1/friends/list` (`iplist:`), when `CF-Connecting-IP` is present | 60 calls | 60 minutes |
 
 Either lookup limit returns `rate_limited`. The window is from the first counted lookup in the current window. `Retry-After` is the seconds left in that window. After the window, the next lookup starts at 1.
 
-The 8-guess per-key limit is easy to get around by rotating friend keys. The 24-per-hour per-IP limit is the real control. `getCode` and `publishRound` do not spend either guess counter. They use their own per-IP objects on the same `FriendGuessLimiter` class and the same `FRIEND_GUESSES` binding.
+The 8-guess per-key limit is easy to get around by rotating friend keys. The 24-per-hour per-IP limit is the real control. `getCode` and `publishRound` do not spend either guess counter. They use their own per-IP objects on the same `FriendGuessLimiter` class and the same `FRIEND_GUESSES` binding. `GET /v1/friends/requests` and `GET /v1/friends/list` do not spend those counters either. Each has its own per-key object and its own per-IP object on that same class. The limit on those objects is 60 per 60 minutes, the same budget as `publishRound`.
 
 The object supports three operations. Only `attempt` is used by lookup. The other two exist so a later step can clear or stop a guesser without an eventually consistent counter:
 
@@ -302,7 +359,7 @@ Friend rows use the `fr:` prefix only. The keys this API writes are:
 - `fr:block:<blocker>:<blocked>` — the caller's block. The value is `1`.
 - `fr:rounds:<ownerId>` — JSON array of that owner's shared rounds, one value, `expirationTtl` of 365 days. This replaces per-round `fr:round:<owner>:<id>` keys.
 
-None of these routes read or write `id:`, `name:`, `osm:`, `gq:`, `gapi:`, `gqueue:`, `gca:`, or `cr:`. Board `GET`, `PUT`, and `DELETE` reserve the `fr:` prefix and return `400` with no KV read or write. That includes a percent-encoded path (`fr%3A` and `fr%3a`), so a board path cannot read, replace, or forge a friend row. Guess counts live in the Durable Object, not in KV.
+None of these routes read or write `id:`, `name:`, `osm:`, `gq:`, `gapi:`, `gqueue:`, `gca:`, or `cr:`. `GET /v1/friends/requests` and `GET /v1/friends/list` do not `put` or `delete` any KV key. The only mutation on those calls is the Durable Object attempt counter. Board `GET`, `PUT`, and `DELETE` reserve the `fr:` prefix and return `400` with no KV read or write. That includes a percent-encoded path (`fr%3A` and `fr%3a`), so a board path cannot read, replace, or forge a friend row. Guess counts live in the Durable Object, not in KV.
 
 ## Phone draft differences
 
@@ -315,6 +372,8 @@ ShotTraxx PR #533 `src/domain/friendsApi.ts` returns `FriendsApiResult` on every
 | `getCode()` | `POST /v1/friends/code` → `{ code, ownerId }` |
 | `resetCode()` | `POST /v1/friends/code/reset` → `{ code, ownerId }` |
 | `sendRequest({ code, name })` | `POST /v1/friends/requests` with `{ code }` only |
+| `listRequests()` | `GET /v1/friends/requests` → `{ incoming, outgoing }`. Not in the cited phone draft. The client should add it. |
+| `listFriends()` | `GET /v1/friends/list` → `{ friends }`. Not in the cited phone draft. The client should add it. |
 | `accept({ id, name })` | `POST /v1/friends/requests/accept` with `{ ownerId }` only |
 | `remove(id)` | `POST /v1/friends/remove` with `{ ownerId }` |
 | `block(id)` | `POST /v1/friends/block` with `{ ownerId }` |
