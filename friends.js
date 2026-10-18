@@ -739,9 +739,12 @@ async function indexOnCreate(boards, recipientOwnerId, requesterOwnerId) {
 }
 
 async function indexOnAccept(boards, recipientOwnerId, requesterOwnerId) {
-  await deletePairIndex(boards, recipientOwnerId, requesterOwnerId);
+  // Backfill an owner who has no ready marker before deleting this pair.
+  // The fr:req row is already gone. A list that still returns it would put
+  // the pair key again, and the delete below removes that put.
   await backfillOwner(boards, recipientOwnerId);
   await backfillOwner(boards, requesterOwnerId);
+  await deletePairIndex(boards, recipientOwnerId, requesterOwnerId);
 }
 
 async function deletePendingRow(boards, recipientOwnerId, requesterOwnerId) {
@@ -755,17 +758,17 @@ async function deletePendingRow(boards, recipientOwnerId, requesterOwnerId) {
 async function declinePendingRequest(boards, recipientOwnerId, requesterOwnerId) {
   const removed = await deletePendingRow(boards, recipientOwnerId, requesterOwnerId);
   if (!removed) return;
-  await deletePairIndex(boards, recipientOwnerId, requesterOwnerId);
   await backfillOwner(boards, recipientOwnerId);
   await backfillOwner(boards, requesterOwnerId);
+  await deletePairIndex(boards, recipientOwnerId, requesterOwnerId);
 }
 
 async function cancelPendingRequest(boards, requesterOwnerId, recipientOwnerId) {
   const removed = await deletePendingRow(boards, recipientOwnerId, requesterOwnerId);
   if (!removed) return;
-  await deletePairIndex(boards, recipientOwnerId, requesterOwnerId);
   await backfillOwner(boards, requesterOwnerId);
   await backfillOwner(boards, recipientOwnerId);
+  await deletePairIndex(boards, recipientOwnerId, requesterOwnerId);
 }
 
 async function readIncomingRequest(boards, callerOwnerId, requesterOwnerId) {

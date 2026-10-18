@@ -874,4 +874,101 @@ describe("friend request index", () => {
     const caughtUp = await viaEntry("/v1/friends/requests", { friend: to.key });
     expect(caughtUp.json.incoming.map((entry) => entry.ownerId).sort()).toEqual([from.ownerId, stable].sort());
   });
+
+  it("leaves no mock pair key when a lagged fr:req list still shows a deleted row", async () => {
+    async function withLaggingRequest(reqKey, run) {
+      const boards = env.BOARDS;
+      env.BOARDS = {
+        ...boards,
+        async list(options = {}) {
+          const page = await boards.list(options);
+          const prefix = typeof options.prefix === "string" ? options.prefix : "";
+          if (!reqKey.startsWith(prefix) || page.keys.some((item) => item.name === reqKey)) return page;
+          return { ...page, keys: [...page.keys, { name: reqKey }] };
+        },
+      };
+      const seen = watchKv();
+      try {
+        await run();
+      } finally {
+        env.BOARDS = boards;
+      }
+      return seen;
+    }
+
+    function expectPairClearedAfterLag(seen, inKey, outKey) {
+      expect(opAt(seen, "put", inKey)).toBeGreaterThanOrEqual(0);
+      expect(opAt(seen, "put", outKey)).toBeGreaterThanOrEqual(0);
+      expect(opAt(seen, "put", inKey)).toBeLessThan(opAt(seen, "delete", inKey));
+      expect(opAt(seen, "put", outKey)).toBeLessThan(opAt(seen, "delete", outKey));
+      expect(kv.has(inKey)).toBe(false);
+      expect(kv.has(outKey)).toBe(false);
+    }
+
+    const acceptCaller = await mint("lagdel-acc-caller");
+    const acceptRequester = await mint("lagdel-acc-req");
+    const acceptOlder = mockOwner("LagDelAccOld");
+    const acceptReq = `fr:req:${acceptCaller.ownerId}:${acceptRequester.ownerId}`;
+    const acceptIn = `fr:ridx:in:${acceptCaller.ownerId}:${acceptRequester.ownerId}`;
+    const acceptOut = `fr:ridx:out:${acceptRequester.ownerId}:${acceptCaller.ownerId}`;
+    kv.set(acceptReq, { value: "pending" });
+    kv.set(`fr:req:${acceptCaller.ownerId}:${acceptOlder}`, { value: "pending" });
+    kv.set(`fr:req:${acceptOlder}:${acceptRequester.ownerId}`, { value: "pending" });
+    const acceptSeen = await withLaggingRequest(acceptReq, async () => {
+      const accepted = await viaEntry("/v1/friends/requests/accept", {
+        method: "POST",
+        friend: acceptCaller.key,
+        body: { ownerId: acceptRequester.ownerId },
+      });
+      expect(accepted.json).toEqual({ status: "friends", ownerId: acceptRequester.ownerId });
+    });
+    expectPairClearedAfterLag(acceptSeen, acceptIn, acceptOut);
+    expect(kv.get(`fr:ridx:in:${acceptCaller.ownerId}:${acceptOlder}`).value).toBe("1");
+    expect(kv.get(`fr:ridx:out:${acceptRequester.ownerId}:${acceptOlder}`).value).toBe("1");
+    expect(kv.get(`fr:ridx:ready:${acceptCaller.ownerId}`).value).toBe("1");
+    expect(kv.get(`fr:ridx:ready:${acceptRequester.ownerId}`).value).toBe("1");
+    expect(kv.has(acceptReq)).toBe(false);
+
+    const declineCaller = await mint("lagdel-dec-caller");
+    const declineOther = await mint("lagdel-dec-other");
+    const declineOlder = mockOwner("LagDelDecOld");
+    plantFriends(declineCaller.ownerId, declineOther.ownerId);
+    const declineReq = `fr:req:${declineCaller.ownerId}:${declineOther.ownerId}`;
+    const declineIn = `fr:ridx:in:${declineCaller.ownerId}:${declineOther.ownerId}`;
+    const declineOut = `fr:ridx:out:${declineOther.ownerId}:${declineCaller.ownerId}`;
+    kv.set(declineReq, { value: "pending" });
+    kv.set(`fr:req:${declineCaller.ownerId}:${declineOlder}`, { value: "pending" });
+    const declineSeen = await withLaggingRequest(declineReq, async () => {
+      expect((await viaEntry("/v1/friends/block", {
+        method: "POST",
+        friend: declineCaller.key,
+        body: { ownerId: declineOther.ownerId },
+      })).json).toEqual({ ok: true });
+    });
+    expectPairClearedAfterLag(declineSeen, declineIn, declineOut);
+    expect(kv.has(declineReq)).toBe(false);
+    expect(kv.get(`fr:ridx:in:${declineCaller.ownerId}:${declineOlder}`).value).toBe("1");
+    expect(kv.get(`fr:ridx:ready:${declineCaller.ownerId}`).value).toBe("1");
+
+    const cancelCaller = await mint("lagdel-can-caller");
+    const cancelOther = await mint("lagdel-can-other");
+    const cancelOlder = mockOwner("LagDelCanOld");
+    plantFriends(cancelCaller.ownerId, cancelOther.ownerId);
+    const cancelReq = `fr:req:${cancelOther.ownerId}:${cancelCaller.ownerId}`;
+    const cancelIn = `fr:ridx:in:${cancelOther.ownerId}:${cancelCaller.ownerId}`;
+    const cancelOut = `fr:ridx:out:${cancelCaller.ownerId}:${cancelOther.ownerId}`;
+    kv.set(cancelReq, { value: "pending" });
+    kv.set(`fr:req:${cancelOlder}:${cancelCaller.ownerId}`, { value: "pending" });
+    const cancelSeen = await withLaggingRequest(cancelReq, async () => {
+      expect((await viaEntry("/v1/friends/block", {
+        method: "POST",
+        friend: cancelCaller.key,
+        body: { ownerId: cancelOther.ownerId },
+      })).json).toEqual({ ok: true });
+    });
+    expectPairClearedAfterLag(cancelSeen, cancelIn, cancelOut);
+    expect(kv.has(cancelReq)).toBe(false);
+    expect(kv.get(`fr:ridx:out:${cancelCaller.ownerId}:${cancelOlder}`).value).toBe("1");
+    expect(kv.get(`fr:ridx:ready:${cancelCaller.ownerId}`).value).toBe("1");
+  });
 });
