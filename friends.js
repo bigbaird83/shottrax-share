@@ -12,8 +12,11 @@
  * block. Block requires a friendship and stores the block row before it
  * deletes that friendship. Remove and block delete only the caller's shared
  * rounds. One fr:rounds: value holds an owner's rounds. One fr:friends:
- * value is that owner's list. A pending request row is the string "pending"
- * and has no display name or created time. A quiet-block send writes
+ * value is that owner's list. One fr:reqix: value is that owner's request
+ * index: incoming and outgoing owner ids for fr:req: rows. A missing index
+ * is the pre-index state. listRequests scans fr:req: then and does not write
+ * the index. A pending request row is the string "pending" and has no
+ * display name or created time. A quiet-block send writes
  * fr:out:<sender>:<recipient> = pending for that sender's outgoing list
  * only. It is not a request, it has no TTL, and unblock does not promote it.
  */
@@ -294,10 +297,13 @@ async function sendRequest(request, env, cors) {
   const pending = await friendGet(boards, reqKey);
   if (typeof pending === "string" && pending.length > 0) {
     await deleteOutgoingNote(boards, caller.ownerId, ownerId);
+    // The row is already stored. Remembering it backfills a missing index.
+    await rememberRequest(boards, ownerId, caller.ownerId);
     return friendJson(200, { status: "pending", ownerId }, cors);
   }
   await friendPut(boards, reqKey, "pending");
   await deleteOutgoingNote(boards, caller.ownerId, ownerId);
+  await rememberRequest(boards, ownerId, caller.ownerId);
   return friendJson(200, { status: "pending", ownerId }, cors);
 }
 
@@ -335,10 +341,14 @@ async function acceptRequest(request, env, cors) {
   await friendPut(boards, friendKvKey("friend", `${ownerId}:${caller.ownerId}`), "1");
   await saveFriendIds(boards, caller.ownerId, addFriendId(callerIds, ownerId));
   await saveFriendIds(boards, ownerId, addFriendId(otherIds, caller.ownerId));
-  // Drop a leftover sender note before the request row. A retry can still
-  // see fr:req: if this delete fails. The note is not read and not accepted.
+  // Drop leftover sender notes before the request row. A retry can still
+  // see fr:req: if a delete fails. Neither note is read, and neither is accepted.
+  // fr:out:<requester>:<caller> is the requester's note. fr:out:<caller>:<requester>
+  // is the caller's own note from when the requester had blocked them.
   await deleteOutgoingNote(boards, ownerId, caller.ownerId);
+  await deleteOutgoingNote(boards, caller.ownerId, ownerId);
   await friendDelete(boards, reqKey);
+  await forgetRequest(boards, caller.ownerId, ownerId);
   return friendJson(200, { status: "friends", ownerId }, cors);
 }
 
@@ -355,8 +365,10 @@ async function blockPerson(request, env, cors) {
   await friendDelete(boards, friendKvKey("friend", `${ownerId}:${caller.ownerId}`));
   await saveFriendIds(boards, caller.ownerId, removeFriendId(await loadFriendIds(boards, caller.ownerId), ownerId));
   await saveFriendIds(boards, ownerId, removeFriendId(await loadFriendIds(boards, ownerId), caller.ownerId));
-  await deleteIfPresent(boards, requestKey(ownerId, caller.ownerId));
-  await deleteIfPresent(boards, requestKey(caller.ownerId, ownerId));
+  const droppedForward = await deleteIfPresent(boards, requestKey(ownerId, caller.ownerId));
+  const droppedReverse = await deleteIfPresent(boards, requestKey(caller.ownerId, ownerId));
+  // No request row deleted: leave fr:reqix: alone, including a missing index.
+  if (droppedForward || droppedReverse) await forgetBothRequestDirections(boards, caller.ownerId, ownerId);
   await deleteOwnedRounds(boards, caller.ownerId);
   return friendJson(200, { ok: true }, cors);
 }
@@ -432,26 +444,43 @@ async function listRequests(request, env, cors) {
   if (typeof boards.list !== "function") return friendJson(503, { error: "boards_not_configured" }, cors);
   const limited = await consumeReadLimit(request, env, friendKey, "keyreq:", "ipreq:", cors);
   if (limited) return limited;
-  // The requester id is the key suffix, so outgoing fr:req: rows are not a
-  // prefix. One fr:req: scan feeds incoming and real outgoing. A quiet-block
-  // note lives at fr:out:<sender>:<recipient> and is listed only for that
-  // sender. Do not invent a row from fr:block:*:<caller>: a block without a
-  // send is not a request, and reading those block rows would reveal it.
-  const names = await listKeysByPrefix(boards, "fr:req:");
+  // fr:reqix:<caller> names this caller's fr:req: rows. A missing or unusable
+  // value is the pre-index state: scan fr:req: and do not write the index.
+  // A quiet-block note lives at fr:out:<sender>:<recipient> and is listed only
+  // for that sender. Do not invent a row from fr:block:*:<caller>: a block
+  // without a send is not a request, and reading those block rows would reveal it.
+  const index = await loadRequestIndex(boards, caller.ownerId);
   const incoming = [];
   const outgoing = [];
-  for (const name of names) {
-    const parsed = parseRequestKey(name);
-    if (!parsed || parsed.recipient === parsed.requester) continue;
-    if (parsed.recipient === caller.ownerId) {
-      const raw = await friendGet(boards, name);
+  if (index) {
+    for (const requester of index.incoming) {
+      if (requester === caller.ownerId) continue;
+      const raw = await friendGet(boards, requestKey(caller.ownerId, requester));
       if (typeof raw !== "string" || raw.length === 0) continue;
-      if (await hasBlock(boards, caller.ownerId, parsed.requester)) continue;
-      incoming.push({ ownerId: parsed.requester });
-    } else if (parsed.requester === caller.ownerId) {
-      const raw = await friendGet(boards, name);
+      if (await hasBlock(boards, caller.ownerId, requester)) continue;
+      incoming.push({ ownerId: requester });
+    }
+    for (const recipient of index.outgoing) {
+      if (recipient === caller.ownerId) continue;
+      const raw = await friendGet(boards, requestKey(recipient, caller.ownerId));
       if (typeof raw !== "string" || raw.length === 0) continue;
-      outgoing.push({ ownerId: parsed.recipient });
+      outgoing.push({ ownerId: recipient });
+    }
+  } else {
+    const names = await listKeysByPrefix(boards, "fr:req:");
+    for (const name of names) {
+      const parsed = parseRequestKey(name);
+      if (!parsed || parsed.recipient === parsed.requester) continue;
+      if (parsed.recipient === caller.ownerId) {
+        const raw = await friendGet(boards, name);
+        if (typeof raw !== "string" || raw.length === 0) continue;
+        if (await hasBlock(boards, caller.ownerId, parsed.requester)) continue;
+        incoming.push({ ownerId: parsed.requester });
+      } else if (parsed.requester === caller.ownerId) {
+        const raw = await friendGet(boards, name);
+        if (typeof raw !== "string" || raw.length === 0) continue;
+        outgoing.push({ ownerId: parsed.recipient });
+      }
     }
   }
   const noteNames = await listKeysByPrefix(boards, `fr:out:${caller.ownerId}:`);
@@ -634,6 +663,158 @@ async function deleteOutgoingNote(boards, senderOwnerId, recipientOwnerId) {
   await friendDelete(boards, outgoingNoteKey(senderOwnerId, recipientOwnerId));
 }
 
+function emptyRequestIndex() {
+  return { incoming: [], outgoing: [] };
+}
+
+function cleanIndexIds(items) {
+  const ids = [];
+  const seen = new Set();
+  for (const item of items) {
+    if (typeof item !== "string" || !OWNER_ID_RE.test(item) || seen.has(item)) continue;
+    seen.add(item);
+    ids.push(item);
+  }
+  return ids;
+}
+
+function parseRequestIndex(raw) {
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  if (unknownFields(parsed, ["incoming", "outgoing"])) return null;
+  if (!Array.isArray(parsed.incoming) || !Array.isArray(parsed.outgoing)) return null;
+  return {
+    incoming: cleanIndexIds(parsed.incoming),
+    outgoing: cleanIndexIds(parsed.outgoing),
+  };
+}
+
+function storedRequestIndex(ownerId, index) {
+  return {
+    incoming: cleanIndexIds(index.incoming).filter((id) => id !== ownerId),
+    outgoing: cleanIndexIds(index.outgoing).filter((id) => id !== ownerId),
+  };
+}
+
+function requestIndexEqual(left, right) {
+  return sameIdList(left.incoming, right.incoming) && sameIdList(left.outgoing, right.outgoing);
+}
+
+function sameIdList(left, right) {
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i += 1) if (left[i] !== right[i]) return false;
+  return true;
+}
+
+async function loadRequestIndex(boards, ownerId) {
+  return parseRequestIndex(await friendGet(boards, friendKvKey("reqix", ownerId)));
+}
+
+async function saveRequestIndex(boards, ownerId, index) {
+  const stored = storedRequestIndex(ownerId, index);
+  await friendPut(boards, friendKvKey("reqix", ownerId), JSON.stringify(stored));
+}
+
+async function backfillRequestIndexes(boards, ownerIds) {
+  const wanted = new Set(ownerIds);
+  const built = new Map();
+  for (const ownerId of ownerIds) built.set(ownerId, emptyRequestIndex());
+  const names = await listKeysByPrefix(boards, "fr:req:");
+  for (const name of names) {
+    const parsed = parseRequestKey(name);
+    if (!parsed || parsed.recipient === parsed.requester) continue;
+    if (wanted.has(parsed.recipient)) {
+      const index = built.get(parsed.recipient);
+      index.incoming = addFriendId(index.incoming, parsed.requester);
+    }
+    if (wanted.has(parsed.requester)) {
+      const index = built.get(parsed.requester);
+      index.outgoing = addFriendId(index.outgoing, parsed.recipient);
+    }
+  }
+  return built;
+}
+
+// Create a missing index from every live fr:req: key. A present index is
+// updated in place and is not rebuilt, so a fallback scan cannot be skipped
+// by a partial index that never saw older rows.
+async function withRequestIndexes(boards, leftOwnerId, rightOwnerId, mutate) {
+  const loadedLeft = await loadRequestIndex(boards, leftOwnerId);
+  const loadedRight = await loadRequestIndex(boards, rightOwnerId);
+  let leftIndex = loadedLeft;
+  let rightIndex = loadedRight;
+  if (!leftIndex || !rightIndex) {
+    if (typeof boards.list !== "function") {
+      const partial = mutate(leftIndex || emptyRequestIndex(), rightIndex || emptyRequestIndex());
+      if (loadedLeft && !requestIndexEqual(storedRequestIndex(leftOwnerId, loadedLeft), storedRequestIndex(leftOwnerId, partial.left))) {
+        await saveRequestIndex(boards, leftOwnerId, partial.left);
+      }
+      if (loadedRight && !requestIndexEqual(storedRequestIndex(rightOwnerId, loadedRight), storedRequestIndex(rightOwnerId, partial.right))) {
+        await saveRequestIndex(boards, rightOwnerId, partial.right);
+      }
+      return;
+    }
+    const missing = [];
+    if (!leftIndex) missing.push(leftOwnerId);
+    if (!rightIndex) missing.push(rightOwnerId);
+    const built = await backfillRequestIndexes(boards, missing);
+    if (!leftIndex) leftIndex = built.get(leftOwnerId);
+    if (!rightIndex) rightIndex = built.get(rightOwnerId);
+  }
+  const next = mutate(leftIndex, rightIndex);
+  if (!loadedLeft || !requestIndexEqual(storedRequestIndex(leftOwnerId, loadedLeft), storedRequestIndex(leftOwnerId, next.left))) {
+    await saveRequestIndex(boards, leftOwnerId, next.left);
+  }
+  if (!loadedRight || !requestIndexEqual(storedRequestIndex(rightOwnerId, loadedRight), storedRequestIndex(rightOwnerId, next.right))) {
+    await saveRequestIndex(boards, rightOwnerId, next.right);
+  }
+}
+
+async function rememberRequest(boards, recipientOwnerId, requesterOwnerId) {
+  await withRequestIndexes(boards, recipientOwnerId, requesterOwnerId, (recipientIndex, requesterIndex) => ({
+    left: {
+      incoming: addFriendId(recipientIndex.incoming, requesterOwnerId),
+      outgoing: recipientIndex.outgoing,
+    },
+    right: {
+      incoming: requesterIndex.incoming,
+      outgoing: addFriendId(requesterIndex.outgoing, recipientOwnerId),
+    },
+  }));
+}
+
+async function forgetRequest(boards, recipientOwnerId, requesterOwnerId) {
+  await withRequestIndexes(boards, recipientOwnerId, requesterOwnerId, (recipientIndex, requesterIndex) => ({
+    left: {
+      incoming: removeFriendId(recipientIndex.incoming, requesterOwnerId),
+      outgoing: recipientIndex.outgoing,
+    },
+    right: {
+      incoming: requesterIndex.incoming,
+      outgoing: removeFriendId(requesterIndex.outgoing, recipientOwnerId),
+    },
+  }));
+}
+
+async function forgetBothRequestDirections(boards, leftOwnerId, rightOwnerId) {
+  await withRequestIndexes(boards, leftOwnerId, rightOwnerId, (leftIndex, rightIndex) => ({
+    left: {
+      incoming: removeFriendId(leftIndex.incoming, rightOwnerId),
+      outgoing: removeFriendId(leftIndex.outgoing, rightOwnerId),
+    },
+    right: {
+      incoming: removeFriendId(rightIndex.incoming, leftOwnerId),
+      outgoing: removeFriendId(rightIndex.outgoing, leftOwnerId),
+    },
+  }));
+}
+
 async function hasBlock(boards, blockerOwnerId, blockedOwnerId) {
   const raw = await friendGet(boards, friendKvKey("block", `${blockerOwnerId}:${blockedOwnerId}`));
   return typeof raw === "string" && raw.length > 0;
@@ -800,7 +981,9 @@ function compareRounds(left, right) {
 
 async function deleteIfPresent(boards, key) {
   const raw = await friendGet(boards, key);
-  if (typeof raw === "string" && raw.length > 0) await friendDelete(boards, key);
+  if (typeof raw !== "string" || raw.length === 0) return false;
+  await friendDelete(boards, key);
+  return true;
 }
 
 async function deleteOwnedRounds(boards, ownerId) {
@@ -919,6 +1102,7 @@ function friendKvKey(kind, id) {
     kind !== "k" &&
     kind !== "code" &&
     kind !== "req" &&
+    kind !== "reqix" &&
     kind !== "out" &&
     kind !== "friend" &&
     kind !== "friends" &&
