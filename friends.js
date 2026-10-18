@@ -16,11 +16,13 @@
  * and has no display name or created time. A quiet-block send writes
  * fr:out:<sender>:<recipient> = pending for that sender's outgoing list
  * only. It is not a request, it has no TTL, and unblock does not promote it.
- * fr:ridx:<ownerId> is that owner's pending-request index ({ in, out }).
- * listRequests reads it and does not scan fr:req:. A missing index falls
- * back to that scan and is not written on read. Create, accept, decline,
- * and cancel keep the index. Decline and cancel are not routes: block
- * declines an incoming pending row and cancels an outgoing one.
+ * Pending requests are indexed one key per pair: fr:ridx:in:<owner>:<other>
+ * and fr:ridx:out:<owner>:<other>. Those keys are put and deleted. They are
+ * not read-modify-written. fr:ridx:ready:<owner> is written last, after a
+ * backfill scan for that owner. listRequests lists the caller's pair-key
+ * prefixes when the marker is present, and otherwise scans fr:req:. The
+ * read does not write. Decline and cancel are not routes: block declines
+ * an incoming pending row and cancels an outgoing one.
  */
 
 export const FRIEND_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -292,6 +294,9 @@ async function sendRequest(request, env, cors) {
     return friendJson(200, { status: "pending", ownerId }, cors);
   }
   if (await areFriends(boards, caller.ownerId, ownerId)) {
+    // Already friends. Delete the note only. Do not write pair-index keys:
+    // there is no pending row to publish, and a put here would be a write
+    // the 1,000/day budget does not need.
     await deleteOutgoingNote(boards, caller.ownerId, ownerId);
     return friendJson(200, { status: "friends", ownerId }, cors);
   }
@@ -299,12 +304,16 @@ async function sendRequest(request, env, cors) {
   const pending = await friendGet(boards, reqKey);
   if (typeof pending === "string" && pending.length > 0) {
     await deleteOutgoingNote(boards, caller.ownerId, ownerId);
+    // Repair pair keys when the row was stored without them (repeat send
+    // after a failed index put, a rollback, or deploy overlap).
     await indexOnCreate(boards, ownerId, caller.ownerId);
     return friendJson(200, { status: "pending", ownerId }, cors);
   }
+  // Pair keys before the request row. A failed index put leaves no fr:req
+  // to hide. KV list can lag a new key by about 60s; the key is still stored.
+  await indexOnCreate(boards, ownerId, caller.ownerId);
   await friendPut(boards, reqKey, "pending");
   await deleteOutgoingNote(boards, caller.ownerId, ownerId);
-  await indexOnCreate(boards, ownerId, caller.ownerId);
   return friendJson(200, { status: "pending", ownerId }, cors);
 }
 
@@ -446,22 +455,27 @@ async function listRequests(request, env, cors) {
   if (typeof boards.list !== "function") return friendJson(503, { error: "boards_not_configured" }, cors);
   const limited = await consumeReadLimit(request, env, friendKey, "keyreq:", "ipreq:", cors);
   if (limited) return limited;
-  // fr:ridx:<caller> names this caller's pending rows, so a fr:req: scan is
-  // not required. The requester id is the key suffix, so that scan is the
-  // fallback when the index was never written (rows from before this
-  // deploy). The read does not backfill. A quiet-block note lives at
-  // fr:out:<sender>:<recipient> and is listed only for that sender. Do not
-  // invent a row from fr:block:*:<caller>: a block without a send is not a
-  // request, and reading those block rows would reveal it.
-  const index = parseRequestIndex(await friendGet(boards, requestIndexKey(caller.ownerId)));
+  // fr:ridx:ready:<caller> means this owner's pair keys were backfilled.
+  // Until that marker exists, scan fr:req: so a pre-deploy row, a partial
+  // backfill, or a row stored without its pair key is still listed. The
+  // read does not write the marker or the pair keys. A quiet-block note
+  // lives at fr:out:<sender>:<recipient> and is listed only for that
+  // sender. Do not invent a row from fr:block:*:<caller>.
+  const readyMarker = await friendGet(boards, readyKey(caller.ownerId));
   const incoming = [];
   const outgoing = [];
-  if (index) {
-    for (const requester of index.in) {
+  if (typeof readyMarker === "string" && readyMarker.length > 0) {
+    const inPrefix = `fr:ridx:in:${caller.ownerId}:`;
+    const outPrefix = `fr:ridx:out:${caller.ownerId}:`;
+    for (const name of await listKeysByPrefix(boards, inPrefix)) {
+      const requester = pairOwnerFromKey(name, inPrefix);
+      if (!requester) continue;
       const entry = await readIncomingRequest(boards, caller.ownerId, requester);
       if (entry) incoming.push(entry);
     }
-    for (const recipient of index.out) {
+    for (const name of await listKeysByPrefix(boards, outPrefix)) {
+      const recipient = pairOwnerFromKey(name, outPrefix);
+      if (!recipient) continue;
       const entry = await readOutgoingRequest(boards, caller.ownerId, recipient);
       if (entry) outgoing.push(entry);
     }
@@ -659,93 +673,75 @@ async function deleteOutgoingNote(boards, senderOwnerId, recipientOwnerId) {
   await friendDelete(boards, outgoingNoteKey(senderOwnerId, recipientOwnerId));
 }
 
-function requestIndexKey(ownerId) {
+function readyKey(ownerId) {
+  return friendKvKey("ridx", `ready:${ownerId}`);
+}
+
+function incomingIndexKey(ownerId, otherId) {
+  return friendKvKey("ridx", `in:${ownerId}:${otherId}`);
+}
+
+function outgoingIndexKey(ownerId, otherId) {
+  return friendKvKey("ridx", `out:${ownerId}:${otherId}`);
+}
+
+function legacyIndexBlobKey(ownerId) {
   return friendKvKey("ridx", ownerId);
 }
 
-function parseRequestIndex(raw) {
-  if (typeof raw !== "string" || raw.length === 0) return null;
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-  if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-  if (!Array.isArray(parsed.in) || !Array.isArray(parsed.out)) return null;
-  if (Object.keys(parsed).some((key) => key !== "in" && key !== "out")) return null;
-  return {
-    in: parsed.in.filter((id) => typeof id === "string"),
-    out: parsed.out.filter((id) => typeof id === "string"),
-  };
+function pairOwnerFromKey(name, prefix) {
+  if (typeof name !== "string" || !name.startsWith(prefix)) return null;
+  const other = name.slice(prefix.length);
+  if (!OWNER_ID_RE.test(other)) return null;
+  return other;
 }
 
-function dedupeOwnerIds(ids, ownerId) {
-  const seen = new Set();
-  const out = [];
-  for (const id of ids) {
-    if (!OWNER_ID_RE.test(id) || id === ownerId || seen.has(id)) continue;
-    seen.add(id);
-    out.push(id);
-  }
-  return out;
+async function hasReadyMarker(boards, ownerId) {
+  const raw = await friendGet(boards, readyKey(ownerId));
+  return typeof raw === "string" && raw.length > 0;
 }
 
-function copyRequestIndex(ownerId, index) {
-  return {
-    in: dedupeOwnerIds(index.in, ownerId),
-    out: dedupeOwnerIds(index.out, ownerId),
-  };
+async function putIndexFlag(boards, key) {
+  const existing = await friendGet(boards, key);
+  if (typeof existing === "string" && existing.length > 0) return;
+  await friendPut(boards, key, "1");
 }
 
-async function backfillRequestIndex(boards, ownerId) {
+async function ensurePairIndex(boards, recipientOwnerId, requesterOwnerId) {
+  await putIndexFlag(boards, incomingIndexKey(recipientOwnerId, requesterOwnerId));
+  await putIndexFlag(boards, outgoingIndexKey(requesterOwnerId, recipientOwnerId));
+}
+
+async function deletePairIndex(boards, recipientOwnerId, requesterOwnerId) {
+  await friendDelete(boards, incomingIndexKey(recipientOwnerId, requesterOwnerId));
+  await friendDelete(boards, outgoingIndexKey(requesterOwnerId, recipientOwnerId));
+}
+
+async function backfillOwner(boards, ownerId) {
+  if (await hasReadyMarker(boards, ownerId)) return;
   const names = await listKeysByPrefix(boards, "fr:req:");
-  const incoming = [];
-  const outgoing = [];
   for (const name of names) {
     const parsed = parseRequestKey(name);
     if (!parsed || parsed.recipient === parsed.requester) continue;
-    if (parsed.recipient === ownerId) incoming.push(parsed.requester);
-    else if (parsed.requester === ownerId) outgoing.push(parsed.recipient);
+    if (parsed.recipient === ownerId) await putIndexFlag(boards, incomingIndexKey(ownerId, parsed.requester));
+    else if (parsed.requester === ownerId) await putIndexFlag(boards, outgoingIndexKey(ownerId, parsed.recipient));
   }
-  return { in: incoming, out: outgoing };
-}
-
-async function indexForWrite(boards, ownerId) {
-  const existing = parseRequestIndex(await friendGet(boards, requestIndexKey(ownerId)));
-  if (existing) return { index: copyRequestIndex(ownerId, existing), fresh: false };
-  const filled = await backfillRequestIndex(boards, ownerId);
-  return { index: copyRequestIndex(ownerId, filled), fresh: true };
-}
-
-async function saveRequestIndex(boards, ownerId, index) {
-  const body = JSON.stringify(copyRequestIndex(ownerId, index));
-  await friendPut(boards, requestIndexKey(ownerId), body);
-}
-
-async function indexAddSide(boards, ownerId, side, otherId) {
-  const loaded = await indexForWrite(boards, ownerId);
-  const changed = loaded.fresh || !loaded.index[side].includes(otherId);
-  if (!loaded.index[side].includes(otherId)) loaded.index[side].push(otherId);
-  if (changed) await saveRequestIndex(boards, ownerId, loaded.index);
-}
-
-async function indexRemoveSide(boards, ownerId, side, otherId) {
-  const loaded = await indexForWrite(boards, ownerId);
-  const next = loaded.index[side].filter((id) => id !== otherId);
-  const changed = loaded.fresh || next.length !== loaded.index[side].length;
-  loaded.index[side] = next;
-  if (changed) await saveRequestIndex(boards, ownerId, loaded.index);
+  // Old single-blob index. Ignored on read. Drop it only after the pair
+  // keys above have been put, and before the ready marker.
+  await deleteIfPresent(boards, legacyIndexBlobKey(ownerId));
+  await friendPut(boards, readyKey(ownerId), "1");
 }
 
 async function indexOnCreate(boards, recipientOwnerId, requesterOwnerId) {
-  await indexAddSide(boards, recipientOwnerId, "in", requesterOwnerId);
-  await indexAddSide(boards, requesterOwnerId, "out", recipientOwnerId);
+  await backfillOwner(boards, recipientOwnerId);
+  await backfillOwner(boards, requesterOwnerId);
+  await ensurePairIndex(boards, recipientOwnerId, requesterOwnerId);
 }
 
 async function indexOnAccept(boards, recipientOwnerId, requesterOwnerId) {
-  await indexRemoveSide(boards, recipientOwnerId, "in", requesterOwnerId);
-  await indexRemoveSide(boards, requesterOwnerId, "out", recipientOwnerId);
+  await deletePairIndex(boards, recipientOwnerId, requesterOwnerId);
+  await backfillOwner(boards, recipientOwnerId);
+  await backfillOwner(boards, requesterOwnerId);
 }
 
 async function deletePendingRow(boards, recipientOwnerId, requesterOwnerId) {
@@ -759,15 +755,17 @@ async function deletePendingRow(boards, recipientOwnerId, requesterOwnerId) {
 async function declinePendingRequest(boards, recipientOwnerId, requesterOwnerId) {
   const removed = await deletePendingRow(boards, recipientOwnerId, requesterOwnerId);
   if (!removed) return;
-  await indexRemoveSide(boards, recipientOwnerId, "in", requesterOwnerId);
-  await indexRemoveSide(boards, requesterOwnerId, "out", recipientOwnerId);
+  await deletePairIndex(boards, recipientOwnerId, requesterOwnerId);
+  await backfillOwner(boards, recipientOwnerId);
+  await backfillOwner(boards, requesterOwnerId);
 }
 
 async function cancelPendingRequest(boards, requesterOwnerId, recipientOwnerId) {
   const removed = await deletePendingRow(boards, recipientOwnerId, requesterOwnerId);
   if (!removed) return;
-  await indexRemoveSide(boards, requesterOwnerId, "out", recipientOwnerId);
-  await indexRemoveSide(boards, recipientOwnerId, "in", requesterOwnerId);
+  await deletePairIndex(boards, recipientOwnerId, requesterOwnerId);
+  await backfillOwner(boards, requesterOwnerId);
+  await backfillOwner(boards, recipientOwnerId);
 }
 
 async function readIncomingRequest(boards, callerOwnerId, requesterOwnerId) {

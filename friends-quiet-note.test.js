@@ -822,7 +822,7 @@ describe("quiet-block sender note", () => {
       outgoing: [{ ownerId: noted }, { ownerId: outgoing }].sort((left, right) => (left.ownerId < right.ownerId ? -1 : 1)),
     });
     expect(counts.seen.get).toHaveLength(2 + 1 + 1 + 1 + 2);
-    expect(counts.seen.get).toContain(`fr:ridx:${caller.ownerId}`);
+    expect(counts.seen.get).toContain(`fr:ridx:ready:${caller.ownerId}`);
     expect(counts.seen.get).not.toContain(`fr:out:${caller.ownerId}:bad`);
     expect(counts.seen.get).not.toContain(`fr:out:${strangerA}:${noted}`);
     expect(counts.seen.get).toContain(`fr:out:${caller.ownerId}:${emptyNote}`);
