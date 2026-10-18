@@ -539,7 +539,7 @@ describe("friend read routes", () => {
       incoming: [{ ownerId: incoming }],
       outgoing: [{ ownerId: outgoing }],
     });
-    expect(requestCounts).toEqual({ get: 4, put: 0, delete: 0, list: 2 });
+    expect(requestCounts).toEqual({ get: 5, put: 0, delete: 0, list: 2 });
 
     const first = "h".repeat(22);
     const second = "j".repeat(22);

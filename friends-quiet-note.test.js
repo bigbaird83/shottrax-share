@@ -821,7 +821,8 @@ describe("quiet-block sender note", () => {
       incoming: [{ ownerId: incoming }],
       outgoing: [{ ownerId: noted }, { ownerId: outgoing }].sort((left, right) => (left.ownerId < right.ownerId ? -1 : 1)),
     });
-    expect(counts.seen.get).toHaveLength(1 + 1 + 1 + 1 + 2);
+    expect(counts.seen.get).toHaveLength(2 + 1 + 1 + 1 + 2);
+    expect(counts.seen.get).toContain(`fr:ridx:${caller.ownerId}`);
     expect(counts.seen.get).not.toContain(`fr:out:${caller.ownerId}:bad`);
     expect(counts.seen.get).not.toContain(`fr:out:${strangerA}:${noted}`);
     expect(counts.seen.get).toContain(`fr:out:${caller.ownerId}:${emptyNote}`);
@@ -878,7 +879,8 @@ describe("quiet-block sender note", () => {
     const readme = readFileSync(new URL("./README.md", import.meta.url), "utf8");
     expect(contract).toContain("`fr:out:<sender>:<recipient>` = `pending`");
     expect(contract).toContain("5 gets and 1 put");
-    expect(contract).toContain("`1 + I + B + O + Q` gets and `P + S` lists");
+    expect(contract).toContain("`2 + I + B + O + Q` gets");
+    expect(contract).toContain("When the index is missing or unusable there are `P + S` lists");
     expect(contract).toContain("No `expirationTtl`");
     expect(contract).toContain("Unblock does not delete the note and does not copy it to `fr:req:`");
     expect(contract).toContain("A fresh `sendRequest` is required");
