@@ -2,14 +2,18 @@
  * Anonymous friend codes. Auth is X-Friend-Key, a random secret the phone
  * generates. It is not an install id and it is not a name. KV rows are fr:
  * only. Guess counts live in FriendGuessLimiter (SQLite Durable Object),
- * one object per friend-key hash and one per IP hash.
+ * one object per friend-key hash and one per IP hash. listRequests and
+ * listFriends use that same class, with their own per-key and per-IP names,
+ * and they do not write KV.
  *
  * Served here: getCode, resetCode, code lookup, sendRequest, accept, block,
- * unblock, remove, publishRound, and fetchRounds. Block is quiet for the
- * blocked person. Unblock deletes only the caller's block. Block requires a
- * friendship and stores the block row before it deletes that friendship.
- * Remove and block delete only the caller's shared rounds. One fr:rounds:
- * value holds an owner's rounds. One fr:friends: value is that owner's list.
+ * unblock, remove, publishRound, fetchRounds, listRequests, and listFriends.
+ * Block is quiet for the blocked person. Unblock deletes only the caller's
+ * block. Block requires a friendship and stores the block row before it
+ * deletes that friendship. Remove and block delete only the caller's shared
+ * rounds. One fr:rounds: value holds an owner's rounds. One fr:friends:
+ * value is that owner's list. A pending request row is the string "pending"
+ * and has no display name or created time.
  */
 
 export const FRIEND_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -17,6 +21,10 @@ export const FRIEND_CODE_GUESS_LIMIT = 8;
 export const FRIEND_IP_GUESS_LIMIT = 24;
 export const FRIEND_GETCODE_IP_LIMIT = 30;
 export const FRIEND_PUBLISH_IP_LIMIT = 60;
+// Screen reads. Same 60-per-hour budget as publish, on separate objects so
+// they do not spend getCode, publish, or code-guess counters.
+export const FRIEND_READ_KEY_LIMIT = 60;
+export const FRIEND_READ_IP_LIMIT = 60;
 export const FRIEND_GUESS_WINDOW_MS = 60 * 60 * 1000;
 export const FRIEND_CAP = 50;
 export const ROUND_CAP = 100;
@@ -54,9 +62,14 @@ export async function limiterNameForFriendKey(friendKey) {
 
 function limitForDurableObjectName(name) {
   // Longer prefixes first. "ipget:" and "ippub:" must not inherit the "ip:" guess cap.
+  // "keyreq:" and "keylist:" must not inherit the 8-guess default.
   if (name.startsWith("ipget:")) return FRIEND_GETCODE_IP_LIMIT;
   if (name.startsWith("ippub:")) return FRIEND_PUBLISH_IP_LIMIT;
+  if (name.startsWith("ipreq:")) return FRIEND_READ_IP_LIMIT;
+  if (name.startsWith("iplist:")) return FRIEND_READ_IP_LIMIT;
   if (name.startsWith("ip:")) return FRIEND_IP_GUESS_LIMIT;
+  if (name.startsWith("keyreq:")) return FRIEND_READ_KEY_LIMIT;
+  if (name.startsWith("keylist:")) return FRIEND_READ_KEY_LIMIT;
   return FRIEND_CODE_GUESS_LIMIT;
 }
 
@@ -168,7 +181,8 @@ const FRIEND_ROUTES = {
   "/v1/friends/code": { POST: getCode },
   "/v1/friends/code/reset": { POST: resetCode },
   "/v1/friends/codes/lookup": { POST: lookupCode },
-  "/v1/friends/requests": { POST: sendRequest },
+  "/v1/friends/requests": { POST: sendRequest, GET: listRequests },
+  "/v1/friends/list": { GET: listFriends },
   "/v1/friends/requests/accept": { POST: acceptRequest },
   "/v1/friends/block": { POST: blockPerson },
   "/v1/friends/unblock": { POST: unblockPerson },
@@ -401,17 +415,65 @@ async function publishRound(request, env, cors) {
   return friendJson(200, { ok: true, id: stored.id }, cors);
 }
 
+async function listRequests(request, env, cors) {
+  const ready = await readyReadCall(request, env, cors);
+  if (ready.error) return ready.error;
+  const { boards, caller, friendKey } = ready;
+  if (typeof boards.list !== "function") return friendJson(503, { error: "boards_not_configured" }, cors);
+  const limited = await consumeReadLimit(request, env, friendKey, "keyreq:", "ipreq:", cors);
+  if (limited) return limited;
+  // The requester id is the key suffix, so outgoing rows are not a prefix.
+  // One fr:req: scan feeds both lists. A quiet-block send stores no row.
+  // Do not invent one from fr:block:*:<caller>: that would reveal the block.
+  const names = await listKeysByPrefix(boards, "fr:req:");
+  const incoming = [];
+  const outgoing = [];
+  for (const name of names) {
+    const parsed = parseRequestKey(name);
+    if (!parsed || parsed.recipient === parsed.requester) continue;
+    if (parsed.recipient === caller.ownerId) {
+      const raw = await friendGet(boards, name);
+      if (typeof raw !== "string" || raw.length === 0) continue;
+      if (await hasBlock(boards, caller.ownerId, parsed.requester)) continue;
+      incoming.push({ ownerId: parsed.requester });
+    } else if (parsed.requester === caller.ownerId) {
+      const raw = await friendGet(boards, name);
+      if (typeof raw !== "string" || raw.length === 0) continue;
+      outgoing.push({ ownerId: parsed.recipient });
+    }
+  }
+  const incomingSorted = dedupeByOwnerId(incoming).sort(compareByOwnerId);
+  const outgoingSorted = dedupeByOwnerId(outgoing).sort(compareByOwnerId);
+  return friendJson(200, { incoming: incomingSorted, outgoing: outgoingSorted }, cors);
+}
+
+async function listFriends(request, env, cors) {
+  const ready = await readyReadCall(request, env, cors);
+  if (ready.error) return ready.error;
+  const { boards, caller, friendKey } = ready;
+  const limited = await consumeReadLimit(request, env, friendKey, "keylist:", "iplist:", cors);
+  if (limited) return limited;
+  // accept stores at most FRIEND_CAP ids. Inspect that many, in stored order.
+  const ids = (await loadFriendIds(boards, caller.ownerId)).slice(0, FRIEND_CAP);
+  const friends = [];
+  for (const otherId of ids) {
+    const forward = await friendGet(boards, friendKvKey("friend", `${caller.ownerId}:${otherId}`));
+    if (typeof forward !== "string" || forward.length === 0) continue;
+    const reverse = await friendGet(boards, friendKvKey("friend", `${otherId}:${caller.ownerId}`));
+    if (typeof reverse !== "string" || reverse.length === 0) continue;
+    if (await hasBlock(boards, caller.ownerId, otherId)) continue;
+    if (await hasBlock(boards, otherId, caller.ownerId)) continue;
+    // The friend row is "1". No created time is stored, so there is no since.
+    friends.push({ ownerId: otherId });
+  }
+  return friendJson(200, { friends: dedupeByOwnerId(friends).sort(compareByOwnerId) }, cors);
+}
+
 async function fetchRounds(request, env, cors) {
   const friendKey = readFriendKey(request);
   if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
-  const declared = Number(request.headers.get("Content-Length"));
-  if (Number.isFinite(declared) && declared > FRIEND_BODY_LIMIT) {
-    return friendJson(413, { error: "payload_too_large" }, cors);
-  }
-  if (Number.isFinite(declared) && declared > 0) return friendJson(400, { error: "invalid_body" }, cors);
-  const parsed = await readJsonObject(request, FRIEND_BODY_LIMIT, true);
-  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
-  if (!parsed.empty) return friendJson(400, { error: "invalid_body" }, cors);
+  const bodyError = await rejectGetBody(request, cors);
+  if (bodyError) return bodyError;
   const boards = boardsBinding(env);
   if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
   const caller = await loadCaller(boards, friendKey);
@@ -426,6 +488,77 @@ async function fetchRounds(request, env, cors) {
   }
   rounds.sort(compareRounds);
   return friendJson(200, { rounds }, cors);
+}
+
+async function readyReadCall(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return { error: friendJson(401, { error: "friend_key_required" }, cors) };
+  const bodyError = await rejectGetBody(request, cors);
+  if (bodyError) return { error: bodyError };
+  const boards = boardsBinding(env);
+  if (!boards) return { error: friendJson(503, { error: "boards_not_configured" }, cors) };
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return { error: friendJson(401, { error: "friend_key_required" }, cors) };
+  return { boards, caller, friendKey };
+}
+
+async function rejectGetBody(request, cors) {
+  const declared = Number(request.headers.get("Content-Length"));
+  if (Number.isFinite(declared) && declared > FRIEND_BODY_LIMIT) {
+    return friendJson(413, { error: "payload_too_large" }, cors);
+  }
+  if (Number.isFinite(declared) && declared > 0) return friendJson(400, { error: "invalid_body" }, cors);
+  const parsed = await readJsonObject(request, FRIEND_BODY_LIMIT, true);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (!parsed.empty) return friendJson(400, { error: "invalid_body" }, cors);
+  return null;
+}
+
+function parseRequestKey(name) {
+  const prefix = "fr:req:";
+  if (typeof name !== "string" || !name.startsWith(prefix)) return null;
+  const parts = name.slice(prefix.length).split(":");
+  if (parts.length !== 2) return null;
+  if (!OWNER_ID_RE.test(parts[0]) || !OWNER_ID_RE.test(parts[1])) return null;
+  return { recipient: parts[0], requester: parts[1] };
+}
+
+function compareByOwnerId(left, right) {
+  if (left.ownerId < right.ownerId) return -1;
+  if (left.ownerId > right.ownerId) return 1;
+  return 0;
+}
+
+function dedupeByOwnerId(entries) {
+  const seen = new Set();
+  const out = [];
+  for (const entry of entries) {
+    if (seen.has(entry.ownerId)) continue;
+    seen.add(entry.ownerId);
+    out.push(entry);
+  }
+  return out;
+}
+
+async function listKeysByPrefix(boards, prefix) {
+  const names = [];
+  const seenCursors = new Set();
+  let cursor;
+  for (;;) {
+    const options = { prefix, limit: 1000 };
+    if (cursor) options.cursor = cursor;
+    const page = await boards.list(options);
+    const keys = page && Array.isArray(page.keys) ? page.keys : [];
+    for (const item of keys) {
+      const name = typeof item === "string" ? item : item && item.name;
+      if (typeof name === "string" && name.length > 0) names.push(name);
+    }
+    if (!page || page.list_complete !== false) break;
+    if (typeof page.cursor !== "string" || page.cursor.length === 0 || seenCursors.has(page.cursor)) break;
+    seenCursors.add(page.cursor);
+    cursor = page.cursor;
+  }
+  return names;
 }
 
 async function readyOwnerCall(request, env, cors) {
@@ -688,6 +821,20 @@ function guessNamespace(env) {
   const ns = env && env.FRIEND_GUESSES;
   if (!ns || typeof ns.idFromName !== "function" || typeof ns.get !== "function") return null;
   return ns;
+}
+
+async function consumeReadLimit(request, env, friendKey, keyPrefix, ipPrefix, cors) {
+  if (!guessNamespace(env)) return friendJson(503, { error: "guess_limiter_not_configured" }, cors);
+  const now = Date.now();
+  const keyHash = await sha256Hex(FRIEND_KEY_HASH_PREFIX + friendKey);
+  const keyAttempt = await guessAttempt(env, `${keyPrefix}${keyHash}`, now);
+  if (!keyAttempt.ok) return rateLimited(cors, keyAttempt.retryAfterSec);
+  const ipHash = await friendIpHash(request);
+  if (ipHash) {
+    const ipAttempt = await guessAttempt(env, `${ipPrefix}${ipHash}`, now);
+    if (!ipAttempt.ok) return rateLimited(cors, ipAttempt.retryAfterSec);
+  }
+  return null;
 }
 
 async function consumeIpAction(request, env, prefix, cors) {

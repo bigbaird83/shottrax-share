@@ -6,11 +6,11 @@ Live boards stay `GET` / `PUT` on a single path segment in the `BOARDS` KV names
 
 If `env.BOARDS` is not bound, board routes, overlay lookups, golfapi reads, and GCA course reads (`courses/{id}`, `courses/{id}/green-centers`) return `503` `{ "error": "boards_not_configured" }` instead of throwing. GCA search still proxies without that namespace.
 
-Merging to `main` deploys this Worker automatically through Cloudflare Workers Builds. A hand `npx wrangler deploy` is not required. That command uses the wrangler version pinned in `package.json`. The Workers Builds check fails immediately on every branch other than `main`. That failure is a Cloudflare branch-build setting, not a problem in this repo. After the merge build finishes, verify with the Magnolia curl below.
+Auto-deploy on merge to `main` is off. A deploy is a manual `npx wrangler deploy`, and Brian approves it. That command uses the wrangler version pinned in `package.json`. The Workers Builds check fails immediately on every branch other than `main`. That failure is a Cloudflare branch-build setting, not a problem in this repo. After the manual deploy, verify with the Magnolia curl below.
 
 ## Boards KV
 
-`wrangler.toml` binds `BOARDS` to the existing namespace `shottrax-boards` (`cfa1824a10374ab6a7fa0c97d0990e80`). The automatic `main` deploy uses this file. Keep this id so that deploy does not drop the dashboard binding. No `preview_id` is set.
+`wrangler.toml` binds `BOARDS` to the existing namespace `shottrax-boards` (`cfa1824a10374ab6a7fa0c97d0990e80`). A manual `npx wrangler deploy` uses this file. Keep this id so that deploy does not drop the dashboard binding. No `preview_id` is set.
 
 Board and paint-cache keys are stored only while that binding is present on the live Worker. If it is missing, those routes return `503` `{ "error": "boards_not_configured" }`.
 
@@ -24,6 +24,8 @@ Lookup allows 8 guesses per friend key and 24 per IP hash per 60 minutes. The 8-
 
 `POST /v1/friends/requests` with `{ "code" }` stores a pending request. `POST /v1/friends/requests/accept` with `{ "ownerId" }` accepts one. `POST /v1/friends/block` requires an accepted friendship. Otherwise it is `409` `{ "error": "not_friends" }` and it writes nothing. It stores the caller's block first, then deletes that pair's friendship and pending requests, and deletes only the caller's shared rounds. A request from someone you blocked is `409` `{ "error": "blocked" }`. A request from someone who blocked you is the same `{ "status": "pending", "ownerId" }` body as a real request, and nothing is stored. `POST /v1/friends/unblock` deletes only the caller's block. It does not restore a friendship or a request, it does not remove the other person's block, and it does not count as a code guess. `POST /v1/friends/remove` deletes an accepted friendship and only the caller's shared rounds. The other person's rounds stay for their remaining friends. Caller-only deletion on remove and block is Brian's approved behavior as of Oct 17, 2026, 5:37 PM CT, replacing the earlier answer that both people's rounds are wiped. No accepted friendship is `409` `{ "error": "not_friends" }`. Accepting a 51st friend is `409` `{ "error": "friend_limit" }`. `PUT /v1/friends/rounds` publishes `{ "share": true, "round" }` into one `fr:rounds:` value per owner (100 rounds max; a new id past that is `409` `{ "error": "round_limit" }`) or deletes the caller's shared rounds with `{ "share": false, "round": null }`. `GET /v1/friends/rounds` returns that caller's rounds and rounds from accepted friends. `fir`, `gir`, `putts`, and `clubs` are returned only when the golfer sent them. Shared rounds never include GPS, photos, or names. A blocked pair cannot fetch each other's rounds.
 
+`GET /v1/friends/requests` returns `{ "incoming", "outgoing" }`. Each entry is the other person's `ownerId` only. The request row is the string `pending`, so there is no display name and no created time. A requester the caller has blocked is omitted from `incoming`. A stored outgoing row stays visible to the sender even when the recipient has a block row. A quiet-block send still stores nothing, so that send is absent from `outgoing` until a row exists. See the open question in `docs/friends-api.md`. `GET /v1/friends/list` returns `{ "friends" }`: accepted friends where both `fr:friend:` rows exist, at most 50, hiding a block in either direction. `since` is omitted because the friendship row is `1`. Both GETs reject a body the same way as `GET /v1/friends/rounds`, allow 60 calls per friend key and 60 per IP hash per hour on their own `FriendGuessLimiter` objects (`keyreq:` / `ipreq:` and `keylist:` / `iplist:`), and do not write KV. Sort order and KV op counts are in `docs/friends-api.md`.
+
 ## Live board web page
 
 `GET /s/{code}` is an HTML page anyone can open in a browser, no app needed (`live-page.js`). The ShotTraxx™ app shares this link for a live board. The page renders the board stored at `{code}` in `BOARDS` on the Worker, so Messages and WhatsApp previews show the course and score (`Live · Greystone CC` / `E thru 2 · On hole 3`). Then it polls `GET /{code}` every 8 s until the round is final. Scores only: no map, and the page never asks for location.
@@ -31,7 +33,7 @@ Lookup allows 8 guesses per friend key and 24 per IP hash per 60 minutes. The 8-
 - Only a six-character board code from the app's alphabet is read. Anything else under `/s/` is a `404` page, and the route also refuses reserved keys, so it never reads or shows overlay, golfapi, course-store, GCA, refill-queue, or paint (`id:` / `name:`) data.
 - A valid code with nothing stored yet (or `BOARDS` unbound) gets a "Waiting for the first hole" page that keeps polling.
 - Every stored string is HTML-escaped (anyone can `PUT` a board). Scripts and styles run under a per-request CSP nonce, and `connect-src` is `'self'`.
-- `STORE_LIVE` (var, default off). Leave it unset until ShotTraxx™ is live in the App Store. Off shows "Open in ShotTraxx™" (`shottrax:///s/{code}`) only. `"true"` adds the Safari App Store banner and a "Track your own round" card with "Get ShotTraxx™ on the App Store". "Open in ShotTraxx™" shows either way: the app has no associated domain, so tapping the web link opens Safari even for people who have the app. The page makes no trial offer; that comes back with the paywall's real terms. Set it under `[vars]` in `wrangler.toml` (the automatic `main` deploy uses that file). `APP_STORE_ID` overrides the App Store id (`6812944398`).
+- `STORE_LIVE` (var, default off). Leave it unset until ShotTraxx™ is live in the App Store. Off shows "Open in ShotTraxx™" (`shottrax:///s/{code}`) only. `"true"` adds the Safari App Store banner and a "Track your own round" card with "Get ShotTraxx™ on the App Store". "Open in ShotTraxx™" shows either way: the app has no associated domain, so tapping the web link opens Safari even for people who have the app. The page makes no trial offer; that comes back with the paywall's real terms. Set it under `[vars]` in `wrangler.toml` (a manual `npx wrangler deploy` uses that file). `APP_STORE_ID` overrides the App Store id (`6812944398`).
 
 Check after merge (any six-character code; an unknown one shows the waiting page):
 
@@ -131,7 +133,7 @@ Moving a review to `rejected` or `rewarded` deletes the photo in the same reques
 
 CORS for this route allows `GET,POST,OPTIONS` and the `Authorization` header. Other routes are unchanged.
 
-Merging to `main` deploys this Worker. The admin list and review stay closed until `COURSE_REPORTS_ADMIN_TOKEN` is set. Do not put that token in `wrangler.toml`.
+A deploy is a manual `npx wrangler deploy` approved by Brian. Auto-deploy on merge to `main` is off. The admin list and review stay closed until `COURSE_REPORTS_ADMIN_TOKEN` is set. Do not put that token in `wrangler.toml`.
 
 ## Golf vendor proxy
 
@@ -238,7 +240,7 @@ https://www.openstreetmap.org/copyright
 
 ### Check after merge
 
-Merging to `main` deploys the Worker. When that Workers Builds run finishes, check Magnolia Country Club, AR:
+A deploy is a manual `npx wrangler deploy` approved by Brian. Auto-deploy on merge to `main` is off. After that deploy, check Magnolia Country Club, AR:
 
 ```
 curl -D - "https://shottrax-share.bcbaird.workers.dev/osm/v1/overlay?courseId=2fa21943-abaa-43a4-a90f-cb06c82216b4&lat=33.1940935&lng=-93.2077463&radius=1800"
