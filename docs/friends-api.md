@@ -76,7 +76,11 @@ Already friends: `200` `{ "status": "friends", "ownerId": "<their ownerId>" }` a
 
 The caller's own code is `400` `{ "error": "invalid_body" }`. That check is made before the guess limiter and does not consume a guess.
 
-Quiet block: if the target has blocked the caller, the response is the same `200` pending body as a real request. Nothing is stored for the target to accept, and the body is not `blocked`. If the caller has blocked the target, the caller gets `409` `{ "error": "blocked" }`. They already know. That swallowed send is not a row, so `GET /v1/friends/requests` cannot list it. See listRequests.
+Quiet block: if the target has blocked the caller, the response is the same `200` pending body as a real request. The body is not `blocked`. This branch writes one sender-only note, `fr:out:<sender>:<recipient>` = `pending`, and does not write `fr:req:<recipient>:<sender>`. The note has no display name and no created time. Nothing is stored for the target to accept. A repeat send on this branch returns the same pending body and does not write a second note. If the caller has blocked the target, the caller gets `409` `{ "error": "blocked" }`. They already know. A block row alone is not a request. `GET /v1/friends/requests` does not invent an outgoing entry from `fr:block:*`.
+
+That note is written only after the code guess is spent, same as a real request. First quiet send to that pair: 5 gets and 1 put. The gets are the auth row, `fr:code:<CODE>`, `fr:block:<caller>:<recipient>`, `fr:block:<recipient>:<caller>`, and `fr:out:<caller>:<recipient>`. The put is that note. The value is `pending`. There is no `expirationTtl`. No delete and no list. This path does not read or write `fr:req:`, `fr:friend:`, `fr:friends:`, or `fr:rounds:`. A repeat quiet send is the same 5 gets and no put when the note is already a non-empty string. A `rate_limited` send returns before the code read and writes no note, same as a real send.
+
+A later real send to that same person (no block, including the already-friends response and a send that finds an existing `fr:req:`) deletes `fr:out:<caller>:<recipient>` without reading it. That is one delete on the non-blocked send path. The sender's outgoing entry does not disappear: it is the real row, or the person is already a friend.
 
 ### listRequests
 
@@ -95,19 +99,32 @@ Auth is `X-Friend-Key`, the same as the other friends routes. A missing or bad k
 }
 ```
 
-`incoming` is pending requests other people sent the caller. `outgoing` is pending requests the caller sent. Each entry is the other person's `ownerId` only. The stored row is the string `pending`. It has no display name and no created time, so this route does not add those fields. The raw value is not returned. A friend code, a friend key, a raw KV key, and anyone who is not the other party of that request are not returned.
+`incoming` is pending requests other people sent the caller. `outgoing` is pending requests the caller sent: `fr:req:<recipient>:<caller>` rows and the caller's own `fr:out:<caller>:<recipient>` notes. Each entry is the other person's `ownerId` only. The stored row is the string `pending`. It has no display name and no created time, so this route does not add those fields. The raw value is not returned. A friend code, a friend key, a raw KV key, and anyone who is not the other party of that request are not returned.
 
-A requester the caller has blocked is left out of `incoming`. A stored outgoing row is still returned to the sender when the recipient has a block row. Hiding it would tell the sender they were blocked.
+A requester the caller has blocked is left out of `incoming`. A stored outgoing `fr:req:` row is still returned to the sender when the recipient has a block row. A quiet-block note is returned in that same `outgoing` array, in the same `{ "ownerId" }` shape, in the same `ownerId` sort. Hiding either one would tell the sender they were blocked. Incoming reads `fr:req:` only. A note is not an incoming row. `listFriends`, `fetchRounds`, accept, block, unblock, and remove do not read `fr:out:`.
 
-Sort: `incoming` and `outgoing` are each sorted by `ownerId` ascending, using JavaScript string order (UTF-16 code units). `ownerId` is unique in each list. There is no cursor. The response is the full set of stored rows this scan can see.
+Sort: `incoming` and `outgoing` are each sorted by `ownerId` ascending, using JavaScript string order (UTF-16 code units). `ownerId` is unique in each list. A note and a real row for the same person are one entry. There is no cursor. The response is the full set of stored rows this scan can see.
 
-KV reads, no KV writes. One list of prefix `fr:req:` (the requester id is the key suffix, so a per-caller prefix cannot see outgoing rows), then a get of each matching row and, for each non-empty incoming row, one block get. Formula: `1 + I + B + O` gets and `P` lists. `P = max(1, ceil(R / 1000))` is the number of list pages, and `R` is every `fr:req:` key in `BOARDS`. `I` is how many of those keys name the caller as recipient (each is one value get). `B` is how many of those values are a non-empty string (each is one `fr:block:<caller>:<requester>` get). `O` is how many name the caller as requester and someone else as recipient (each is one value get). The `1` is the auth row. Keys that belong to two other people are not gotten. No `put` and no `delete`.
+KV reads, no KV writes. One list of prefix `fr:req:` (the requester id is the key suffix, so a per-caller prefix cannot see outgoing rows) and one list of prefix `fr:out:<caller>:`. Formula: `1 + I + B + O + Q` gets and `P + S` lists. `P = max(1, ceil(R / 1000))` is the number of `fr:req:` list pages, and `R` is every `fr:req:` key in `BOARDS`. `S = max(1, ceil(N / 1000))` is the number of `fr:out:<caller>:` list pages, and `N` is every key with that prefix. An empty note prefix is still one list (`S = 1`). `I` is how many `fr:req:` keys name the caller as recipient (each is one value get). `B` is how many of those values are a non-empty string (each is one `fr:block:<caller>:<requester>` get). `O` is how many `fr:req:` keys name the caller as requester and someone else as recipient (each is one value get). `Q` is how many `fr:out:<caller>:` keys have a suffix that is a different owner id (each is one value get, including an empty value). The `1` is the auth row. Keys that belong to two other people are not gotten. A malformed note suffix is not gotten. No `put` and no `delete`.
 
 The read limit is 60 calls per friend key per 60 minutes (`keyreq:` on `FriendGuessLimiter`) and 60 per IP hash per 60 minutes when `CF-Connecting-IP` is present (`ipreq:`). No IP header skips the IP limit. A missing `FRIEND_GUESSES` binding is `503` `{ "error": "guess_limiter_not_configured" }` and does not list. Over the limit is `429` `{ "error": "rate_limited" }` and `Retry-After`, and that request does not list. `invalid_body` and `payload_too_large` do not consume a call. These objects are not the code-guess, `ipget:`, or `ippub:` counters.
 
 If `BOARDS` is missing, or it has no `list`, the call is `503` `{ "error": "boards_not_configured" }`.
 
-Open question, not implemented. A quiet-block `sendRequest` returns `200` pending and stores nothing. This GET can only list stored `fr:req:` rows, so the sender's outgoing list does not include that person. Building the row from `fr:block:*:<sender>` would also list people who blocked the sender and were never sent a new request, which reveals the block. This route does not do that. Smallest follow-up, if Brian wants the swallowed send to stay visible: on the quiet-block branch only, write `fr:out:<sender>:<recipient>` = `pending` (no display fields, no created time). Outgoing GET would list that prefix. Incoming GET would keep reading only `fr:req:`, so the recipient still sees nothing and still cannot accept it. When to delete that marker (a later real request to the same person, a TTL, or the sender's code reset) is the open point. Storing the normal `fr:req:` row on the quiet-block path is smaller and needs no new key, and incoming GET already hides a requester the caller blocked, but after unblock that row would be acceptable without a new send. That contradicts the current sentence that a quiet block stores nothing. The same `fr:out:<sender>:` prefix would also drop the global `fr:req:` scan down to a per-caller list.
+### Sender-only note lifetime
+
+A real pending request has no `expirationTtl`. It stays until the recipient accepts, or until a successful block deletes both `fr:req:` directions. There is no decline or withdraw call. Unblock, remove, and `resetCode` do not delete it. There is no cap on outstanding requests. Each send spends one code guess before the block check.
+
+The note has that same lifetime from the sender's side. The rule is: delete the note only when a real pending request would also leave the sender's outgoing list, and only as a result of the sender's own later send or of the recipient accepting a real request.
+
+- No `expirationTtl`. A TTL on the note alone would drop it from `outgoing` while a real request stayed. That difference is the block.
+- No cancel. `POST /v1/friends/decline` stays `404` and deletes nothing, for a note and for a real request. There is no decline call.
+- Unblock does not delete the note and does not copy it to `fr:req:`. Deleting it on unblock would remove the sender's outgoing entry with no action of theirs. That is how they would learn the block ended. After unblock the note is still not acceptable. A fresh `sendRequest` is required. That fresh send writes `fr:req:` and deletes the note. Outgoing still shows that `ownerId`.
+- Remove does not delete the note. Remove does not delete `fr:req:` either. A quiet note exists only after the recipient has blocked the sender, so remove is `not_friends` and writes nothing, same as a pending request that was never accepted.
+- A successful block does not delete the note. Block requires a friendship. While the note is the sender's only outgoing row, the two people are not friends, so block is `not_friends` and writes nothing. A real `fr:req:` row is also left in place when block refuses. Deleting the note on the blocker's later unblock or remove would change the sender's outgoing list. A real pending request does not change on those calls.
+- `resetCode` does not delete the note. It does not delete `fr:req:` either, because `ownerId` is unchanged. Deleting only the note would make a quiet outgoing entry disappear on reset while a real one stayed.
+- The note is deleted, without being read, when a later real send to that same person stores or finds `fr:req:<recipient>:<sender>`, including the already-friends response. Accept deletes the note key without reading it, and only after a real `fr:req:` row has already been confirmed, immediately before that row is deleted. A failed accept, including accept after unblock with no fresh send, does not delete the note and does not create a friendship. Accept never treats the note as a request.
+- One note per pair, the same cardinality as one request per pair. No new cap was added. A note-only cap would reject a quiet send that a real send would store. The existing guess limits (8 per friend key and 24 per IP hash per 60 minutes) already bound how fast new notes are written. The 50-friend cap and the 100-round cap do not apply to sends. Notes are not given a separate KV bound, because real `fr:req:` rows do not have one either. A new friend key resets the 8-guess limit and can write more notes, the same way it can write more real requests.
 
 ### accept
 
@@ -124,6 +141,8 @@ Only the recipient of a pending request can accept. That creates the friendship.
 `200` `{ "status": "friends", "ownerId": "<the requester>" }`
 
 No pending request: `409` `{ "error": "not_friends" }`. The caller already blocked that person: `409` `{ "error": "blocked" }`. The caller is the one who was blocked: the same `not_friends` response as when there was never a request. No `blocked` signal. There is no decline call. A pending request stays pending until the recipient accepts or blocks.
+
+Accept reads `fr:req:` only. A sender-only `fr:out:` note is not a request and cannot be accepted. On success, after the `fr:req:` row is confirmed and before that row is deleted, accept deletes `fr:out:<requester>:<recipient>` without reading it. A failed accept does not delete the note. Unblock does not turn the note into a row accept can grant.
 
 ### remove
 
@@ -171,7 +190,7 @@ The blocked person gets no notice. Their later `sendRequest` and `accept` behave
 
 The phone's `id` is this `ownerId`. Auth, body allowlist, and size limit are the same as block.
 
-Deletes only the caller's stored block on that person. It does not restore a friendship, and it does not recreate a request: the quiet block stored nothing, so there is nothing to bring back. It does not touch a block the other person holds on the caller. Rounds deleted by block stay deleted.
+Deletes only the caller's stored block on that person. It does not restore a friendship, and it does not recreate a request. A sender-only note from a quiet-block send is left in place. It is not copied to `fr:req:` and it is not deleted. It does not touch a block the other person holds on the caller. Rounds deleted by block stay deleted.
 
 `200` `{ "ok": true }`
 
@@ -353,7 +372,8 @@ Friend rows use the `fr:` prefix only. The keys this API writes are:
 
 - `fr:k:<sha256>` — `{ "ownerId", "code" }` for the friend key. No name and no raw key.
 - `fr:code:<CODE>` — the `ownerId` string. `resetCode` deletes the old key before it responds.
-- `fr:req:<recipient>:<requester>` — a pending request. The value is `pending`.
+- `fr:req:<recipient>:<requester>` — a pending request. The value is `pending`. No `expirationTtl`.
+- `fr:out:<sender>:<recipient>` — a sender-only note for a quiet-block send. The value is `pending`. No `expirationTtl`. Not a request. Incoming scans, accept, `listFriends`, `fetchRounds`, block, unblock, and remove do not read it. `fr:` stays reserved, so a board path cannot read or write this key.
 - `fr:friend:<a>:<b>` — one direction of an accepted friendship. The value is `1`. Both directions are required.
 - `fr:friends:<ownerId>` — JSON array of the other owner ids. This is the fetch index and the 50-friend cap. `accept` writes both lists. `remove` and `block` take the other person out of both lists.
 - `fr:block:<blocker>:<blocked>` — the caller's block. The value is `1`.

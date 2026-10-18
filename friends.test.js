@@ -546,7 +546,7 @@ describe("friend codes", () => {
     return { key, code: created.json.code, ownerId: created.json.ownerId };
   }
 
-  it("quiet block looks like a sent request and stores nothing", async () => {
+  it("quiet block looks like a sent request and stores a sender-only note", async () => {
     const opener = await mint("quiet-opener");
     const inviter = await mint("quiet-inviter");
     const controlFrom = await mint("quiet-from");
@@ -573,6 +573,8 @@ describe("friend codes", () => {
     expect(quiet.text).not.toContain("error");
     expect(rows("fr:req:")).toEqual([`fr:req:${controlTo.ownerId}:${controlFrom.ownerId}`]);
     expect(kv.has(`fr:req:${inviter.ownerId}:${opener.ownerId}`)).toBe(false);
+    expect(kv.get(`fr:out:${opener.ownerId}:${inviter.ownerId}`).value).toBe("pending");
+    expect(kv.get(`fr:out:${opener.ownerId}:${inviter.ownerId}`).expirationTtl).toBeUndefined();
 
     const told = await invoke("/v1/friends/requests/accept", { friend: opener.key, body: { ownerId: inviter.ownerId } });
     expect(told.status).toBe(409);
