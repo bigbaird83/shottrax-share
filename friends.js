@@ -13,7 +13,9 @@
  * deletes that friendship. Remove and block delete only the caller's shared
  * rounds. One fr:rounds: value holds an owner's rounds. One fr:friends:
  * value is that owner's list. A pending request row is the string "pending"
- * and has no display name or created time.
+ * and has no display name or created time. A quiet-block send writes
+ * fr:out:<sender>:<recipient> = pending for that sender's outgoing list
+ * only. It is not a request, it has no TTL, and unblock does not promote it.
  */
 
 export const FRIEND_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -278,19 +280,24 @@ async function sendRequest(request, env, cors) {
   if (await hasBlock(boards, caller.ownerId, ownerId)) {
     return friendJson(409, { error: "blocked" }, cors);
   }
-  // Quiet block: same pending body as a real request, and nothing is stored.
+  // Quiet block: same pending body as a real request. The note is the
+  // sender's outgoing row only. The recipient has no fr:req: to accept.
   if (await hasBlock(boards, ownerId, caller.ownerId)) {
+    await storeOutgoingNote(boards, caller.ownerId, ownerId);
     return friendJson(200, { status: "pending", ownerId }, cors);
   }
   if (await areFriends(boards, caller.ownerId, ownerId)) {
+    await deleteOutgoingNote(boards, caller.ownerId, ownerId);
     return friendJson(200, { status: "friends", ownerId }, cors);
   }
   const reqKey = requestKey(ownerId, caller.ownerId);
   const pending = await friendGet(boards, reqKey);
   if (typeof pending === "string" && pending.length > 0) {
+    await deleteOutgoingNote(boards, caller.ownerId, ownerId);
     return friendJson(200, { status: "pending", ownerId }, cors);
   }
   await friendPut(boards, reqKey, "pending");
+  await deleteOutgoingNote(boards, caller.ownerId, ownerId);
   return friendJson(200, { status: "pending", ownerId }, cors);
 }
 
@@ -328,6 +335,9 @@ async function acceptRequest(request, env, cors) {
   await friendPut(boards, friendKvKey("friend", `${ownerId}:${caller.ownerId}`), "1");
   await saveFriendIds(boards, caller.ownerId, addFriendId(callerIds, ownerId));
   await saveFriendIds(boards, ownerId, addFriendId(otherIds, caller.ownerId));
+  // Drop a leftover sender note before the request row. A retry can still
+  // see fr:req: if this delete fails. The note is not read and not accepted.
+  await deleteOutgoingNote(boards, ownerId, caller.ownerId);
   await friendDelete(boards, reqKey);
   return friendJson(200, { status: "friends", ownerId }, cors);
 }
@@ -422,9 +432,11 @@ async function listRequests(request, env, cors) {
   if (typeof boards.list !== "function") return friendJson(503, { error: "boards_not_configured" }, cors);
   const limited = await consumeReadLimit(request, env, friendKey, "keyreq:", "ipreq:", cors);
   if (limited) return limited;
-  // The requester id is the key suffix, so outgoing rows are not a prefix.
-  // One fr:req: scan feeds both lists. A quiet-block send stores no row.
-  // Do not invent one from fr:block:*:<caller>: that would reveal the block.
+  // The requester id is the key suffix, so outgoing fr:req: rows are not a
+  // prefix. One fr:req: scan feeds incoming and real outgoing. A quiet-block
+  // note lives at fr:out:<sender>:<recipient> and is listed only for that
+  // sender. Do not invent a row from fr:block:*:<caller>: a block without a
+  // send is not a request, and reading those block rows would reveal it.
   const names = await listKeysByPrefix(boards, "fr:req:");
   const incoming = [];
   const outgoing = [];
@@ -441,6 +453,14 @@ async function listRequests(request, env, cors) {
       if (typeof raw !== "string" || raw.length === 0) continue;
       outgoing.push({ ownerId: parsed.recipient });
     }
+  }
+  const noteNames = await listKeysByPrefix(boards, `fr:out:${caller.ownerId}:`);
+  for (const name of noteNames) {
+    const recipient = parseOutgoingNoteKey(name, caller.ownerId);
+    if (!recipient) continue;
+    const raw = await friendGet(boards, name);
+    if (typeof raw !== "string" || raw.length === 0) continue;
+    outgoing.push({ ownerId: recipient });
   }
   const incomingSorted = dedupeByOwnerId(incoming).sort(compareByOwnerId);
   const outgoingSorted = dedupeByOwnerId(outgoing).sort(compareByOwnerId);
@@ -523,6 +543,14 @@ function parseRequestKey(name) {
   return { recipient: parts[0], requester: parts[1] };
 }
 
+function parseOutgoingNoteKey(name, senderOwnerId) {
+  const prefix = `fr:out:${senderOwnerId}:`;
+  if (typeof name !== "string" || !name.startsWith(prefix)) return null;
+  const recipient = name.slice(prefix.length);
+  if (!OWNER_ID_RE.test(recipient) || recipient === senderOwnerId) return null;
+  return recipient;
+}
+
 function compareByOwnerId(left, right) {
   if (left.ownerId < right.ownerId) return -1;
   if (left.ownerId > right.ownerId) return 1;
@@ -589,6 +617,21 @@ async function loadCaller(boards, friendKey) {
 
 function requestKey(recipientOwnerId, requesterOwnerId) {
   return friendKvKey("req", `${recipientOwnerId}:${requesterOwnerId}`);
+}
+
+function outgoingNoteKey(senderOwnerId, recipientOwnerId) {
+  return friendKvKey("out", `${senderOwnerId}:${recipientOwnerId}`);
+}
+
+async function storeOutgoingNote(boards, senderOwnerId, recipientOwnerId) {
+  const key = outgoingNoteKey(senderOwnerId, recipientOwnerId);
+  const existing = await friendGet(boards, key);
+  if (typeof existing === "string" && existing.length > 0) return;
+  await friendPut(boards, key, "pending");
+}
+
+async function deleteOutgoingNote(boards, senderOwnerId, recipientOwnerId) {
+  await friendDelete(boards, outgoingNoteKey(senderOwnerId, recipientOwnerId));
 }
 
 async function hasBlock(boards, blockerOwnerId, blockedOwnerId) {
@@ -876,6 +919,7 @@ function friendKvKey(kind, id) {
     kind !== "k" &&
     kind !== "code" &&
     kind !== "req" &&
+    kind !== "out" &&
     kind !== "friend" &&
     kind !== "friends" &&
     kind !== "round" &&

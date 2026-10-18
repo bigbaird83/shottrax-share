@@ -320,6 +320,9 @@ describe("friend read routes", () => {
       friend: recipient.key,
       body: { ownerId: sender.ownerId },
     })).json).toEqual({ ok: true });
+    const beforeSend = await viaEntry("/v1/friends/requests", { friend: sender.key });
+    expect(beforeSend.json).toEqual({ incoming: [], outgoing: [] });
+    expect(kv.has(`fr:out:${sender.ownerId}:${recipient.ownerId}`)).toBe(false);
     const quiet = await viaEntry("/v1/friends/requests", {
       method: "POST",
       friend: sender.key,
@@ -327,12 +330,14 @@ describe("friend read routes", () => {
     });
     expect(quiet.json).toEqual({ status: "pending", ownerId: recipient.ownerId });
     expect(kv.has(`fr:req:${recipient.ownerId}:${sender.ownerId}`)).toBe(false);
+    expect(kv.get(`fr:out:${sender.ownerId}:${recipient.ownerId}`).value).toBe("pending");
     const listed = await viaEntry("/v1/friends/requests", { friend: sender.key });
-    expect(listed.json).toEqual({ incoming: [], outgoing: [] });
-    expect(listed.text).not.toContain(recipient.ownerId);
+    expect(listed.json).toEqual({ incoming: [], outgoing: [{ ownerId: recipient.ownerId }] });
     expect(listed.text).not.toContain("blocked");
+    expect(listed.text).not.toContain("fr:");
     const incoming = await viaEntry("/v1/friends/requests", { friend: recipient.key });
     expect(incoming.json.incoming).toEqual([]);
+    expect(incoming.text).not.toContain(sender.ownerId);
   });
 
   it("hides a friend the caller blocked", async () => {
@@ -534,7 +539,7 @@ describe("friend read routes", () => {
       incoming: [{ ownerId: incoming }],
       outgoing: [{ ownerId: outgoing }],
     });
-    expect(requestCounts).toEqual({ get: 4, put: 0, delete: 0, list: 1 });
+    expect(requestCounts).toEqual({ get: 4, put: 0, delete: 0, list: 2 });
 
     const first = "h".repeat(22);
     const second = "j".repeat(22);
@@ -575,7 +580,7 @@ describe("friend read routes", () => {
     const listed = await viaEntry("/v1/friends/requests", { friend: caller.key });
     expect(ownerIds(listed.json.incoming)).toEqual([high]);
     expect(ownerIds(listed.json.outgoing)).toEqual([low]);
-    expect(lists).toBe(2);
+    expect(lists).toBe(3);
   });
 
   it("fails closed without the guess limiter", async () => {
