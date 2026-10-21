@@ -23,6 +23,8 @@ const FRIEND_CODE_CALLS = [
   ["GET", "/v1/friends/rounds"],
   ["GET", "/v1/friends/requests"],
   ["GET", "/v1/friends/list"],
+  ["POST", "/v1/friends/code/name"],
+  ["PUT", "/v1/friends/past"],
 ];
 
 function boards() {
