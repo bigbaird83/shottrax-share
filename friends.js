@@ -16,6 +16,8 @@
  * and has no display name or created time. A quiet-block send writes
  * fr:out:<sender>:<recipient> = pending for that sender's outgoing list
  * only. It is not a request, it has no TTL, and unblock does not promote it.
+ * setInvitePhoto stores the sharer's invite photo (JPEG, 64 KB cap) at fr:invphoto:<code>,
+ * the same way as the name: never in a URL, returned only by lookup, deleted by reset.
  * setInviteName stores the sharer's invite name at fr:invname:<code>; only
  * code lookup returns it and resetCode deletes it. setPastRounds gives one
  * friend a pick of the caller's past rounds (private "to" audience inside
@@ -37,6 +39,9 @@ export const ROUND_CAP = 100;
 // Invite name: the sharer's own name for this invite, stored with the code.
 // It is never in the URL. lookup returns it; reset deletes it with the old code.
 export const INVITE_NAME_MAX = 24;
+// Invite photo cap: JPEG only, at most 64 KB decoded, sent as base64. The app sends a 256 px square.
+export const INVITE_PHOTO_MAX_BYTES = 64 * 1024;
+export const INVITE_PHOTO_TYPE = "image/jpeg";
 // Past rounds: per friend, the owner's pick of rounds finished before the
 // friendship. "all" is still capped at ROUND_CAP.
 export const PAST_ROUND_CHOICES = Object.freeze(["none", "10", "25", "all"]);
@@ -47,6 +52,7 @@ const FRIEND_IP_HASH_PREFIX = "shottrax-friend-guess-ip-v1:";
 const FRIEND_BODY_LIMIT = 2048;
 const PUBLISH_BODY_LIMIT = 8192;
 const PAST_BODY_LIMIT = 256 * 1024;
+const PHOTO_BODY_LIMIT = 96 * 1024;
 const ROUND_TTL_SECONDS = 365 * 24 * 60 * 60;
 const ROUND_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const PLAYED_ON_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
@@ -194,6 +200,7 @@ const FRIEND_ROUTES = {
   "/v1/friends/code": { POST: getCode },
   "/v1/friends/code/reset": { POST: resetCode },
   "/v1/friends/code/name": { POST: setInviteName },
+  "/v1/friends/code/photo": { POST: setInvitePhoto },
   "/v1/friends/codes/lookup": { POST: lookupCode },
   "/v1/friends/requests": { POST: sendRequest, GET: listRequests },
   "/v1/friends/list": { GET: listFriends },
@@ -246,6 +253,7 @@ async function resetCode(request, env, cors) {
   await friendDelete(boards, friendKvKey("code", previous));
   // The invite name lives with the code. A reset deletes it; it does not move to the new code.
   await deleteIfPresent(boards, friendKvKey("invname", previous));
+  await deleteIfPresent(boards, friendKvKey("invphoto", previous));
   return friendJson(200, { code, ownerId: existing.ownerId }, cors);
 }
 
@@ -270,7 +278,11 @@ async function lookupCode(request, env, cors) {
   }
   // The invite name is returned only here, when the code (or its link) is opened.
   const name = readInviteName(await friendGet(boards, friendKvKey("invname", code)));
-  return friendJson(200, name ? { ownerId, name } : { ownerId }, cors);
+  const photo = readInvitePhoto(await friendGet(boards, friendKvKey("invphoto", code)));
+  const found = { ownerId };
+  if (name) found.name = name;
+  if (photo) found.photo = photo;
+  return friendJson(200, found, cors);
 }
 
 /**
@@ -303,6 +315,58 @@ async function setInviteName(request, env, cors) {
   if (name) await friendPut(boards, key, name);
   else await deleteIfPresent(boards, key);
   return friendJson(200, { ok: true }, cors);
+}
+
+/**
+ * Store or clear the caller's invite photo. Body { photo: { type: "image/jpeg", data: base64 } | null }.
+ * JPEG only, at most INVITE_PHOTO_MAX_BYTES decoded. null deletes it. Stored at fr:invphoto:<code>.
+ */
+async function setInvitePhoto(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const parsed = await readJsonObject(request, PHOTO_BODY_LIMIT, false);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (unknownFields(parsed.value, ["photo"]) || !Object.hasOwn(parsed.value, "photo")) {
+    return friendJson(400, { error: "invalid_body" }, cors);
+  }
+  const raw = parsed.value.photo;
+  let photo = null;
+  if (raw !== null) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return friendJson(400, { error: "invalid_body" }, cors);
+    if (unknownFields(raw, ["type", "data"])) return friendJson(400, { error: "invalid_body" }, cors);
+    if (raw.type !== INVITE_PHOTO_TYPE) return friendJson(415, { error: "photo_type" }, cors);
+    photo = readInvitePhoto(JSON.stringify({ type: raw.type, data: raw.data }));
+    if (!photo) {
+      const tooBig = typeof raw.data === "string" && raw.data.length > Math.ceil(INVITE_PHOTO_MAX_BYTES / 3) * 4;
+      return friendJson(tooBig ? 413 : 400, { error: tooBig ? "photo_too_large" : "invalid_body" }, cors);
+    }
+  }
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const key = friendKvKey("invphoto", caller.code);
+  if (photo) await friendPut(boards, key, JSON.stringify(photo));
+  else await deleteIfPresent(boards, key);
+  return friendJson(200, { ok: true }, cors);
+}
+
+function readInvitePhoto(raw) {
+  if (typeof raw !== "string") return null;
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!value || value.type !== INVITE_PHOTO_TYPE || typeof value.data !== "string") return null;
+  const data = value.data;
+  if (data.length < 8 || data.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) return null;
+  const bytes = (data.length / 4) * 3 - (data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0);
+  if (bytes > INVITE_PHOTO_MAX_BYTES) return null;
+  // JPEG files start with FF D8 FF ("/9j/" in base64).
+  if (!data.startsWith("/9j/")) return null;
+  return { type: INVITE_PHOTO_TYPE, data };
 }
 
 function readInviteName(raw) {
@@ -1095,7 +1159,8 @@ function friendKvKey(kind, id) {
     kind !== "round" &&
     kind !== "rounds" &&
     kind !== "block" &&
-    kind !== "invname"
+    kind !== "invname" &&
+    kind !== "invphoto"
   ) {
     throw new Error("friend_namespace");
   }

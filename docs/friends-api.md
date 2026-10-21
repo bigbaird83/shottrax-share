@@ -54,7 +54,7 @@ Body: empty, or `{}`.
 
 The friend key must already have a code. Otherwise `401` `{ "error": "friend_key_required" }`.
 
-`200` with the new `code` and the same `ownerId`. The previous code then looks up as `404` `{ "error": "code_not_found" }`. Does not count as a guess, and does not clear the guess counter. The invite name stored with the previous code (`fr:invname:<old CODE>`) is deleted on the same request. It is not copied to the new code.
+`200` with the new `code` and the same `ownerId`. The previous code then looks up as `404` `{ "error": "code_not_found" }`. Does not count as a guess, and does not clear the guess counter. The invite name stored with the previous code (`fr:invname:<old CODE>`) and the invite photo (`fr:invphoto:<old CODE>`) are deleted on the same request. Neither is copied to the new code.
 
 ### setInviteName
 
@@ -67,6 +67,18 @@ The friend key must already have a code. Otherwise `401` `{ "error": "friend_key
 The sharer's name for this invite. It is stored with the caller's current code and is never part of the link or the URL. Whitespace runs collapse to one space and the ends are trimmed. 1 to 24 characters, no control characters, else `400` `{ "error": "invalid_body" }`. `null`, `""` or all spaces deletes it. A key with no code is `401`. `200` `{ "ok": true }`. Not a guess and not rate limited beyond the normal key check.
 
 The name is returned only by code lookup (below), when someone opens the link or types the code. `getCode`, `resetCode`, the lists and `fetchRounds` never carry it. It is invite-only: it changes nothing about what is shared.
+
+### setInvitePhoto
+
+`POST /v1/friends/code/photo`
+
+```json
+{ "photo": { "type": "image/jpeg", "data": "<base64>" } }
+```
+
+The sharer's optional photo for this invite, stored with the caller's current code at `fr:invphoto:<CODE>` and never part of the link or URL. Cap: `type` must be `image/jpeg` (else `415` `{ "error": "photo_type" }`), `data` is standard base64 of a JPEG (starts `FF D8 FF`) of at most 64 KB decoded (else `413` `{ "error": "photo_too_large" }`). Body cap 96 KB. Other shapes are `400`. `{ "photo": null }` deletes it. A key with no code is `401`. `200` `{ "ok": true }`.
+
+Returned only by code lookup as `photo` next to `name`. `resetCode` deletes it from the server. A copy the friend already saved on their phone is theirs and is not affected.
 
 ### setPastRounds
 
@@ -304,7 +316,7 @@ Fetch reads `3 + 2N + F` KV values and does not list. `N` is the caller's friend
 
 This is the resolve `sendRequest` uses. Both calls share one guess counter per friend key and one per IP. The friend key must already have a minted code, or the call is `401` `{ "error": "friend_key_required" }` and does not spend a guess.
 
-`200` `{ "ownerId": "<public id>" }`, plus `"name"` when the code's owner set an invite name (`{ "ownerId": "<public id>", "name": "Alex M." }`).
+`200` `{ "ownerId": "<public id>" }`, plus `"name"` when the code's owner set an invite name (`{ "ownerId": "<public id>", "name": "Alex M." }`). Also `"photo": { "type": "image/jpeg", "data": "<base64>" }` when an invite photo is set.
 
 Unknown code, including a code that `resetCode` just replaced: `404` `{ "error": "code_not_found" }`.
 
