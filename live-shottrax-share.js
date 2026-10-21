@@ -934,8 +934,9 @@ var GOLFAPI_DEFAULTS = {
   // Saved course/coordinates copies; 7-day marker for a clean 200 with no data.
   storeTtlDays: 365,
   emptyTtlDays: 7,
-  // Calls one course open may make (search, course, coordinates). The open is
-  // checked for this many calls up front and then never refused midway.
+  // Calls one course open may make (search, course, coordinates). That reservation
+  // is checked up front. A balance at or under the floor still stops the next call,
+  // including the coordinates half of a queued refill.
   openCalls: 3
 };
 function readGolfapiLimits(env) {
@@ -1555,8 +1556,33 @@ function quotaFor(ident, allowlisted, openSetPlan) {
   };
 }
 __name(quotaFor, "quotaFor");
+function searchCapReason(search, allowlisted, ident, limits) {
+  if (!search || allowlisted) return null;
+  if ((ident.dev || ident.ip) && quotaSearchCount(ident) >= limits.searchCap) return "search_device_day";
+  return null;
+}
+__name(searchCapReason, "searchCapReason");
+__name2(searchCapReason, "searchCapReason");
+function quotaSearchCount(ident) {
+  if (ident.dev) return ident.dev.searchCount;
+  if (ident.ip) return ident.ip.searchCount;
+  return 0;
+}
+__name(quotaSearchCount, "quotaSearchCount");
+__name2(quotaSearchCount, "quotaSearchCount");
+function floorBlocks(balance, floor, need) {
+  if (!balance || typeof balance.left !== "number") return false;
+  if (balance.left <= floor) return true;
+  return Number.isInteger(balance.left) && balance.left - need < floor;
+}
+__name(floorBlocks, "floorBlocks");
+__name2(floorBlocks, "floorBlocks");
 async function golfapiOpenGate({ boards, limits, now, quota, ident, allowlisted, search }) {
+  const floorNeed = quota.newOpen ? limits.openCalls : 1;
+  if (floorBlocks(await readBalance(boards), limits.floor, floorNeed)) return "floor";
   if (!quota.newOpen) {
+    const capped = searchCapReason(search, allowlisted, ident, limits);
+    if (capped) return capped;
     const calls = quota.devPlan && quota.devPlan.next ? quota.devPlan.next.calls : 1;
     if (calls <= limits.openCalls) return null;
     hotfixLog("golfapi_open_over_calls", { calls, openCalls: limits.openCalls });
@@ -1575,8 +1601,7 @@ async function golfapiOpenGate({ boards, limits, now, quota, ident, allowlisted,
     limits
   });
   if (reason) return reason;
-  if (search && (ident.dev || ident.ip) && quota.searchCount >= limits.searchCap) return "search_device_day";
-  return null;
+  return searchCapReason(search, allowlisted, ident, limits);
 }
 __name(golfapiOpenGate, "golfapiOpenGate");
 __name2(quotaFor, "quotaFor");
@@ -1953,7 +1978,7 @@ async function handleGolfapiLookup({ kind, id, url, env, ctx, cors, boards, now,
     await rememberGolfEdge(cache, ctx, cacheKey, response);
     return response;
   }
-  if (classified.outcome === "empty200") {
+  if (classified.outcome === "empty200" || classified.reason === "error_body") {
     await writeEmptyMarker(boards, limits, kind, id);
     hotfixLog("golfapi_no_data_marker", { route: `${stem}/${id}`, days: limits.emptyTtlDays });
   } else if (upstream.status >= 200 && upstream.status < 300) {
@@ -2049,7 +2074,7 @@ async function countGolfapiCall(env, boards, limits, now) {
 __name(countGolfapiCall, "countGolfapiCall");
 async function golfapiSpendBlockReason(boards, limits, now, allowlisted = false, need = 1) {
   const balance = await readBalance(boards);
-  if (balance && typeof balance.left === "number" && balance.left - need < limits.floor) return "floor";
+  if (floorBlocks(balance, limits.floor, need)) return "floor";
   if (allowlisted) return null;
   const period = billingPeriod(now.getTime(), limits.billingDay);
   if (await readMonthCount(boards, monthCounterKey(period.id)) + need > limits.monthBudget) return "global_month";
@@ -2298,7 +2323,7 @@ async function pullQueuedPart(env, boards, day, state, kind, id) {
     await boards.delete(emptyMarkerKey(kind, id));
     return;
   }
-  if (classified.outcome === "empty200") {
+  if (classified.outcome === "empty200" || classified.reason === "error_body") {
     await writeEmptyMarker(boards, limits, kind, id);
     return;
   }
@@ -2314,11 +2339,19 @@ async function refillCoursePair(env, boards, limits, day, state, courseId) {
   let courseDone = await partReady(boards, "course", courseId);
   let coordDone = await partReady(boards, "coord", courseId);
   if (!courseDone) {
+    if (balanceBlocks(await readBalance(boards), limits.floor)) {
+      state.stop = true;
+      return;
+    }
     await pullQueuedPart(env, boards, day, state, "course", courseId);
     if (state.failed) return;
     courseDone = true;
   }
   if (!coordDone) {
+    if (balanceBlocks(await readBalance(boards), limits.floor)) {
+      state.stop = true;
+      return;
+    }
     await pullQueuedPart(env, boards, day, state, "coord", courseId);
     if (state.failed) return;
     coordDone = true;
@@ -2403,7 +2436,9 @@ async function drainGolfapiQueue(env) {
   items.sort((left, right) => left.record.at - right.record.at || (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
   for (const item of items) {
     if (item.record.attempts >= GOLFAPI_GIVE_UP) continue;
-    if (await golfapiSpendBlockReason(boards, limits, /* @__PURE__ */ new Date(), false, limits.openCalls)) break;
+    if (balanceBlocks(await readBalance(boards), limits.floor)) break;
+    const budgetBlock = await golfapiSpendBlockReason(boards, limits, /* @__PURE__ */ new Date(), false, limits.openCalls);
+    if (budgetBlock && budgetBlock !== "floor") break;
     const outcome = item.kind === "search" ? await drainSearchItem(env, boards, limits, periods.day, item) : await (async () => {
       const state = { fetched: false, failed: false, stop: false, done: false };
       await refillCoursePair(env, boards, limits, periods.day, state, item.id);
