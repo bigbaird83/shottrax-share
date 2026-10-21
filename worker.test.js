@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GCA_CORRECTIONS } from "./gca-corrections.js";
-import worker, { osmInflight, presentGcaCourseBody } from "./live-shottrax-share.js";
+import worker, { osmInflight, presentGcaCourseBody, readGolfapiLimits } from "./live-shottrax-share.js";
 
 const ORIGIN = "https://shottrax-share.bcbaird.workers.dev";
 const PRIMARY = "https://overpass-api.de/api/interpreter";
@@ -1714,14 +1714,792 @@ describe("shottrax-share worker", () => {
     expect(stats().lookups).toBe(1);
   });
 
+  it("keeps the live golfapi defaults", () => {
+    expect(readGolfapiLimits({})).toEqual({
+      deviceDay: 12,
+      deviceWeek: 40,
+      deviceMonth: 80,
+      ipDay: 150,
+      ipWeek: 1050,
+      ipMonth: 4650,
+      globalDay: 100,
+      monthBudget: 450,
+      billingDay: 5,
+      floor: 50,
+      storeTtlDays: 365,
+      emptyTtlDays: 7,
+      openCalls: 3,
+      searchCap: 36,
+    });
+  });
+
+  it("queues the next device lookup after the live device day while that IP is still under its limit", async () => {
+    const limits = readGolfapiLimits({});
+    expect(limits.deviceDay).toBe(12);
+    expect(limits.ipDay).toBe(150);
+    let n = 0;
+    mockGolfApi(async (url) => {
+      n += 1;
+      return jsonResponse(coursePayload(url.split("/").pop(), 100 - n));
+    });
+    for (let i = 1; i <= limits.deviceDay; i += 1) {
+      expect((await golfGet(`/golfapi/v2.3/courses/c${i}`)).status, `c${i}`).toBe(200);
+    }
+    const blocked = await golfGet(`/golfapi/v2.3/courses/c${limits.deviceDay + 1}`);
+    const body = await blocked.json();
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers.get("Retry-After")).toBe(String(body.retryAfterSec));
+    expect(body.error).toBe("golfapi_limited");
+    expect(body.reason).toBe("device_day");
+    expect(body.queued).toBe(true);
+    expect(body.retryAfterSec).toBeGreaterThan(0);
+    expect(body.retryAfterSec).toBeLessThanOrEqual(86400);
+    expect(fetchMock).toHaveBeenCalledTimes(limits.deviceDay);
+    expect(stats().lookups).toBe(limits.deviceDay);
+    expect(stats().blocked.device_day).toBe(1);
+    expect(kv.has(`gqueue:c${limits.deviceDay + 1}`)).toBe(true);
+    const ipKeys = [...kv.keys()].filter((key) => /^gq:ip:[0-9a-f]{64}$/.test(key));
+    expect(ipKeys).toHaveLength(1);
+    expect(JSON.parse(kv.get(ipKeys[0]).value).dayCount).toBe(limits.deviceDay);
+    expect(JSON.parse(kv.get(ipKeys[0]).value).dayCount).toBeLessThan(limits.ipDay);
+
+    const again = await golfGet(`/golfapi/v2.3/courses/c${limits.deviceDay + 1}`);
+    expect((await again.json()).reason).toBe("device_day");
+    expect([...kv.keys()].filter((key) => key.startsWith("gqueue:"))).toEqual([
+      `gqueue:c${limits.deviceDay + 1}`,
+    ]);
+
+    const other = await golfGet(`/golfapi/v2.3/courses/c${limits.deviceDay + 2}`, { install: OTHER_INSTALL });
+    expect(other.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(limits.deviceDay + 1);
+    expect(stats().lookups).toBe(limits.deviceDay + 1);
+  });
+
+  it("applies the IP limit across spoofed install ids", async () => {
+    const limits = readGolfapiLimits({});
+    expect(limits.ipDay).toBe(150);
+    expect(limits.globalDay).toBe(100);
+    mockGolfApi(async (url) => jsonResponse(coursePayload(url.split("/").pop(), 80)));
+    expect((await golfGet("/golfapi/v2.3/courses/s1", { install: "spoof-aaa" })).status).toBe(200);
+    expect((await golfGet("/golfapi/v2.3/courses/s2", { install: "spoof-bbb" })).status).toBe(200);
+    const ipKeys = [...kv.keys()].filter((key) => /^gq:ip:[0-9a-f]{64}$/.test(key));
+    expect(ipKeys).toHaveLength(1);
+    expect(JSON.parse(kv.get(ipKeys[0]).value).dayCount).toBe(2);
+    expect(JSON.stringify([...kv.entries()])).not.toContain(CLIENT_IP);
+
+    const bucket = JSON.parse(kv.get(ipKeys[0]).value);
+    bucket.dayCount = limits.ipDay - 1;
+    kv.set(ipKeys[0], { value: JSON.stringify(bucket) });
+    expect((await golfGet("/golfapi/v2.3/courses/s3", { install: "spoof-ccc" })).status).toBe(200);
+    expect(JSON.parse(kv.get(ipKeys[0]).value).dayCount).toBe(limits.ipDay);
+
+    const spoofed = await golfGet("/golfapi/v2.3/courses/s4", { install: "spoof-ddd" });
+    expect(spoofed.status).toBe(429);
+    expect((await spoofed.json()).reason).toBe("ip_day");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(JSON.stringify([...kv.entries()])).not.toContain(CLIENT_IP);
+
+    const otherIp = await golfGet("/golfapi/v2.3/courses/s5", { install: "spoof-eee", ip: "203.0.113.99" });
+    expect(otherIp.status).toBe(200);
+  });
+
+  it("stops fresh lookups at the global daily cap", async () => {
+    const limits = readGolfapiLimits({});
+    expect(limits.globalDay).toBe(100);
+    expect(limits.openCalls).toBe(3);
+    expect(limits.deviceDay).toBe(12);
+    expect(limits.ipDay).toBeGreaterThan(limits.globalDay);
+    const allowedOpens = limits.globalDay - limits.openCalls + 1;
+    mockGolfApi(async (url) => jsonResponse(coursePayload(url.split("/").pop(), 80)));
+    for (let n = 1; n <= allowedOpens; n += 1) {
+      const install = `ginst${String(Math.floor((n - 1) / limits.deviceDay)).padStart(4, "0")}`;
+      const response = await golfGet(`/golfapi/v2.3/courses/g${n}`, { install });
+      expect(response.status, `open ${n} install ${install}`).toBe(200);
+    }
+    const blocked = await golfGet(`/golfapi/v2.3/courses/g${allowedOpens + 1}`, { install: "ginst9999" });
+    const body = await blocked.json();
+    expect(blocked.status).toBe(429);
+    expect(body.reason).toBe("global_day");
+    expect(body.queued).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(allowedOpens);
+    expect(stats().lookups).toBe(allowedOpens);
+    expect(kv.has(`gqueue:g${allowedOpens + 1}`)).toBe(true);
+  });
+
+  it("refuses fresh golfapi calls at the balance floor", async () => {
+    const limits = readGolfapiLimits({});
+    expect(limits.floor).toBe(50);
+    expect(limits.openCalls).toBe(3);
+    mockGolfApi(async () => jsonResponse(coursePayload("floor", 80)));
+    kv.set("gq:balance", { value: JSON.stringify({ left: limits.floor, at: 1, lastStatus: 200 }) });
+    const blocked = await golfGet("/golfapi/v2.3/courses/floor");
+    const body = await blocked.json();
+    expect(blocked.status).toBe(429);
+    expect(body.reason).toBe("floor");
+    expect(body.queued).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(kv.has("gqueue:floor")).toBe(true);
+
+    const reserved = limits.floor + limits.openCalls - 1;
+    kv.set("gq:balance", { value: JSON.stringify({ left: reserved, at: 1, lastStatus: 200 }) });
+    kv.delete("gqueue:floor");
+    const still = await golfGet("/golfapi/v2.3/courses/floor");
+    expect(still.status).toBe(429);
+    expect((await still.json()).reason).toBe("floor");
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    kv.set("gq:balance", {
+      value: JSON.stringify({ left: limits.floor + limits.openCalls, at: 1, lastStatus: 200 }),
+    });
+    kv.delete("gqueue:floor");
+    expect((await golfGet("/golfapi/v2.3/courses/floor")).status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    fetchMock.mockClear();
+    for (const key of [...kv.keys()]) {
+      if (key.startsWith("gq:set:")) kv.delete(key);
+    }
+    kv.set("gq:balance", { value: JSON.stringify({ left: limits.floor, at: 1, lastStatus: 200 }) });
+    const search = await golfGet("/golfapi/v2.3/courses?q=magnolia");
+    const searchBody = await search.json();
+    expect(search.status).toBe(429);
+    expect(searchBody.reason).toBe("floor");
+    expect(searchBody.queued).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
+    const queuedSearch = [...kv.keys()].filter((key) => key.startsWith("gqueue:"));
+    expect(queuedSearch).toHaveLength(1);
+    expect(queuedSearch[0].startsWith("gqueue:q:")).toBe(true);
+  });
+
+  it("counts searches inside one open as a single lookup and blocks the next course at the device day", async () => {
+    const limits = readGolfapiLimits({});
+    expect(limits.deviceDay).toBe(12);
+    expect(limits.searchCap).toBe(36);
+    mockGolfApi(async (url) => {
+      if (url.includes("/courses?")) {
+        return jsonResponse({
+          apiRequestsLeft: "80",
+          numCourses: 1,
+          courses: [{ courseID: "abc", courseName: "Somewhere" }],
+        });
+      }
+      return jsonResponse(coursePayload(url.split("/").pop(), 80));
+    });
+    for (const q of ["one", "two", "three"]) {
+      expect((await golfGet(`/golfapi/v2.3/courses?q=${q}`)).status).toBe(200);
+    }
+    expect(stats().lookups).toBe(1);
+    expect(stats().searches).toBe(3);
+    expect((await golfGet("/golfapi/v2.3/courses/pebble")).status).toBe(200);
+    expect(stats().lookups).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+
+    kv.clear();
+    edge.clear();
+    fetchMock.mockClear();
+    kv.set(`gq:dev:${INSTALL}`, {
+      value: JSON.stringify({ day: todayKey(), dayCount: limits.deviceDay }),
+    });
+    kv.set(`gq:set:dev:${INSTALL}`, {
+      value: JSON.stringify({ at: Date.now(), courseId: null, calls: 1 }),
+    });
+    expect((await golfGet("/golfapi/v2.3/courses/pebble")).status).toBe(200);
+    expect(stats().lookups).toBe(0);
+    expect(JSON.parse(kv.get(`gq:dev:${INSTALL}`).value).dayCount).toBe(limits.deviceDay);
+    const other = await golfGet("/golfapi/v2.3/courses/other");
+    expect(other.status).toBe(429);
+    expect((await other.json()).reason).toBe("device_day");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("caps a fresh search at 3x the device day on a new open and ignores search vars", async () => {
+    const limits = readGolfapiLimits({});
+    expect(limits.deviceDay).toBe(12);
+    expect(limits.searchCap).toBe(limits.deviceDay * 3);
+    kv.set(`gq:dev:${INSTALL}`, {
+      value: JSON.stringify({
+        day: todayKey(),
+        dayCount: 0,
+        searchDay: todayKey(),
+        searchCount: limits.searchCap,
+      }),
+    });
+    mockGolfApi(async () => jsonResponse(searchPayload("abc", "Somewhere", "80")));
+    const blocked = await golfGet("/golfapi/v2.3/courses?q=four");
+    const body = await blocked.json();
+    expect(blocked.status).toBe(429);
+    expect(body.reason).toBe("search_device_day");
+    expect(body.queued).toBe(true);
+    const again = await golfGet("/golfapi/v2.3/courses?q=Four");
+    expect(again.status).toBe(429);
+    const queued = [...kv.keys()].filter((key) => key.startsWith("gqueue:q:"));
+    expect(queued).toHaveLength(1);
+    expect(JSON.parse(kv.get(queued[0]).value).q).toBe("four");
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const raised = { ...env, GOLFAPI_SEARCH_DEVICE_DAY: "100", GOLFAPI_SEARCH_GLOBAL_DAY: "1000" };
+    expect(readGolfapiLimits(raised).searchCap).toBe(limits.searchCap);
+    const still = await golfGet("/golfapi/v2.3/courses?q=four", { env: raised });
+    expect(still.status).toBe(429);
+    expect((await still.json()).reason).toBe("search_device_day");
+    expect([...kv.keys()].filter((key) => key.startsWith("gqueue:q:"))).toHaveLength(1);
+
+    kv.clear();
+    edge.clear();
+    fetchMock.mockClear();
+    kv.set(`gq:dev:${INSTALL}`, {
+      value: JSON.stringify({
+        day: todayKey(),
+        dayCount: 0,
+        searchDay: todayKey(),
+        searchCount: limits.searchCap - 1,
+      }),
+    });
+    expect((await golfGet("/golfapi/v2.3/courses?q=under", { env: raised })).status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(stats().searches).toBe(1);
+  });
+
+  it.fails("live gap: caps fresh searches at 3x the device day inside an open set", async () => {
+    const limits = readGolfapiLimits({});
+    expect(limits.searchCap).toBe(36);
+    mockGolfApi(async () => jsonResponse(searchPayload("abc", "Somewhere", "80")));
+    for (let n = 1; n <= limits.searchCap; n += 1) {
+      const response = await golfGet(`/golfapi/v2.3/courses?q=search${n}`);
+      expect(response.status, `search ${n}`).toBe(200);
+    }
+    expect(stats().lookups).toBe(1);
+    expect(stats().searches).toBe(limits.searchCap);
+    expect(kv.has(`gq:set:dev:${INSTALL}`)).toBe(true);
+    const blocked = await golfGet(`/golfapi/v2.3/courses?q=search${limits.searchCap + 1}`);
+    const body = await blocked.json();
+    expect(blocked.status).toBe(429);
+    expect(body.reason).toBe("search_device_day");
+    expect(body.queued).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(limits.searchCap);
+  });
+
+  it("does not store an error body or a 200 with no course data", async () => {
+    const limits = readGolfapiLimits({});
+    expect(limits.floor).toBe(50);
+    mockGolfApi(async (url) => {
+      if (url.endsWith("/courses/missing")) {
+        return jsonResponse({ error: "Course not found", apiRequestsLeft: "80" });
+      }
+      if (url.endsWith("/coordinates/missing")) {
+        return jsonResponse({ apiRequestsLeft: "80", courseID: "missing", coordinates: [] });
+      }
+      if (url.endsWith("/coordinates/abc")) return jsonResponse({ ok: true });
+      throw new Error(url);
+    });
+    const missing = await golfGet("/golfapi/v2.3/courses/missing");
+    expect(missing.status).toBe(200);
+    expect(await missing.json()).toEqual({ error: "Course not found", apiRequestsLeft: "80" });
+    expect(kv.has("gapi:course:missing")).toBe(false);
+    expect(edge.size).toBe(0);
+
+    const emptyCoords = await golfGet("/golfapi/v2.3/coordinates/missing");
+    expect(emptyCoords.status).toBe(200);
+    expect(kv.has("gapi:coord:missing")).toBe(false);
+    expect(edge.size).toBe(0);
+    expect(JSON.parse(kv.get("gq:balance").value).left).toBe(80);
+    expect(80).toBeGreaterThan(limits.floor);
+
+    fetchMock.mockClear();
+    const repeatEmpty = await golfGet("/golfapi/v2.3/coordinates/missing");
+    expect(repeatEmpty.status).toBe(404);
+    expect(await repeatEmpty.json()).toEqual({ error: "no_course_data" });
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const plain = await golfGet("/golfapi/v2.3/coordinates/abc");
+    expect(plain.status).toBe(200);
+    expect(await plain.json()).toEqual({ ok: true });
+    expect(kv.has("gapi:coord:abc")).toBe(false);
+    expect([...edge.keys()].some((key) => key.includes("/coordinates/abc"))).toBe(false);
+  });
+
+  it.fails("live gap: a repeat of a golfapi error body is no_course_data", async () => {
+    mockGolfApi(async () => jsonResponse({ error: "Course not found", apiRequestsLeft: "80" }));
+    const missing = await golfGet("/golfapi/v2.3/courses/missing");
+    expect(missing.status).toBe(200);
+    expect(kv.has("gapi:course:missing")).toBe(false);
+    fetchMock.mockClear();
+    const repeat = await golfGet("/golfapi/v2.3/courses/missing");
+    expect(repeat.status).toBe(404);
+    expect(await repeat.json()).toEqual({ error: "no_course_data" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("overrides golfapi limits from vars and ignores invalid values", async () => {
+    const defaults = readGolfapiLimits({});
+    expect(defaults.deviceDay).toBe(12);
+    expect(defaults.ipDay).toBe(150);
+    expect(defaults.floor).toBe(50);
+    mockGolfApi(async (url) => jsonResponse(coursePayload(url.split("/").pop(), 80)));
+    const brokenDay = { ...env, GOLFAPI_DEVICE_DAY: "nope", GOLFAPI_DEVICE_WEEK: "1" };
+    expect(readGolfapiLimits(brokenDay).deviceDay).toBe(defaults.deviceDay);
+    expect(readGolfapiLimits(brokenDay).deviceWeek).toBe(1);
+    expect((await golfGet("/golfapi/v2.3/courses/cfg1", { env: brokenDay })).status).toBe(200);
+    const weekBlocked = await golfGet("/golfapi/v2.3/courses/cfg2", { env: brokenDay });
+    expect((await weekBlocked.json()).reason).toBe("device_week");
+
+    kv.clear();
+    edge.clear();
+    fetchMock.mockClear();
+    const oneDay = { ...env, GOLFAPI_DEVICE_DAY: "1", GOLFAPI_IP_DAY: "5" };
+    expect(readGolfapiLimits(oneDay).deviceDay).toBeLessThan(defaults.deviceDay);
+    expect(readGolfapiLimits(oneDay).ipDay).toBeLessThan(defaults.ipDay);
+    expect((await golfGet("/golfapi/v2.3/courses/cfg3", { env: oneDay })).status).toBe(200);
+    expect((await (await golfGet("/golfapi/v2.3/courses/cfg4", { env: oneDay })).json()).reason).toBe("device_day");
+
+    kv.clear();
+    edge.clear();
+    fetchMock.mockClear();
+    const ipOverride = { ...env, GOLFAPI_DEVICE_DAY: "5", GOLFAPI_IP_DAY: "1" };
+    expect(readGolfapiLimits(ipOverride).deviceDay).toBeLessThan(defaults.deviceDay);
+    expect(readGolfapiLimits(ipOverride).ipDay).toBeLessThan(defaults.ipDay);
+    expect((await golfGet("/golfapi/v2.3/courses/ipcfg", { env: ipOverride })).status).toBe(200);
+    expect((await (await golfGet("/golfapi/v2.3/courses/ipcfg2", { env: ipOverride })).json()).reason).toBe("ip_day");
+
+    kv.clear();
+    edge.clear();
+    fetchMock.mockClear();
+    const floorEnv = { ...env, GOLFAPI_FLOOR: "50" };
+    expect(readGolfapiLimits(floorEnv).floor).toBe(defaults.floor);
+    kv.set("gq:balance", { value: JSON.stringify({ left: 50, at: 1, lastStatus: 200 }) });
+    const floorBlocked = await golfGet("/golfapi/v2.3/courses/cfg5", { env: floorEnv });
+    expect((await floorBlocked.json()).reason).toBe("floor");
+    expect(fetchMock).not.toHaveBeenCalled();
+    kv.set("gq:balance", { value: JSON.stringify({ left: 53, at: 1, lastStatus: 200 }) });
+    expect((await golfGet("/golfapi/v2.3/courses/cfg5", { env: floorEnv })).status).toBe(200);
+
+    kv.clear();
+    edge.clear();
+    fetchMock.mockClear();
+    const stricterFloor = { ...env, GOLFAPI_FLOOR: "80" };
+    expect(readGolfapiLimits(stricterFloor).floor).toBeGreaterThan(defaults.floor);
+    kv.set("gq:balance", { value: JSON.stringify({ left: 80, at: 1, lastStatus: 200 }) });
+    const stricterBlocked = await golfGet("/golfapi/v2.3/courses/cfg6", { env: stricterFloor });
+    expect((await stricterBlocked.json()).reason).toBe("floor");
+    expect(fetchMock).not.toHaveBeenCalled();
+    kv.set("gq:balance", { value: JSON.stringify({ left: 83, at: 1, lastStatus: 200 }) });
+    expect((await golfGet("/golfapi/v2.3/courses/cfg6", { env: stricterFloor })).status).toBe(200);
+
+    kv.clear();
+    edge.clear();
+    fetchMock.mockClear();
+    const invalidFloor = { ...env, GOLFAPI_FLOOR: "nope" };
+    expect(readGolfapiLimits(invalidFloor).floor).toBe(defaults.floor);
+    kv.set("gq:balance", { value: JSON.stringify({ left: 50, at: 1, lastStatus: 200 }) });
+    expect((await (await golfGet("/golfapi/v2.3/courses/cfg7", { env: invalidFloor })).json()).reason).toBe("floor");
+    expect(fetchMock).not.toHaveBeenCalled();
+    kv.set("gq:balance", { value: JSON.stringify({ left: 53, at: 1, lastStatus: 200 }) });
+    expect((await golfGet("/golfapi/v2.3/courses/cfg7", { env: invalidFloor })).status).toBe(200);
+
+    kv.clear();
+    edge.clear();
+    fetchMock.mockClear();
+    mockGolfApi(async () => jsonResponse({ apiRequestsLeft: "80", numCourses: 0, courses: [] }));
+    const ignoredSearchVars = { ...env, GOLFAPI_SEARCH_GLOBAL_DAY: "1", GOLFAPI_SEARCH_DEVICE_DAY: "10" };
+    expect(readGolfapiLimits(ignoredSearchVars).searchCap).toBe(defaults.searchCap);
+    expect((await golfGet("/golfapi/v2.3/courses?q=one", { env: ignoredSearchVars })).status).toBe(200);
+    expect((await golfGet("/golfapi/v2.3/courses?q=two", { env: ignoredSearchVars })).status).toBe(200);
+    expect(stats().lookups).toBe(1);
+    expect(stats().searches).toBe(2);
+  });
+
+  it("keeps an open 15 minute set free and treats an expired set as closed", async () => {
+    const limits = readGolfapiLimits({});
+    expect(limits.deviceDay).toBe(12);
+    async function sha256Hex(text) {
+      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+      return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    }
+    async function seedSets(courseId, at) {
+      const value = JSON.stringify({ at, courseId });
+      kv.set(`gq:set:dev:${INSTALL}`, { value });
+      kv.set(`gq:set:ip:${await sha256Hex(`shottrax-golfapi-ip-v1:${CLIENT_IP}`)}`, { value });
+    }
+    kv.set(`gq:dev:${INSTALL}`, {
+      value: JSON.stringify({ day: todayKey(), dayCount: limits.deviceDay }),
+    });
+    await seedSets("pebble", Date.now());
+    mockGolfApi(async () => jsonResponse(coursePayload("pebble", 80)));
+    expect((await golfGet("/golfapi/v2.3/courses/pebble")).status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(stats().lookups).toBe(0);
+    expect(JSON.parse(kv.get(`gq:dev:${INSTALL}`).value).dayCount).toBe(limits.deviceDay);
+
+    fetchMock.mockClear();
+    const other = await golfGet("/golfapi/v2.3/courses/other");
+    expect(other.status).toBe(429);
+    expect((await other.json()).reason).toBe("device_day");
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    kv.clear();
+    edge.clear();
+    fetchMock.mockClear();
+    kv.set(`gq:dev:${INSTALL}`, {
+      value: JSON.stringify({ day: todayKey(), dayCount: limits.deviceDay }),
+    });
+    await seedSets("pebble", Date.now() - 16 * 60 * 1000);
+    const expired = await golfGet("/golfapi/v2.3/courses/pebble");
+    expect(expired.status).toBe(429);
+    expect((await expired.json()).reason).toBe("device_day");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("drains queued courses under the cap and above the floor", async () => {
+    const limits = readGolfapiLimits({});
+    expect(limits.globalDay).toBe(100);
+    expect(limits.floor).toBe(50);
+    expect(limits.openCalls).toBe(3);
+    const aboveFloor = 80;
+    expect(aboveFloor - limits.openCalls).toBeGreaterThanOrEqual(limits.floor);
+    const oneOpen = { ...env, GOLFAPI_GLOBAL_DAY: String(limits.openCalls) };
+    expect(readGolfapiLimits(oneOpen).globalDay).toBe(limits.openCalls);
+    expect(readGolfapiLimits(oneOpen).globalDay).toBeLessThan(limits.globalDay);
+
+    kv.set("gqueue:ready", { value: JSON.stringify({ attempts: 0, at: 1 }) });
+    kv.set("gqueue:later", { value: JSON.stringify({ attempts: 0, at: 2 }) });
+    kv.set("gq:balance", { value: JSON.stringify({ left: aboveFloor, at: 1, lastStatus: 200 }) });
+    const calls = [];
+    mockGolfApi(async (url) => {
+      calls.push(url);
+      if (url.endsWith("/courses/ready")) return jsonResponse(coursePayload("ready", 78));
+      if (url.endsWith("/coordinates/ready")) return jsonResponse(coordPayload("ready", 77));
+      throw new Error(`should not fetch ${url}`);
+    });
+    await runDrain(oneOpen);
+    expect(calls).toEqual([
+      "https://golfapi.io/api/v2.3/courses/ready",
+      "https://golfapi.io/api/v2.3/coordinates/ready",
+    ]);
+    expect(kv.has("gqueue:ready")).toBe(false);
+    expect(kv.has("gqueue:later")).toBe(true);
+    expect(kv.get("gapi:course:ready")?.value).toContain("Magnolia");
+    expect(kv.get("gapi:coord:ready")?.value).toContain("coordinates");
+    expect(stats().lookups).toBe(1);
+
+    fetchMock.mockClear();
+    const free = await golfGet("/golfapi/v2.3/courses/ready");
+    expect(free.status).toBe(200);
+    expect(await free.json()).toMatchObject({ courseID: "ready" });
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    kv.set("gq:balance", { value: JSON.stringify({ left: limits.floor, at: 1, lastStatus: 200 }) });
+    await runDrain(oneOpen);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(kv.has("gqueue:later")).toBe(true);
+
+    kv.set("gq:balance", { value: JSON.stringify({ left: aboveFloor, at: 1, lastStatus: 200 }) });
+    await runDrain(oneOpen);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    kv.set(`gq:stats:${todayKey()}`, {
+      value: JSON.stringify({ lookups: 0, searches: 0, hits: 0, blocked: {} }),
+    });
+    kv.set("gq:balance", { value: JSON.stringify({ left: aboveFloor, at: 1, lastStatus: 200 }) });
+    mockGolfApi(async () => new Response("nope", { status: 500, headers: { "Content-Type": "text/plain" } }));
+    await runDrain(env);
+    expect(JSON.parse(kv.get("gqueue:later").value).attempts).toBe(1);
+    expect(kv.has("gapi:course:later")).toBe(false);
+    expect(stats().lookups).toBe(1);
+
+    kv.set("gqueue:later", { value: JSON.stringify({ attempts: 5, at: 2 }) });
+    fetchMock.mockClear();
+    await runDrain(env);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(JSON.parse(kv.get("gqueue:later").value).attempts).toBe(5);
+  });
+
+  it.fails("live gap: drain drops a queued course when the upstream body is an error", async () => {
+    const limits = readGolfapiLimits({});
+    expect(limits.floor).toBe(50);
+    kv.set("gqueue:empty", { value: JSON.stringify({ attempts: 0, at: 3 }) });
+    kv.set("gq:balance", { value: JSON.stringify({ left: 80, at: 1, lastStatus: 200 }) });
+    mockGolfApi(async () => jsonResponse({ error: "missing", apiRequestsLeft: "80" }));
+    await runDrain(env);
+    expect(kv.has("gqueue:empty")).toBe(false);
+    expect(kv.has("gapi:course:empty")).toBe(false);
+    expect(kv.has("gapi:coord:empty")).toBe(false);
+    expect(JSON.parse(kv.get("gq:balance").value).left).toBe(80);
+  });
+
+  it.fails("live gap: stops a queue refill before coordinates once balance reaches the floor", async () => {
+    const limits = readGolfapiLimits({});
+    expect(limits.floor).toBe(50);
+    expect(limits.openCalls).toBe(3);
+    kv.set("gqueue:split", { value: JSON.stringify({ attempts: 0, at: 1 }) });
+    kv.set("gq:balance", {
+      value: JSON.stringify({ left: limits.floor + limits.openCalls, at: 1, lastStatus: 200 }),
+    });
+    const calls = [];
+    mockGolfApi(async (url) => {
+      calls.push(url);
+      if (url.endsWith("/courses/split")) return jsonResponse(coursePayload("split", limits.floor));
+      if (url.endsWith("/coordinates/split")) return jsonResponse(coordPayload("split", limits.floor));
+      throw new Error(url);
+    });
+    await runDrain();
+    expect(calls).toEqual(["https://golfapi.io/api/v2.3/courses/split"]);
+    expect(kv.has("gapi:course:split")).toBe(true);
+    expect(kv.has("gapi:coord:split")).toBe(false);
+    expect(JSON.parse(kv.get("gqueue:split").value).attempts).toBe(0);
+    expect(stats().lookups).toBe(1);
+  });
+
+  it("queues a limited name= search and the drain replays name=", async () => {
+    const limits = readGolfapiLimits({});
+    expect(limits.searchCap).toBe(36);
+    kv.set(`gq:dev:${INSTALL}`, {
+      value: JSON.stringify({
+        day: todayKey(),
+        dayCount: 0,
+        searchDay: todayKey(),
+        searchCount: limits.searchCap,
+      }),
+    });
+    mockGolfApi(async () => jsonResponse(searchPayload("oak", "Oak Marsh", "80")));
+    const blocked = await golfGet("/golfapi/v2.3/courses?country=US&name=Oak%20Marsh");
+    const body = await blocked.json();
+    expect(blocked.status).toBe(429);
+    expect(body.reason).toBe("search_device_day");
+    expect(body.queued).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
+    const queued = [...kv.keys()].filter((key) => key.startsWith("gqueue:q:"));
+    expect(queued).toEqual([`gqueue:q:${await searchTokenFor("oak marsh")}`]);
+    expect(JSON.parse(kv.get(queued[0]).value)).toMatchObject({
+      attempts: 0,
+      q: "oak marsh",
+      search: "?country=US&name=Oak%20Marsh",
+    });
+
+    const calls = [];
+    mockGolfApi(async (url) => {
+      calls.push(url);
+      if (url.includes("/courses?")) return jsonResponse(searchPayload("oak", "Oak Marsh", "80"));
+      if (url.endsWith("/courses/oak")) return jsonResponse(coursePayload("oak", 80));
+      if (url.endsWith("/coordinates/oak")) return jsonResponse(coordPayload("oak", 80));
+      throw new Error(url);
+    });
+    await runDrain();
+    expect(calls).toEqual([
+      "https://golfapi.io/api/v2.3/courses?country=US&name=Oak%20Marsh",
+      "https://golfapi.io/api/v2.3/courses/oak",
+      "https://golfapi.io/api/v2.3/coordinates/oak",
+    ]);
+    expect(kv.has(queued[0])).toBe(false);
+    expect(kv.get(`gapi:search:${await searchTokenFor("oak marsh")}`)?.opts.expirationTtl).toBe(30 * DAY);
+    expect(kv.has("gapi:course:oak")).toBe(true);
+    expect(kv.has("gapi:coord:oak")).toBe(true);
+  });
+
+  it("drains a queued search and follows a unique normalized name", async () => {
+    const limits = readGolfapiLimits({});
+    expect(limits.floor).toBe(50);
+    kv.set("gq:balance", { value: JSON.stringify({ left: limits.floor, at: 1, lastStatus: 200 }) });
+    const blocked = await golfGet("/golfapi/v2.3/courses?country=US&q=Magnolia");
+    expect(blocked.status).toBe(429);
+    expect((await blocked.json()).queued).toBe(true);
+    expect((await golfGet("/golfapi/v2.3/courses?q=magnolia")).status).toBe(429);
+    const queued = [...kv.keys()].filter((key) => key.startsWith("gqueue:"));
+    expect(queued).toHaveLength(1);
+    expect(JSON.parse(kv.get(queued[0]).value)).toMatchObject({
+      attempts: 0,
+      q: "magnolia",
+      search: "?country=US&q=Magnolia",
+    });
+    kv.set("gqueue:q:nope", { value: JSON.stringify({ attempts: 0, at: 5, q: "nope", search: "?q=nope" }) });
+
+    kv.set("gq:balance", { value: JSON.stringify({ left: 80, at: 1, lastStatus: 200 }) });
+    const calls = [];
+    mockGolfApi(async (url) => {
+      calls.push(url);
+      if (url.includes("/courses?")) {
+        return jsonResponse({
+          apiRequestsLeft: "80",
+          numCourses: 1,
+          courses: [{ courseID: "pebble", courseName: "Magnolia" }],
+        });
+      }
+      if (url.endsWith("/courses/pebble")) return jsonResponse(coursePayload("pebble", 80));
+      if (url.endsWith("/coordinates/pebble")) return jsonResponse(coordPayload("pebble", 80));
+      throw new Error(url);
+    });
+    await runDrain();
+    expect(calls).toEqual([
+      "https://golfapi.io/api/v2.3/courses?country=US&q=Magnolia",
+      "https://golfapi.io/api/v2.3/courses/pebble",
+      "https://golfapi.io/api/v2.3/coordinates/pebble",
+    ]);
+    expect(kv.has(queued[0])).toBe(false);
+    expect(kv.has("gqueue:q:nope")).toBe(false);
+    const token = queued[0].slice("gqueue:q:".length);
+    expect(kv.get(`gapi:search:${token}`)?.opts.expirationTtl).toBe(30 * DAY);
+    expect(kv.get("gapi:course:pebble")?.opts.expirationTtl).toBe(365 * DAY);
+    expect(kv.get("gapi:coord:pebble")?.value).toContain("coordinates");
+    expect(stats().lookups).toBe(1);
+
+    fetchMock.mockClear();
+    expect((await golfGet("/golfapi/v2.3/courses?q=magnolia")).status).toBe(200);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(stats().lookups).toBe(1);
+  });
+
+  it("stores only the search when the queued name is not a single match", async () => {
+    const limits = readGolfapiLimits({});
+    expect(limits.floor).toBe(50);
+    async function enqueue(path) {
+      kv.set("gq:balance", { value: JSON.stringify({ left: limits.floor, at: 1, lastStatus: 200 }) });
+      expect((await golfGet(path)).status).toBe(429);
+      kv.set("gq:balance", { value: JSON.stringify({ left: 80, at: 1, lastStatus: 200 }) });
+    }
+
+    await enqueue("/golfapi/v2.3/courses?q=Pine");
+    const calls = [];
+    mockGolfApi(async (url) => {
+      calls.push(url);
+      return jsonResponse({
+        apiRequestsLeft: "80",
+        numCourses: 2,
+        courses: [
+          { courseID: "a", courseName: "Pine" },
+          { courseID: "b", clubName: "Pine" },
+        ],
+      });
+    });
+    await runDrain();
+    expect(calls).toEqual(["https://golfapi.io/api/v2.3/courses?q=Pine"]);
+    expect([...kv.keys()].some((key) => key.startsWith("gapi:course:"))).toBe(false);
+    expect([...kv.keys()].some((key) => key.startsWith("gapi:search:"))).toBe(true);
+    expect([...kv.keys()].some((key) => key.startsWith("gqueue:"))).toBe(false);
+    expect(stats().lookups).toBe(1);
+
+    kv.clear();
+    edge.clear();
+    calls.length = 0;
+    await enqueue("/golfapi/v2.3/courses?q=Missing");
+    mockGolfApi(async (url) => {
+      calls.push(url);
+      return jsonResponse({
+        apiRequestsLeft: "80",
+        numCourses: 1,
+        courses: [{ courseID: "zzz", courseName: "Other" }],
+      });
+    });
+    await runDrain();
+    expect(calls).toEqual(["https://golfapi.io/api/v2.3/courses?q=Missing"]);
+    expect([...kv.keys()].some((key) => key.startsWith("gapi:course:"))).toBe(false);
+    expect([...kv.keys()].some((key) => key.startsWith("gqueue:"))).toBe(false);
+    expect(stats().lookups).toBe(1);
+  });
+
+  it.fails("live gap: leaves a queued search in place when the floor hits before course details", async () => {
+    const limits = readGolfapiLimits({});
+    expect(limits.floor).toBe(50);
+    kv.set("gq:balance", { value: JSON.stringify({ left: limits.floor, at: 1, lastStatus: 200 }) });
+    expect((await golfGet("/golfapi/v2.3/courses?q=Magnolia")).status).toBe(429);
+    const queued = [...kv.keys()].filter((key) => key.startsWith("gqueue:q:"));
+    expect(queued).toHaveLength(1);
+    kv.set("gq:balance", { value: JSON.stringify({ left: 80, at: 1, lastStatus: 200 }) });
+    mockGolfApi(async () => jsonResponse({
+      apiRequestsLeft: String(limits.floor),
+      numCourses: 1,
+      courses: [{ courseID: "pebble", courseName: "Magnolia" }],
+    }));
+    await runDrain();
+    expect(kv.has(queued[0])).toBe(true);
+    expect(JSON.parse(kv.get(queued[0]).value).attempts).toBe(0);
+    expect(kv.has(`gapi:search:${queued[0].slice("gqueue:q:".length)}`)).toBe(true);
+    expect(kv.has("gapi:course:pebble")).toBe(false);
+    expect(stats().lookups).toBe(1);
+
+    const calls = [];
+    kv.set("gq:balance", { value: JSON.stringify({ left: 80, at: 1, lastStatus: 200 }) });
+    mockGolfApi(async (url) => {
+      calls.push(url);
+      if (url.endsWith("/courses/pebble")) return jsonResponse(coursePayload("pebble", 80));
+      if (url.endsWith("/coordinates/pebble")) return jsonResponse(coordPayload("pebble", 80));
+      throw new Error(url);
+    });
+    await runDrain();
+    expect(calls).toEqual([
+      "https://golfapi.io/api/v2.3/courses/pebble",
+      "https://golfapi.io/api/v2.3/coordinates/pebble",
+    ]);
+    expect(kv.has(queued[0])).toBe(false);
+    expect(stats().lookups).toBe(2);
+  });
+
+  it("live-shottrax-share reserves fr: for raw and percent-encoded paths", async () => {
+    const counts = { get: 0, put: 0, delete: 0, list: 0 };
+    const boards = env.BOARDS;
+    env.BOARDS = {
+      async get(key) {
+        counts.get += 1;
+        return boards.get(key);
+      },
+      async put(key, value, options) {
+        counts.put += 1;
+        return boards.put(key, value, options);
+      },
+      async delete(key) {
+        counts.delete += 1;
+        return boards.delete(key);
+      },
+      async list(options) {
+        counts.list += 1;
+        return boards.list(options);
+      },
+    };
+    const proof = await invoke(`${ORIGIN}/board2345`, { method: "PUT", body: "{\"ok\":true}" });
+    expect(proof.status).toBe(200);
+    expect(counts.put).toBe(1);
+    const read = await invoke(`${ORIGIN}/board2345`);
+    expect(read.status).toBe(200);
+    expect(await read.text()).toBe("{\"ok\":true}");
+    expect(counts.get).toBeGreaterThan(0);
+    counts.get = 0;
+    counts.put = 0;
+    counts.delete = 0;
+    counts.list = 0;
+    const paths = [
+      "/fr:code:AB3K7NP2",
+      "/fr:round:k3mR9xQ2nB8wL4pT6vYs1A:round_7Kp2",
+      "/fr:friend:k3mR9xQ2nB8wL4pT6vYs1A:k3mR9xQ2nB8wL4pT6vYs1B",
+      "/fr%3Acode:AB3K7NP2",
+      "/fr%3acode:AB3K7NP2",
+      "/fr%3Around:k3mR9xQ2nB8wL4pT6vYs1A:round_7Kp2",
+      "/fr%3afriend:k3mR9xQ2nB8wL4pT6vYs1A:k3mR9xQ2nB8wL4pT6vYs1B",
+    ];
+    for (const path of paths) {
+      for (const method of ["GET", "PUT", "DELETE"]) {
+        const response = await invoke(`${ORIGIN}${path}`, {
+          method,
+          body: method === "PUT" ? "{\"forged\":true}" : undefined,
+        });
+        expect(response.status, `${method} ${path}`).toBe(400);
+        expect(await response.text(), `${method} ${path}`).toBe("bad key");
+      }
+    }
+    expect(counts).toEqual({ get: 0, put: 0, delete: 0, list: 0 });
+    expect(kv.get("board2345").value).toBe("{\"ok\":true}");
+    env.BOARDS = boards;
+  });
+
   it("reports /meta/golfapi without secrets, install ids, or IPs", async () => {
     mockGolfApi(async (url) => {
       if (url.includes("/courses?")) {
-        return jsonResponse({ apiRequestsLeft: "33.5", numCourses: 1, courses: [{ courseID: "m", courseName: "M" }] });
+        return jsonResponse({ apiRequestsLeft: "80.5", numCourses: 1, courses: [{ courseID: "m", courseName: "M" }] });
       }
-      return jsonResponse(coursePayload("meta", 40));
+      return jsonResponse(coursePayload("meta", 80));
     });
-    const limited = { ...env, GOLFAPI_DEVICE_DAY: "1", GOLFAPI_FLOOR: "10" };
+    const limited = { ...env, GOLFAPI_DEVICE_DAY: "1" };
+    expect(readGolfapiLimits({}).floor).toBe(50);
+    expect(readGolfapiLimits({}).deviceDay).toBe(12);
+    expect(readGolfapiLimits(limited).floor).toBe(50);
+    expect(readGolfapiLimits(limited).deviceDay).toBe(1);
     expect((await golfGet("/golfapi/v2.3/courses/meta", { env: limited })).status).toBe(200);
     expect((await golfGet("/golfapi/v2.3/courses/meta", { env: limited })).status).toBe(200);
     expect((await golfGet("/golfapi/v2.3/courses?q=meta", { env: limited })).status).toBe(200);
@@ -1732,7 +2510,7 @@ describe("shottrax-share worker", () => {
     expect(meta.headers.get("Cache-Control")).toBe("no-store");
     const body = await meta.json();
     expect(body.balance).toEqual({
-      left: 33.5,
+      left: 80.5,
       at: expect.any(Number),
       lastStatus: 200,
       asOf: expect.any(String),
