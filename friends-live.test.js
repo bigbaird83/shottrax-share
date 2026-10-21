@@ -281,6 +281,45 @@ describe("live rounds for friends", () => {
     expect((await getLive(pal)).json).toEqual({ live: [] });
   });
 
+  it("a blocked friend stops seeing it, whichever side blocks", async () => {
+    for (const side of ["golfer", "pal"]) {
+      const golfer = await mint(`live-blk-${side}`);
+      const pal = await mint(`live-blk-${side}-pal`);
+      await befriend(pal, golfer);
+      await putLive(golfer);
+      expect((await getLive(pal)).json.live).toHaveLength(1);
+      const [blocker, other] = side === "golfer" ? [golfer, pal] : [pal, golfer];
+      const blocked = await invoke("/v1/friends/block", { friend: blocker.key, body: { ownerId: other.ownerId } });
+      expect(blocked.status).toBe(200);
+      expect((await getLive(pal)).json).toEqual({ live: [] });
+    }
+  });
+
+  it("a block row alone hides the live row, even if friend edges were left behind", async () => {
+    for (const side of ["golfer", "pal"]) {
+      const golfer = await mint(`live-blkrow-${side}`);
+      const pal = await mint(`live-blkrow-${side}-pal`);
+      await befriend(pal, golfer);
+      await putLive(golfer);
+      expect((await getLive(pal)).json.live).toHaveLength(1);
+      const [blocker, other] = side === "golfer" ? [golfer, pal] : [pal, golfer];
+      // Simulates a partial write: the block is stored but the friend edges are still there.
+      kv.set(`fr:block:${blocker.ownerId}:${other.ownerId}`, { value: "1" });
+      expect((await getLive(pal)).json).toEqual({ live: [] });
+    }
+  });
+
+  it("a one-sided friend edge is not enough: the golfer's edge back to the caller is required", async () => {
+    const golfer = await mint("live-one");
+    const pal = await mint("live-one-pal");
+    await befriend(pal, golfer);
+    await putLive(golfer);
+    expect((await getLive(pal)).json.live).toHaveLength(1);
+    // The pal's friend list still names the golfer, but the golfer's edge back is gone.
+    expect(kv.delete(`fr:friend:${golfer.ownerId}:${pal.ownerId}`)).toBe(true);
+    expect((await getLive(pal)).json).toEqual({ live: [] });
+  });
+
   it("validates the body and needs a friend key", async () => {
     const golfer = await mint("live-val");
     expect((await invoke("/v1/friends/live", { method: "PUT", body: LIVE })).status).toBe(401);
