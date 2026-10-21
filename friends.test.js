@@ -978,6 +978,62 @@ describe("friend codes", () => {
     return storedRounds(ownerId).some((round) => round && round.id === id);
   }
 
+  function deleteRounds(friend, body) {
+    return invoke("/v1/friends/rounds/delete", { method: "POST", friend, body });
+  }
+
+  it("deletes only the caller's named rounds, shared or past, and retries are fine", async () => {
+    const caller = await mint("del-caller");
+    const pal = await mint("del-pal");
+    await befriend(pal, caller);
+    expect((await putRound(caller.key, baseRound({ id: "round_keep" }))).status).toBe(200);
+    expect((await putRound(caller.key, baseRound({ id: "round_gone", courseName: "Pine Hollow" }))).status).toBe(200);
+    expect((await putRound(caller.key, baseRound({ id: "round_dup", courseName: "Pine Hollow North" }))).status).toBe(200);
+    expect((await putRound(pal.key, baseRound({ id: "round_gone" }))).status).toBe(200);
+    const past = await invoke("/v1/friends/past", {
+      method: "PUT",
+      friend: caller.key,
+      body: { ownerId: pal.ownerId, choice: "10", rounds: [baseRound({ id: "round_past" })] },
+    });
+    expect(past.status).toBe(200);
+    expect(hasRound(caller.ownerId, "round_past")).toBe(true);
+
+    const gone = await deleteRounds(caller.key, { ids: ["round_gone", "round_dup", "round_past", "round_never"] });
+    expect(gone.status).toBe(200);
+    expect(gone.json).toEqual({ ok: true, removed: 3 });
+    expect(storedRounds(caller.ownerId).map((round) => round.id)).toEqual(["round_keep"]);
+    // The friend's round with the same id is theirs and stays.
+    expect(hasRound(pal.ownerId, "round_gone")).toBe(true);
+    const seen = await fetchRounds(pal.key);
+    expect(seen.json.rounds.filter((round) => round.ownerId === caller.ownerId).map((round) => round.id)).toEqual(["round_keep"]);
+
+    const again = await deleteRounds(caller.key, { ids: ["round_gone"] });
+    expect(again.status).toBe(200);
+    expect(again.json).toEqual({ ok: true, removed: 0 });
+
+    const last = await deleteRounds(caller.key, { ids: ["round_keep"] });
+    expect(last.json).toEqual({ ok: true, removed: 1 });
+    expect(kv.has(roundsKey(caller.ownerId))).toBe(false);
+  });
+
+  it("rejects bad delete bodies and missing keys without writing", async () => {
+    const caller = await mint("del-bad");
+    expect((await putRound(caller.key, baseRound({ id: "round_safe" }))).status).toBe(200);
+    const before = kvSnapshot();
+    for (const body of [{}, { ids: [] }, { ids: "round_safe" }, { ids: ["bad id!"] }, { ids: [7] }, { ids: ["round_safe"], extra: 1 }, { ids: Array.from({ length: 101 }, (_, i) => `r${i}`) }]) {
+      const res = await deleteRounds(caller.key, body);
+      expect(res.status).toBe(400);
+      expect(res.json).toEqual({ error: "invalid_body" });
+    }
+    const noKey = await invoke("/v1/friends/rounds/delete", { method: "POST", body: { ids: ["round_safe"] } });
+    expect(noKey.status).toBe(401);
+    const unknownKey = await deleteRounds(friendKey("nobody"), { ids: ["round_safe"] });
+    expect(unknownKey.status).toBe(401);
+    const wrongMethod = await invoke("/v1/friends/rounds/delete", { method: "GET", friend: caller.key });
+    expect(wrongMethod.status).toBe(405);
+    expect(kvSnapshot()).toEqual(before);
+  });
+
   it("remove without a friendship is 409 and deletes nothing", async () => {
     const caller = await mint("rm-none");
     const other = await mint("rm-other");
