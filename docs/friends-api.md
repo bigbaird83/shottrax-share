@@ -54,7 +54,33 @@ Body: empty, or `{}`.
 
 The friend key must already have a code. Otherwise `401` `{ "error": "friend_key_required" }`.
 
-`200` with the new `code` and the same `ownerId`. The previous code then looks up as `404` `{ "error": "code_not_found" }`. Does not count as a guess, and does not clear the guess counter.
+`200` with the new `code` and the same `ownerId`. The previous code then looks up as `404` `{ "error": "code_not_found" }`. Does not count as a guess, and does not clear the guess counter. The invite name stored with the previous code (`fr:invname:<old CODE>`) is deleted on the same request. It is not copied to the new code.
+
+### setInviteName
+
+`POST /v1/friends/code/name`
+
+```json
+{ "name": "Alex M." }
+```
+
+The sharer's name for this invite. It is stored with the caller's current code and is never part of the link or the URL. Whitespace runs collapse to one space and the ends are trimmed. 1 to 24 characters, no control characters, else `400` `{ "error": "invalid_body" }`. `null`, `""` or all spaces deletes it. A key with no code is `401`. `200` `{ "ok": true }`. Not a guess and not rate limited beyond the normal key check.
+
+The name is returned only by code lookup (below), when someone opens the link or types the code. `getCode`, `resetCode`, the lists and `fetchRounds` never carry it. It is invite-only: it changes nothing about what is shared.
+
+### setPastRounds
+
+`PUT /v1/friends/past`
+
+```json
+{ "ownerId": "<friend>", "choice": "10", "rounds": [ { "id": "...", "courseName": "...", "playedOn": "2025-04-01", "gross": 84, "toPar": 12, "holes": [ ] } ] }
+```
+
+The caller's own past rounds for one accepted friend. `choice` is `"none"`, `"10"`, `"25"` or `"all"`. `rounds` may hold at most 0, 10, 25 or 100 (`ROUND_CAP`) entries for those choices. Each round passes the same allowlist as `publishRound`, so GPS, names and unknown fields are `400`. Body cap 256 KB. Not friends both ways: `409` `{ "error": "not_friends" }`. Rate limited on the `ippub:` IP counter. `200` `{ "ok": true }`.
+
+Storage: past rounds live in the owner's one `fr:rounds:<ownerId>` value with a private audience `to: [ownerIds]`. A call first takes this friend off every past round (a past round with no audience left is deleted), then adds the new pick. So a lower choice, or `"none"`, deletes the rounds that no longer fit from the Worker. A round already shared the normal way (no `to`) is visible to every friend and is left as it is. A later `publishRound` of the same id makes it a normal shared round. Counts toward the 100-round cap; over it is `409` `round_limit`.
+
+Each side picks only for its own rounds. No call returns a choice or an audience, the caller's or the friend's: `fetchRounds` strips `to`, and there is no read route for `/past` (`GET` is `405`). Remove and block take the caller off the other side's past rounds too.
 
 ### sendRequest
 
@@ -264,7 +290,7 @@ No body.
 
 `200` `{ "rounds": [ ] }`
 
-Each entry is a stored round from an accepted friend, plus the caller's own published rounds. Rounds the caller removed, blocked, or unshared are already gone. The other person's rounds are not deleted by remove or block, so that person's other friends still fetch them. Omitted stat fields stay omitted. A stored round that fails the allowlist, including one that carries GPS, is omitted on read. The response is the full list. There is no cursor. Rounds are sorted by `playedOn`, then `ownerId`, then `id`, ascending.
+Each entry is a stored round from an accepted friend, plus the caller's own published rounds. A friend's past round (see setPastRounds) is included only when it was given to the caller, and the `to` audience is never returned. Rounds the caller removed, blocked, or unshared are already gone. The other person's rounds are not deleted by remove or block, so that person's other friends still fetch them. Omitted stat fields stay omitted. A stored round that fails the allowlist, including one that carries GPS, is omitted on read. The response is the full list. There is no cursor. Rounds are sorted by `playedOn`, then `ownerId`, then `id`, ascending.
 
 Fetch reads `3 + 2N + F` KV values and does not list. `N` is the caller's friend-list length. `F` is how many of those friends are unblocked in both directions (`F` ≤ `N`). The reads are 1 auth row, 1 `fr:friends:` list, 1 own `fr:rounds:` value, 2 block checks per friend, and 1 round-list read per unblocked friend. When nobody is blocked, that is `3 + 3N` gets.
 
@@ -278,7 +304,7 @@ Fetch reads `3 + 2N + F` KV values and does not list. `N` is the caller's friend
 
 This is the resolve `sendRequest` uses. Both calls share one guess counter per friend key and one per IP. The friend key must already have a minted code, or the call is `401` `{ "error": "friend_key_required" }` and does not spend a guess.
 
-`200` `{ "ownerId": "<public id>" }`
+`200` `{ "ownerId": "<public id>" }`, plus `"name"` when the code's owner set an invite name (`{ "ownerId": "<public id>", "name": "Alex M." }`).
 
 Unknown code, including a code that `resetCode` just replaced: `404` `{ "error": "code_not_found" }`.
 
@@ -377,7 +403,8 @@ Friend rows use the `fr:` prefix only. The keys this API writes are:
 - `fr:friend:<a>:<b>` — one direction of an accepted friendship. The value is `1`. Both directions are required.
 - `fr:friends:<ownerId>` — JSON array of the other owner ids. This is the fetch index and the 50-friend cap. `accept` writes both lists. `remove` and `block` take the other person out of both lists.
 - `fr:block:<blocker>:<blocked>` — the caller's block. The value is `1`.
-- `fr:rounds:<ownerId>` — JSON array of that owner's shared rounds, one value, `expirationTtl` of 365 days. This replaces per-round `fr:round:<owner>:<id>` keys.
+- `fr:rounds:<ownerId>` — JSON array of that owner's shared rounds, one value, `expirationTtl` of 365 days. This replaces per-round `fr:round:<owner>:<id>` keys. A past round carries `to: [ownerIds]`, the friends it was given to.
+- `fr:invname:<CODE>` — the invite name for that code, a plain string of 1–24 characters. `resetCode` deletes it with the old code.
 
 None of these routes read or write `id:`, `name:`, `osm:`, `gq:`, `gapi:`, `gqueue:`, `gca:`, or `cr:`. `GET /v1/friends/requests` and `GET /v1/friends/list` do not `put` or `delete` any KV key. The only mutation on those calls is the Durable Object attempt counter. Board `GET`, `PUT`, and `DELETE` reserve the `fr:` prefix and return `400` with no KV read or write. That includes a percent-encoded path (`fr%3A` and `fr%3a`), so a board path cannot read, replace, or forge a friend row. Guess counts live in the Durable Object, not in KV.
 

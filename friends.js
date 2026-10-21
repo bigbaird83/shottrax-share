@@ -16,6 +16,10 @@
  * and has no display name or created time. A quiet-block send writes
  * fr:out:<sender>:<recipient> = pending for that sender's outgoing list
  * only. It is not a request, it has no TTL, and unblock does not promote it.
+ * setInviteName stores the sharer's invite name at fr:invname:<code>; only
+ * code lookup returns it and resetCode deletes it. setPastRounds gives one
+ * friend a pick of the caller's past rounds (private "to" audience inside
+ * fr:rounds:); fetchRounds never returns a choice or an audience.
  */
 
 export const FRIEND_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -30,12 +34,19 @@ export const FRIEND_READ_IP_LIMIT = 60;
 export const FRIEND_GUESS_WINDOW_MS = 60 * 60 * 1000;
 export const FRIEND_CAP = 50;
 export const ROUND_CAP = 100;
+// Invite name: the sharer's own name for this invite, stored with the code.
+// It is never in the URL. lookup returns it; reset deletes it with the old code.
+export const INVITE_NAME_MAX = 24;
+// Past rounds: per friend, the owner's pick of rounds finished before the
+// friendship. "all" is still capped at ROUND_CAP.
+export const PAST_ROUND_CHOICES = Object.freeze(["none", "10", "25", "all"]);
 
 const FRIEND_KEY_PREFIX = "fr:";
 const FRIEND_KEY_HASH_PREFIX = "shottrax-friend-key-v1:";
 const FRIEND_IP_HASH_PREFIX = "shottrax-friend-guess-ip-v1:";
 const FRIEND_BODY_LIMIT = 2048;
 const PUBLISH_BODY_LIMIT = 8192;
+const PAST_BODY_LIMIT = 256 * 1024;
 const ROUND_TTL_SECONDS = 365 * 24 * 60 * 60;
 const ROUND_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const PLAYED_ON_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
@@ -182,6 +193,7 @@ export async function handleFriends(request, url, env, cors) {
 const FRIEND_ROUTES = {
   "/v1/friends/code": { POST: getCode },
   "/v1/friends/code/reset": { POST: resetCode },
+  "/v1/friends/code/name": { POST: setInviteName },
   "/v1/friends/codes/lookup": { POST: lookupCode },
   "/v1/friends/requests": { POST: sendRequest, GET: listRequests },
   "/v1/friends/list": { GET: listFriends },
@@ -190,6 +202,7 @@ const FRIEND_ROUTES = {
   "/v1/friends/unblock": { POST: unblockPerson },
   "/v1/friends/remove": { POST: removeFriend },
   "/v1/friends/rounds": { PUT: publishRound, GET: fetchRounds },
+  "/v1/friends/past": { PUT: setPastRounds },
 };
 
 async function getCode(request, env, cors) {
@@ -231,6 +244,8 @@ async function resetCode(request, env, cors) {
   await friendPut(boards, authKey, storedAuth(existing.ownerId, code));
   // The old code is deleted before the response, so a later lookup misses.
   await friendDelete(boards, friendKvKey("code", previous));
+  // The invite name lives with the code. A reset deletes it; it does not move to the new code.
+  await deleteIfPresent(boards, friendKvKey("invname", previous));
   return friendJson(200, { code, ownerId: existing.ownerId }, cors);
 }
 
@@ -253,7 +268,148 @@ async function lookupCode(request, env, cors) {
   if (typeof ownerId !== "string" || ownerId.length === 0) {
     return friendJson(404, { error: "code_not_found" }, cors);
   }
-  return friendJson(200, { ownerId }, cors);
+  // The invite name is returned only here, when the code (or its link) is opened.
+  const name = readInviteName(await friendGet(boards, friendKvKey("invname", code)));
+  return friendJson(200, name ? { ownerId, name } : { ownerId }, cors);
+}
+
+/**
+ * Store or clear the caller's invite name. Body { name: string | null }.
+ * 1-24 characters after trimming, no control characters. "" or null deletes it.
+ */
+async function setInviteName(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const parsed = await readJsonObject(request, FRIEND_BODY_LIMIT, false);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (unknownFields(parsed.value, ["name"]) || !Object.hasOwn(parsed.value, "name")) {
+    return friendJson(400, { error: "invalid_body" }, cors);
+  }
+  const raw = parsed.value.name;
+  let name = null;
+  if (raw !== null) {
+    if (typeof raw !== "string") return friendJson(400, { error: "invalid_body" }, cors);
+    const trimmed = raw.replace(/\s+/g, " ").trim();
+    if (trimmed.length > 0) {
+      name = readInviteName(trimmed);
+      if (!name) return friendJson(400, { error: "invalid_body" }, cors);
+    }
+  }
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const key = friendKvKey("invname", caller.code);
+  if (name) await friendPut(boards, key, name);
+  else await deleteIfPresent(boards, key);
+  return friendJson(200, { ok: true }, cors);
+}
+
+function readInviteName(raw) {
+  if (typeof raw !== "string") return null;
+  if (raw.length < 1 || [...raw].length > INVITE_NAME_MAX) return null;
+  if (raw !== raw.trim() || /[\u0000-\u001F\u007F]/.test(raw)) return null;
+  return raw;
+}
+
+/**
+ * The caller's past rounds for one friend. Body { ownerId, choice, rounds }.
+ * choice is "none", "10", "25" or "all". rounds must fit the choice (all = ROUND_CAP).
+ * The stored set is replaced, so a lower choice deletes the rest; "none" deletes the row.
+ * Only the caller's own row is written. No call returns a choice, the caller's or the friend's.
+ */
+async function setPastRounds(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const parsed = await readJsonObject(request, PAST_BODY_LIMIT, false);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  const body = parsed.value;
+  if (unknownFields(body, ["ownerId", "choice", "rounds"])) return friendJson(400, { error: "invalid_body" }, cors);
+  const ownerId = readOwnerId(body.ownerId);
+  const limit = pastChoiceLimit(body.choice);
+  if (!ownerId || limit == null || !Array.isArray(body.rounds)) return friendJson(400, { error: "invalid_body" }, cors);
+  if (body.rounds.length > limit) return friendJson(400, { error: "invalid_body" }, cors);
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  if (ownerId === caller.ownerId) return friendJson(400, { error: "invalid_body" }, cors);
+  const stored = [];
+  const seen = new Set();
+  for (const round of body.rounds) {
+    const clean = sanitizeRound(round, caller.ownerId);
+    if (!clean || seen.has(clean.id)) return friendJson(400, { error: "invalid_body" }, cors);
+    seen.add(clean.id);
+    stored.push(clean);
+  }
+  if (!(await areFriends(boards, caller.ownerId, ownerId)) || !(await areFriends(boards, ownerId, caller.ownerId))) {
+    return friendJson(409, { error: "not_friends" }, cors);
+  }
+  const limited = await consumeIpAction(request, env, "ippub:", cors);
+  if (limited) return limited;
+  // Past rounds live in the owner's one fr:rounds: value with a private
+  // audience (to: ownerIds). First this friend is taken off every past round,
+  // which deletes rounds no one else was given, then the new pick is added.
+  // A round already shared the normal way is visible to every friend and is not touched.
+  const next = withoutAudience(await loadOwnedRounds(boards, caller.ownerId), ownerId);
+  for (const round of stored) {
+    const index = next.findIndex((item) => item.id === round.id);
+    if (index >= 0) {
+      const current = next[index];
+      if (!Array.isArray(current.to)) continue;
+      next[index] = { ...round, to: [...current.to, ownerId] };
+      continue;
+    }
+    if (next.length >= ROUND_CAP) return friendJson(409, { error: "round_limit" }, cors);
+    next.push({ ...round, to: [ownerId] });
+  }
+  await saveOwnedRounds(boards, caller.ownerId, next);
+  return friendJson(200, { ok: true }, cors);
+}
+
+/** Take one friend off every past round. A past round left with no audience is dropped. */
+function withoutAudience(rounds, friendId) {
+  const out = [];
+  for (const round of rounds) {
+    if (!Array.isArray(round.to)) {
+      out.push(round);
+      continue;
+    }
+    const to = round.to.filter((id) => id !== friendId);
+    if (to.length > 0) out.push({ ...round, to });
+  }
+  return out;
+}
+
+async function saveOwnedRounds(boards, ownerId, rounds) {
+  const key = friendKvKey("rounds", ownerId);
+  if (rounds.length === 0) {
+    await deleteIfPresent(boards, key);
+    return;
+  }
+  await friendPut(boards, key, JSON.stringify(rounds), { expirationTtl: ROUND_TTL_SECONDS });
+}
+
+/** What a reader may see of a round: never the audience list. */
+function publicRound(round) {
+  if (!Object.hasOwn(round, "to")) return round;
+  const { to: _to, ...rest } = round;
+  return rest;
+}
+
+function pastChoiceLimit(choice) {
+  if (choice === "none") return 0;
+  if (choice === "10") return 10;
+  if (choice === "25") return 25;
+  if (choice === "all") return ROUND_CAP;
+  return null;
+}
+
+/** After remove or block: the other side's past rounds given to the caller are taken back too. */
+async function deletePastRoundsFor(boards, ownerId, friendId) {
+  const rounds = await loadOwnedRounds(boards, ownerId);
+  if (!rounds.some((round) => Array.isArray(round.to) && round.to.includes(friendId))) return;
+  await saveOwnedRounds(boards, ownerId, withoutAudience(rounds, friendId));
 }
 
 async function sendRequest(request, env, cors) {
@@ -358,6 +514,7 @@ async function blockPerson(request, env, cors) {
   await deleteIfPresent(boards, requestKey(ownerId, caller.ownerId));
   await deleteIfPresent(boards, requestKey(caller.ownerId, ownerId));
   await deleteOwnedRounds(boards, caller.ownerId);
+  await deletePastRoundsFor(boards, ownerId, caller.ownerId);
   return friendJson(200, { ok: true }, cors);
 }
 
@@ -384,6 +541,7 @@ async function removeFriend(request, env, cors) {
   await saveFriendIds(boards, caller.ownerId, removeFriendId(await loadFriendIds(boards, caller.ownerId), ownerId));
   await saveFriendIds(boards, ownerId, removeFriendId(await loadFriendIds(boards, ownerId), caller.ownerId));
   await deleteOwnedRounds(boards, caller.ownerId);
+  await deletePastRoundsFor(boards, ownerId, caller.ownerId);
   return friendJson(200, { ok: true }, cors);
 }
 
@@ -504,10 +662,14 @@ async function fetchRounds(request, env, cors) {
     const blockedByCaller = await hasBlock(boards, caller.ownerId, otherId);
     const blockedByOther = await hasBlock(boards, otherId, caller.ownerId);
     if (blockedByCaller || blockedByOther) continue;
-    rounds.push(...await loadOwnedRounds(boards, otherId));
+    for (const round of await loadOwnedRounds(boards, otherId)) {
+      // A past round reaches only the friends it was given to.
+      if (Array.isArray(round.to) && !round.to.includes(caller.ownerId)) continue;
+      rounds.push(round);
+    }
   }
   rounds.sort(compareRounds);
-  return friendJson(200, { rounds }, cors);
+  return friendJson(200, { rounds: rounds.map(publicRound) }, cors);
 }
 
 async function readyReadCall(request, env, cors) {
@@ -700,8 +862,16 @@ async function loadOwnedRounds(boards, ownerId) {
   const seen = new Set();
   for (const item of parsed) {
     if (item == null || typeof item !== "object" || Array.isArray(item)) continue;
-    const round = sanitizeRound(item, ownerId);
+    const { to, ...body } = item;
+    const round = sanitizeRound(body, ownerId);
     if (!round || seen.has(round.id)) continue;
+    if (Object.hasOwn(item, "to")) {
+      // A past round with a bad or empty audience is dropped, never widened to everyone.
+      if (!Array.isArray(to)) continue;
+      const audience = [...new Set(to.filter((id) => typeof id === "string" && OWNER_ID_RE.test(id)))];
+      if (audience.length === 0) continue;
+      round.to = audience;
+    }
     seen.add(round.id);
     rounds.push(round);
   }
@@ -924,7 +1094,8 @@ function friendKvKey(kind, id) {
     kind !== "friends" &&
     kind !== "round" &&
     kind !== "rounds" &&
-    kind !== "block"
+    kind !== "block" &&
+    kind !== "invname"
   ) {
     throw new Error("friend_namespace");
   }
