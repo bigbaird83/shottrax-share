@@ -4029,26 +4029,257 @@ function paintStoredResponse(body, cors) {
 }
 __name(paintStoredResponse, "paintStoredResponse");
 __name2(paintStoredResponse, "paintStoredResponse");
-async function putPaintRecord(boards, key, body, ttl, request, cors) {
-  if (paintReplaceRequested(request)) {
-    await boards.put(key, body, { expirationTtl: ttl });
-    return paintStoredResponse(body, cors);
+function coursePointSame(a, b) {
+  if (!paintPoint(a) && !paintPoint(b)) return true;
+  if (!paintPoint(a) || !paintPoint(b)) return false;
+  return a.lat === b.lat && a.lng === b.lng;
+}
+__name(coursePointSame, "coursePointSame");
+__name2(coursePointSame, "coursePointSame");
+function isHandPaintSource(source) {
+  if (source == null || source === "") return true;
+  if (source === "golfer_consensus" || source === "osm" || source === "golfapi" || source === "gca") return false;
+  return true;
+}
+__name(isHandPaintSource, "isHandPaintSource");
+__name2(isHandPaintSource, "isHandPaintSource");
+function commitCoursePointWrite(req) {
+  const existing = req.existing ?? null;
+  const proposed = req.proposed ?? null;
+  const requestBody = req.requestBody ?? null;
+  if (requestBody && Object.prototype.hasOwnProperty.call(requestBody, "stagedBy")) {
+    console.error("course-point-write refused: staged-by-from-request");
+    return { ok: false, status: 400, message: "staged-by-from-request" };
   }
-  const existingRaw = await boards.get(key);
-  if (!existingRaw) {
-    await boards.put(key, body, { expirationTtl: ttl });
-    return paintStoredResponse(body, cors);
+  if (!existing || coursePointSame(existing, proposed)) return { ok: true, point: proposed };
+  if (!isHandPaintSource(req.existingSource) && !req.requireApproval) return { ok: true, point: proposed };
+  const identity = req.identity ?? { name: null, source: "none" };
+  const message = !identity.name || identity.source === "none" ? "no-trustworthy-identity" : "hand-move-without-approval";
+  console.error("course-point-write refused: " + message);
+  return { ok: false, status: 400, message, point: existing };
+}
+__name(commitCoursePointWrite, "commitCoursePointWrite");
+__name2(commitCoursePointWrite, "commitCoursePointWrite");
+function paintHoleSource(hole, record) {
+  if (hole && typeof hole.source === "string" && hole.source) return hole.source;
+  if (record && typeof record.source === "string") return record.source;
+  return null;
+}
+__name(paintHoleSource, "paintHoleSource");
+__name2(paintHoleSource, "paintHoleSource");
+function assertPaintHolesAllowed(existing, incoming, requestBody, writer) {
+  const prior = /* @__PURE__ */ new Map();
+  const next = /* @__PURE__ */ new Map();
+  for (const h of existing && Array.isArray(existing.holes) ? existing.holes : []) {
+    const n = holeNumber(h);
+    if (n != null) prior.set(n, h);
   }
-  const existing = parsePaintRecord(existingRaw);
+  for (const h of incoming && Array.isArray(incoming.holes) ? incoming.holes : []) {
+    const n = holeNumber(h);
+    if (n != null) next.set(n, h);
+  }
+  for (const n of new Set([...prior.keys(), ...next.keys()])) {
+    const left = prior.get(n) || null;
+    const right = next.get(n) || null;
+    for (const role of ["tee", "green"]) {
+      const verdict = commitCoursePointWrite({
+        courseId: incoming && incoming.key || existing && existing.key || "",
+        hole: n,
+        role,
+        existing: left && paintPoint(left[role]) ? left[role] : null,
+        proposed: right && paintPoint(right[role]) ? right[role] : null,
+        existingSource: paintHoleSource(left, existing),
+        proposedSource: paintHoleSource(right, incoming),
+        identity: { name: null, source: "none" },
+        writer,
+        requestBody
+      });
+      if (!verdict.ok) return { ...verdict, hole: n, role };
+    }
+  }
+  return { ok: true };
+}
+__name(assertPaintHolesAllowed, "assertPaintHolesAllowed");
+__name2(assertPaintHolesAllowed, "assertPaintHolesAllowed");
+function paintRecordChokepoint(key, existing, incoming, requestBody, writer) {
+  if (key.startsWith("name:")) return assertPaintHolesAllowed(existing, incoming, requestBody, writer);
+  if (writer === "putPaintRecord") return assertPaintHolesAllowed(existing, incoming, incoming, "putPaintRecord");
+  return assertPaintHolesAllowed(existing, incoming, requestBody, writer);
+}
+__name(paintRecordChokepoint, "paintRecordChokepoint");
+__name2(paintRecordChokepoint, "paintRecordChokepoint");
+async function paintKeysForSave(boards, urlKey, incoming) {
+  const keys = [];
+  const seen = /* @__PURE__ */ new Set();
+  const push = (key) => {
+    if (typeof key !== "string") return;
+    const alias = key.trim();
+    if (!alias || seen.has(alias)) return;
+    if (!isPaintKey(alias) || isReservedBoardKey(alias)) return;
+    seen.add(alias);
+    keys.push(alias);
+  };
+  push(urlKey);
+  const queue = [urlKey];
+  const consider = (record) => {
+    if (!record || !Array.isArray(record.aliases)) return;
+    for (const alias of record.aliases) {
+      const before = keys.length;
+      push(alias);
+      if (keys.length !== before) queue.push(keys[keys.length - 1]);
+    }
+  };
+  consider(incoming);
+  for (let i = 0; i < queue.length; i++) {
+    const raw = await boards.get(queue[i]);
+    consider(parsePaintRecord(raw));
+  }
+  return keys;
+}
+__name(paintKeysForSave, "paintKeysForSave");
+__name2(paintKeysForSave, "paintKeysForSave");
+function shortCardBlocked(record) {
+  const declared = numericNumHoles(record);
+  if (declared != null && Array.isArray(record.holes) && record.holes.length < declared) return false;
+  return false;
+}
+__name(shortCardBlocked, "shortCardBlocked");
+__name2(shortCardBlocked, "shortCardBlocked");
+function consensusUploads(env) {
+  const raw = env && env.GOLFER_CONSENSUS_ENABLED;
+  if (raw === true) return true;
+  const text = String(raw ?? "").trim().toLowerCase();
+  return text === "1" || text === "true" || text === "yes" || text === "on";
+}
+__name(consensusUploads, "consensusUploads");
+__name2(consensusUploads, "consensusUploads");
+function sharedFillKind(source, env) {
+  if (source === "osm" || source === "golfapi" || source === "gca") return "vendor";
+  if (source === "golfer_consensus") return consensusUploads(env) ? "consensus" : "player";
+  return "player";
+}
+__name(sharedFillKind, "sharedFillKind");
+__name2(sharedFillKind, "sharedFillKind");
+function mergePaintFill(base, incoming, env) {
+  const baseHoles = Array.isArray(base.holes) ? base.holes : [];
+  const incomingHoles = Array.isArray(incoming.holes) ? incoming.holes : [];
+  const baseBy = /* @__PURE__ */ new Map();
+  for (const hole of baseHoles) {
+    const n = holeNumber(hole);
+    if (n != null && !baseBy.has(n)) baseBy.set(n, hole);
+  }
+  let adding = false;
+  for (const hole of incomingHoles) {
+    const n = holeNumber(hole);
+    if (n != null && !baseBy.has(n)) adding = true;
+  }
+  const holes = [];
+  let changed = false;
+  for (const hole of baseHoles) {
+    const n = holeNumber(hole);
+    const inc = n == null ? null : incomingHoles.find((row) => holeNumber(row) === n);
+    if (adding && inc && JSON.stringify(inc) !== JSON.stringify(hole)) {
+      holes.push(hole);
+      continue;
+    }
+    if (!adding && inc && JSON.stringify(inc) !== JSON.stringify(hole)) {
+      holes.push(inc);
+      changed = true;
+      continue;
+    }
+    holes.push(hole);
+  }
+  for (const hole of incomingHoles) {
+    const n = holeNumber(hole);
+    if (n == null || baseBy.has(n)) continue;
+    const kind = sharedFillKind(paintHoleSource(hole, incoming), env);
+    if (kind === "player") continue;
+    holes.push(hole);
+    changed = true;
+  }
+  holes.sort((a, b) => (holeNumber(a) || 0) - (holeNumber(b) || 0));
+  return { holes, changed };
+}
+__name(mergePaintFill, "mergePaintFill");
+__name2(mergePaintFill, "mergePaintFill");
+function incomingForCheck(existing, incoming) {
+  const incomingHoles = Array.isArray(incoming.holes) ? incoming.holes : [];
+  const incomingBy = /* @__PURE__ */ new Map();
+  for (const hole of incomingHoles) {
+    const n = holeNumber(hole);
+    if (n != null && !incomingBy.has(n)) incomingBy.set(n, hole);
+  }
+  const holes = [];
+  const seen = /* @__PURE__ */ new Set();
+  const existingHoles = existing && Array.isArray(existing.holes) ? existing.holes : [];
+  for (const hole of existingHoles) {
+    const n = holeNumber(hole);
+    if (n == null || seen.has(n)) continue;
+    seen.add(n);
+    holes.push(incomingBy.has(n) ? incomingBy.get(n) : hole);
+  }
+  for (const hole of incomingHoles) {
+    const n = holeNumber(hole);
+    if (n == null || seen.has(n)) continue;
+    seen.add(n);
+    holes.push(hole);
+  }
+  return { ...incoming, holes };
+}
+__name(incomingForCheck, "incomingForCheck");
+__name2(incomingForCheck, "incomingForCheck");
+async function putPaintRecord(boards, key, body, ttl, request, cors, env) {
   const incoming = parsePaintRecord(body);
-  if (!existing || !incoming) return paintUnchangedResponse(cors);
-  const { record, added } = mergePaintRecords(existing, incoming);
-  if (!added || completeHoleCount(record.holes) < completeHoleCount(existing.holes)) {
-    return paintUnchangedResponse(cors);
+  if (!incoming) {
+    console.error("course-point-write refused: unreadable-paint-replace");
+    return golfJson(400, { error: "unreadable-paint-replace" }, cors);
   }
-  const stored = JSON.stringify(record);
-  await boards.put(key, stored, { expirationTtl: ttl });
-  return paintStoredResponse(stored, cors);
+  if (Object.prototype.hasOwnProperty.call(incoming, "stagedBy")) {
+    console.error("course-point-write refused: staged-by-from-request");
+    return golfJson(400, { error: "staged-by-from-request" }, cors);
+  }
+  if (shortCardBlocked(incoming)) {
+    console.error("course-point-write refused: short-card-blocked");
+    return golfJson(400, { error: "short-card-blocked" }, cors);
+  }
+  const keys = await paintKeysForSave(boards, key, incoming);
+  const existingByKey = /* @__PURE__ */ new Map();
+  for (const paintKey of keys) {
+    const raw = await boards.get(paintKey);
+    const existing = raw ? parsePaintRecord(raw) : null;
+    if (raw && !existing) {
+      console.error("course-point-write refused: unreadable-paint-replace");
+      return golfJson(400, { error: "unreadable-paint-replace" }, cors);
+    }
+    existingByKey.set(paintKey, existing);
+    if (!existing) continue;
+    const verdict = paintRecordChokepoint(paintKey, existing, incomingForCheck(existing, incoming), incoming, "putPaintRecord");
+    if (!verdict.ok) {
+      console.error("course-point-write refused: " + verdict.message);
+      return golfJson(400, { error: verdict.message, hole: verdict.hole, role: verdict.role }, cors);
+    }
+  }
+  const base = existingByKey.get(key) || [...existingByKey.values()].find(Boolean) || null;
+  let holes = Array.isArray(incoming.holes) ? incoming.holes.slice() : [];
+  let changed = true;
+  if (base) {
+    const merged = mergePaintFill(base, incoming, env);
+    holes = merged.holes;
+    changed = merged.changed;
+  }
+  if (!changed) {
+    const raw = await boards.get(key);
+    return paintStoredResponse(raw || body, cors);
+  }
+  const template = base ? { ...base, ...incoming, holes } : { ...incoming, holes };
+  let storedBody = body;
+  for (const paintKey of keys) {
+    const record = { ...template, key: paintKey, aliases: keys.filter((item) => item !== paintKey) };
+    const nextBody = JSON.stringify(record);
+    await boards.put(paintKey, nextBody, { expirationTtl: ttl });
+    if (paintKey === key) storedBody = nextBody;
+  }
+  return paintStoredResponse(storedBody, cors);
 }
 __name(putPaintRecord, "putPaintRecord");
 __name2(putPaintRecord, "putPaintRecord");
@@ -4073,7 +4304,6 @@ async function paintGetBody(boards, key, raw) {
 __name(paintGetBody, "paintGetBody");
 __name2(paintGetBody, "paintGetBody");
 var PAINT_GREEN_MAX_FROM_COURSE_M = 2e3;
-var PAINT_GREEN_MOVE_FLAG_M = 10;
 var PAINT_PENDING_PREFIX = "v1:paint-pending:";
 var PAINT_PENDING_TTL = 60 * 60 * 24 * 180;
 var PAINT_RECORD_TTL = 60 * 60 * 24 * 365;
@@ -4219,23 +4449,28 @@ function guardPaintGreens(stored, incoming, anchor) {
   if (isPlainObject(stored) && Array.isArray(stored.holes)) {
     for (const h of stored.holes) {
       const n = holeNumber(h);
-      if (n != null && !storedByHole.has(n) && paintPoint(h.green)) storedByHole.set(n, h);
+      if (n != null && !storedByHole.has(n) && (paintPoint(h.green) || paintPoint(h.tee))) storedByHole.set(n, h);
     }
   }
   const pending = {};
   const flaggedHoles = [];
-  const holes = incoming.holes.map((h) => {
+  const holes = [];
+  for (const h of incoming.holes) {
     const prior = storedByHole.get(h.hole);
-    if (!prior) return h;
-    if (!paintPoint(h.green)) return { ...h, green: prior.green };
-    const moved = paintDistanceM(prior.green, h.green);
-    if (moved <= PAINT_GREEN_MOVE_FLAG_M) return h;
-    pending[h.hole] = { green: h.green, movedM: Math.round(moved * 10) / 10, source: h.source ?? incoming.source };
-    flaggedHoles.push(h.hole);
-    const kept = { ...h, green: prior.green };
-    if (prior.source) kept.source = prior.source;
-    return kept;
-  });
+    if (!prior) {
+      holes.push(h);
+      continue;
+    }
+    const verdict = paintRecordChokepoint(
+      incoming.key,
+      { key: incoming.key, source: stored && stored.source, holes: [prior] },
+      { key: incoming.key, source: h.source ?? incoming.source, holes: [h] },
+      incoming,
+      "guardPaintGreens"
+    );
+    if (!verdict.ok) return { error: verdict.message, hole: verdict.hole, role: verdict.role };
+    holes.push(h);
+  }
   const included = new Set(incoming.holes.map((h) => h.hole));
   const leftovers = [];
   if (isPlainObject(stored) && Array.isArray(stored.holes)) {
@@ -4278,6 +4513,7 @@ __name(paintPutRequiresInstallId, "paintPutRequiresInstallId");
 function __resetHotfixMemoryForTests() {
   paintRateWindows.clear();
   hotfixEmailMessageClass = null;
+  consumedContributionApprovals.clear();
 }
 __name(__resetHotfixMemoryForTests, "__resetHotfixMemoryForTests");
 async function handlePaintRoute(request, env, key, ttl, cors) {
@@ -4324,7 +4560,11 @@ async function handlePaintRoute(request, env, key, ttl, cors) {
   const guard = guardPaintGreens(stored, valid.record, anchor);
   if (guard.error) {
     hotfixLog("paint_put_rejected", { key, error: guard.error, hole: guard.hole, meters: guard.meters, anchor: known ? known.source : "centroid" });
-    return golfJson(400, { error: guard.error, hole: guard.hole }, cors);
+    return golfJson(400, {
+      error: guard.error,
+      hole: guard.hole,
+      ...guard.role ? { role: guard.role } : {}
+    }, cors);
   }
   if (guard.flaggedHoles.length > 0) {
     const pendingKey = PAINT_PENDING_PREFIX + key;
@@ -4336,33 +4576,267 @@ async function handlePaintRoute(request, env, key, ttl, cors) {
     await boards.put(pendingKey, JSON.stringify(prior), { expirationTtl: PAINT_PENDING_TTL });
     hotfixLog("paint_green_flagged", { key, holes: guard.flaggedHoles, pending: guard.pending });
   }
-  const response = await putPaintRecord(boards, key, JSON.stringify(guard.record), ttl, request, cors);
+  const response = await putPaintRecord(boards, key, JSON.stringify(guard.record), ttl, request, cors, env);
   if (guard.flaggedHoles.length > 0) response.headers.set("X-Paint-Flagged-Holes", guard.flaggedHoles.join(","));
   return response;
 }
 __name(handlePaintRoute, "handlePaintRoute");
-async function promotePendingGreen(boards, key, hole) {
+var CONTRIBUTION_APPROVERS = /* @__PURE__ */ new Set(["Brian", "Chief of Staff", "ShotTraxx Lead"]);
+var consumedContributionApprovals = /* @__PURE__ */ new Set();
+function contributionPoint(point) {
+  if (paintPoint(point)) return { lat: point.lat, lng: point.lng };
+  if (isPlainObject(point) && Number.isFinite(point.lat) && Number.isFinite(point.lon)) {
+    const candidate = { lat: point.lat, lng: point.lon };
+    return paintPoint(candidate) ? candidate : null;
+  }
+  return null;
+}
+__name(contributionPoint, "contributionPoint");
+__name2(contributionPoint, "contributionPoint");
+async function contributionChangeSha(change) {
+  const point = (value) => {
+    const parsed = contributionPoint(value);
+    return parsed ? { lat: parsed.lat, lng: parsed.lng } : null;
+  };
+  const body = JSON.stringify({
+    v: 1,
+    courseId: String(change.courseId ?? ""),
+    hole: change.hole,
+    role: change.role,
+    from: point(change.from),
+    to: point(change.to)
+  });
+  return sha256Hex(body);
+}
+__name(contributionChangeSha, "contributionChangeSha");
+__name2(contributionChangeSha, "contributionChangeSha");
+function contributionDisplayLabel(name) {
+  const key = String(name ?? "").trim().toLowerCase();
+  return key === "brian" || key === "brian baird" || key === "doc" || key === "bigbaird83";
+}
+__name(contributionDisplayLabel, "contributionDisplayLabel");
+__name2(contributionDisplayLabel, "contributionDisplayLabel");
+function contributionAccount(identity) {
+  if (!identity || identity.source === "none" || identity.source == null) return null;
+  const account = String(identity.account ?? "").trim();
+  return account || null;
+}
+__name(contributionAccount, "contributionAccount");
+__name2(contributionAccount, "contributionAccount");
+function contributionSlot(name, identity) {
+  const key = String(name ?? "").trim().toLowerCase();
+  if (key === "chief of staff") return "Chief of Staff";
+  if (key === "shottraxx lead") return "ShotTraxx Lead";
+  if (contributionDisplayLabel(name) && contributionAccount(identity) === "bigbaird83") return "Brian";
+  return null;
+}
+__name(contributionSlot, "contributionSlot");
+__name2(contributionSlot, "contributionSlot");
+function sameContributionPerson(stagedBy, approver, identity) {
+  const left = contributionSlot(stagedBy, identity);
+  const right = contributionSlot(approver, identity);
+  if (left && right) return left === right;
+  return String(stagedBy ?? "") === String(approver ?? "");
+}
+__name(sameContributionPerson, "sameContributionPerson");
+__name2(sameContributionPerson, "sameContributionPerson");
+function approvalForPromote(requestBody, hole, role) {
+  if (!isPlainObject(requestBody)) return null;
+  if (Array.isArray(requestBody.approvals)) {
+    return requestBody.approvals.find((row) => row && row.hole === hole && row.role === role) || null;
+  }
+  return isPlainObject(requestBody.approval) ? requestBody.approval : null;
+}
+__name(approvalForPromote, "approvalForPromote");
+__name2(approvalForPromote, "approvalForPromote");
+async function commitPromotedFill(args) {
+  const existing = contributionPoint(args.existing);
+  const proposed = contributionPoint(args.proposed);
+  if (!proposed && !existing) return { ok: true, point: null, skipped: true };
+  if (existing && !proposed) return { ok: true, point: existing, skipped: true };
+  if (existing && proposed && existing.lat === proposed.lat && existing.lng === proposed.lng) {
+    return { ok: true, point: existing, skipped: true };
+  }
+  if (existing && proposed) return { ok: false, status: 400, message: "promote-would-move" };
+  const requestBody = args.requestBody || null;
+  if (requestBody && Object.prototype.hasOwnProperty.call(requestBody, "stagedBy")) {
+    return { ok: false, status: 400, message: "staged-by-from-request" };
+  }
+  const who = args.identity || { name: null, source: "none" };
+  if (!who.name || who.source === "none" || who.source == null) {
+    return { ok: false, status: 400, message: "no-trustworthy-identity" };
+  }
+  if (contributionDisplayLabel(who.name) && contributionAccount(who) !== "bigbaird83") {
+    return { ok: false, status: 400, message: "brian-name-unauthenticated" };
+  }
+  const approverSlot = contributionSlot(who.name, who);
+  if (!approverSlot || !CONTRIBUTION_APPROVERS.has(approverSlot)) {
+    return { ok: false, status: 400, message: "unlisted-approver" };
+  }
+  const expected = await contributionChangeSha({
+    courseId: args.courseId,
+    hole: args.hole,
+    role: args.role,
+    from: null,
+    to: proposed
+  });
+  let approval = approvalForPromote(requestBody, args.hole, args.role);
+  if (!approval) return { ok: false, status: 400, message: "contribution-unapproved" };
+  if (approval.sha256 !== expected) return { ok: false, status: 400, message: "wrong-sha" };
+  if (approval.approver != null && contributionSlot(approval.approver, who) !== approverSlot) {
+    return { ok: false, status: 400, message: "approver-not-authenticated" };
+  }
+  const stagedBy = approval.stagedBy;
+  const ownChange = stagedBy == null || String(stagedBy).trim() === "" || sameContributionPerson(stagedBy, approverSlot, who);
+  if (ownChange && contributionAccount(who) !== "bigbaird83") {
+    return { ok: false, status: 400, message: "self-approval" };
+  }
+  const useId = String(approval.useId ?? "");
+  if (!useId || consumedContributionApprovals.has(useId)) return { ok: false, status: 400, message: "replayed-approval" };
+  consumedContributionApprovals.add(useId);
+  const source = typeof args.pendingSource === "string" && args.pendingSource ? args.pendingSource : "manual_verified";
+  return {
+    ok: true,
+    point: proposed,
+    source,
+    verifiedBy: approverSlot,
+    approvalSha: approval.sha256,
+    skipped: false
+  };
+}
+__name(commitPromotedFill, "commitPromotedFill");
+__name2(commitPromotedFill, "commitPromotedFill");
+function applyPromotedPoint(holes, hole, role, fill) {
+  const next = holes.map((row) => ({ ...row }));
+  let found = false;
+  for (const row of next) {
+    if (holeNumber(row) !== hole) continue;
+    found = true;
+    row[role] = fill.point;
+    row.source = fill.source;
+    row.verifiedBy = fill.verifiedBy;
+    row.approvalSha = fill.approvalSha;
+    row.contribution = "hole-contribution";
+  }
+  if (!found) {
+    const created = { hole, tee: null, green: null, source: fill.source, verifiedBy: fill.verifiedBy, approvalSha: fill.approvalSha, contribution: "hole-contribution" };
+    created[role] = fill.point;
+    next.push(created);
+  }
+  next.sort((a, b) => (holeNumber(a) || 0) - (holeNumber(b) || 0));
+  return next;
+}
+__name(applyPromotedPoint, "applyPromotedPoint");
+__name2(applyPromotedPoint, "applyPromotedPoint");
+async function promotePendingEntry(boards, key, hole, requestBody, identity) {
   const pendingKey = PAINT_PENDING_PREFIX + key;
   const pending = parsePaintRecord(await boards.get(pendingKey));
-  const p = pending && isPlainObject(pending.holes) ? pending.holes[String(hole)] : null;
+  const entry = pending && isPlainObject(pending.holes) ? pending.holes[String(hole)] : null;
   const stored = parsePaintRecord(await boards.get(key));
-  if (!p || !paintPoint(p.green) || !stored) return { ok: false, error: "nothing_pending" };
-  const holes = Array.isArray(stored.holes) ? stored.holes : [];
-  let found = false;
-  stored.holes = holes.map((h) => {
-    if (holeNumber(h) !== hole) return h;
-    found = true;
-    return { ...h, green: p.green };
-  });
-  if (!found) stored.holes.push({ hole, tee: null, green: p.green });
-  await boards.put(key, JSON.stringify(stored), { expirationTtl: PAINT_RECORD_TTL });
-  delete pending.holes[String(hole)];
-  if (Object.keys(pending.holes).length === 0) await boards.delete(pendingKey);
-  else await boards.put(pendingKey, JSON.stringify(pending), { expirationTtl: PAINT_PENDING_TTL });
-  hotfixLog("paint_green_promoted", { key, hole, green: p.green });
-  return { ok: true, green: p.green };
+  if (!entry || !stored) return { ok: false, error: "nothing_pending" };
+  const holes = Array.isArray(stored.holes) ? stored.holes.slice() : [];
+  const prior = holes.find((row) => holeNumber(row) === hole) || null;
+  const roles = [];
+  if (contributionPoint(entry.green) || contributionPoint(entry.tee)) {
+    if (contributionPoint(entry.tee)) roles.push("tee");
+    if (contributionPoint(entry.green)) roles.push("green");
+  }
+  if (roles.length === 0) return { ok: false, error: "nothing_pending" };
+  let nextHoles = holes;
+  const written = {};
+  for (const role of roles) {
+    const verdict = await commitPromotedFill({
+      courseId: key,
+      hole,
+      role,
+      existing: prior ? prior[role] : null,
+      proposed: entry[role],
+      pendingSource: entry.source || null,
+      requestBody,
+      identity,
+      writer: "promotePendingGreen"
+    });
+    if (!verdict.ok) return { ok: false, status: verdict.status || 400, error: verdict.message };
+    if (verdict.skipped) continue;
+    nextHoles = applyPromotedPoint(nextHoles, hole, role, verdict);
+    written[role] = verdict.point;
+  }
+  if (Object.keys(written).length === 0) return { ok: true, green: contributionPoint(entry.green), unchanged: true, holes: nextHoles };
+  return { ok: true, green: written.green || contributionPoint(prior && prior.green), holes: nextHoles, written };
+}
+__name(promotePendingEntry, "promotePendingEntry");
+__name2(promotePendingEntry, "promotePendingEntry");
+async function writePromotedRecord(boards, key, stored, holes) {
+  const keys = await paintKeysForSave(boards, key, stored);
+  let storedBody = null;
+  for (const paintKey of keys) {
+    const record = { ...stored, holes, key: paintKey, aliases: keys.filter((item) => item !== paintKey) };
+    const body = JSON.stringify(record);
+    await boards.put(paintKey, body, { expirationTtl: PAINT_RECORD_TTL });
+    if (paintKey === key) storedBody = body;
+  }
+  return storedBody;
+}
+__name(writePromotedRecord, "writePromotedRecord");
+__name2(writePromotedRecord, "writePromotedRecord");
+async function promotePendingGreen(boards, key, hole, requestBody, identity) {
+  if (requestBody && requestBody.dismiss === true) return { ok: true, dismissed: true };
+  const pendingKey = PAINT_PENDING_PREFIX + key;
+  const result = await promotePendingEntry(boards, key, hole, requestBody, identity);
+  if (!result.ok) return result;
+  if (!result.written) return { ok: true, green: result.green };
+  const stored = parsePaintRecord(await boards.get(key));
+  await writePromotedRecord(boards, key, stored, result.holes);
+  const pending = parsePaintRecord(await boards.get(pendingKey));
+  if (pending && isPlainObject(pending.holes)) {
+    delete pending.holes[String(hole)];
+    if (Object.keys(pending.holes).length === 0) await boards.delete(pendingKey);
+    else await boards.put(pendingKey, JSON.stringify(pending), { expirationTtl: PAINT_PENDING_TTL });
+  }
+  hotfixLog("paint_green_promoted", { key, hole, green: result.green, writer: "promotePendingGreen" });
+  return { ok: true, green: result.green };
 }
 __name(promotePendingGreen, "promotePendingGreen");
+__name2(promotePendingGreen, "promotePendingGreen");
+async function promotePendingCourse(boards, key, requestBody, identity) {
+  if (requestBody && requestBody.dismiss === true) return { ok: true, dismissed: true };
+  const pendingKey = PAINT_PENDING_PREFIX + key;
+  const pending = parsePaintRecord(await boards.get(pendingKey));
+  const stored = parsePaintRecord(await boards.get(key));
+  if (!pending || !isPlainObject(pending.holes) || !stored) return { ok: false, error: "nothing_pending" };
+  let holes = Array.isArray(stored.holes) ? stored.holes.slice() : [];
+  const promoted = [];
+  for (const holeKey of Object.keys(pending.holes)) {
+    const hole = Number(holeKey);
+    if (!Number.isInteger(hole)) continue;
+    const entry = pending.holes[holeKey];
+    const prior = holes.find((row) => holeNumber(row) === hole) || null;
+    for (const role of ["tee", "green"]) {
+      if (!contributionPoint(entry && entry[role])) continue;
+      const verdict = await commitPromotedFill({
+        courseId: key,
+        hole,
+        role,
+        existing: prior ? prior[role] : null,
+        proposed: entry[role],
+        pendingSource: entry.source || null,
+        requestBody,
+        identity,
+        writer: "promotePendingGreen"
+      });
+      if (!verdict.ok) return { ok: false, status: verdict.status || 400, error: verdict.message };
+      if (verdict.skipped) continue;
+      holes = applyPromotedPoint(holes, hole, role, verdict);
+      promoted.push({ hole, role });
+    }
+  }
+  if (promoted.length === 0) return { ok: true, promoted };
+  await writePromotedRecord(boards, key, stored, holes);
+  await boards.delete(pendingKey);
+  return { ok: true, promoted };
+}
+__name(promotePendingCourse, "promotePendingCourse");
+__name2(promotePendingCourse, "promotePendingCourse");
 async function handlePaintPendingPromote(request, env, cors) {
   if (request.method !== "POST") return golfJson(405, { error: "method_not_allowed" }, cors);
   const denied = await authorizeCourseReports(request, env, cors);
@@ -4379,8 +4853,8 @@ async function handlePaintPendingPromote(request, env, cors) {
   const hole = isPlainObject(payload) ? payload.hole : null;
   if (parsePaintKey(key).kind !== "ok") return golfJson(400, { error: "bad_key" }, cors);
   if (!Number.isInteger(hole) || hole < 1 || hole > 18) return golfJson(400, { error: "bad_hole" }, cors);
-  const result = await promotePendingGreen(boards, key, hole);
-  if (!result.ok) return golfJson(404, { error: result.error }, cors);
+  const result = await promotePendingGreen(boards, key, hole, payload);
+  if (!result.ok) return golfJson(result.status || 404, { error: result.error }, cors);
   return golfJson(200, { ok: true, key, hole, green: result.green }, cors);
 }
 __name(handlePaintPendingPromote, "handlePaintPendingPromote");
@@ -5370,7 +5844,6 @@ var worker_default = {
       if (!body || body.length > 2e4) {
         return new Response("bad body", { status: 400, headers: cors });
       }
-      if (isPaint) return putPaintRecord(env.BOARDS, key, body, ttl, request, cors);
       await env.BOARDS.put(key, body, { expirationTtl: ttl });
       return new Response(body, { headers: { ...cors, "Content-Type": "application/json" } });
     }
@@ -5392,6 +5865,8 @@ export {
   osmInflight,
   parsePaintKey,
   presentGcaCourseBody,
+  promotePendingCourse,
+  promotePendingGreen,
   readGolfapiLimits
 };
 

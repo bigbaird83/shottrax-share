@@ -1,8 +1,7 @@
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import entry from "./entry.js";
-import worker, { FriendGuessLimiter } from "./worker.js";
+import entry, { FriendGuessLimiter } from "./entry.js";
 import { limiterNameForFriendKey } from "./friends.js";
 
 const ORIGIN = "https://shottrax-share.bcbaird.workers.dev";
@@ -129,7 +128,7 @@ describe("live rounds for friends", () => {
     const headers = {};
     if (friend) headers["X-Friend-Key"] = friend;
     if (body !== undefined) headers["Content-Type"] = "application/json";
-    const response = await worker.fetch(new Request(`${ORIGIN}${pathname}`, {
+    const response = await entry.fetch(new Request(`${ORIGIN}${pathname}`, {
       method,
       headers,
       body: body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body),

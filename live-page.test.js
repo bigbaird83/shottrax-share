@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import worker from "./worker.js";
+import live from "./live-shottrax-share.js";
 import { handleLivePage, isLiveBoardCode, livePageCode, renderLivePage, storeLive, __test } from "./live-page.js";
 
 const { normalizeCode, parseBoard, planView, previewLine, renderBoard, clientScript } = __test;
@@ -273,7 +273,7 @@ describe("live board page: worker route", () => {
   });
 
   function invoke(path, init) {
-    return worker.fetch(new Request(`${ORIGIN}${path}`, init), env, { waitUntil() {} });
+    return live.fetch(new Request(`${ORIGIN}${path}`, init), env, { waitUntil() {} });
   }
 
   it("renders a stored board and keeps GET/PUT /{code} working", async () => {
@@ -311,7 +311,7 @@ describe("live board page: worker route", () => {
   });
 
   it("renders the waiting page when BOARDS is not bound", async () => {
-    const res = await worker.fetch(new Request(`${ORIGIN}/s/BK3MCQ`), {}, { waitUntil() {} });
+    const res = await live.fetch(new Request(`${ORIGIN}/s/BK3MCQ`), {}, { waitUntil() {} });
     expect(res.status).toBe(200);
     expect(await res.text()).toMatch(/Waiting for the first hole/);
   });

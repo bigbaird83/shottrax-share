@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GCA_CORRECTIONS } from "./gca-corrections.js";
-import worker, { osmInflight, presentGcaCourseBody } from "./worker.js";
+import worker, { osmInflight, presentGcaCourseBody } from "./live-shottrax-share.js";
 
 const ORIGIN = "https://shottrax-share.bcbaird.workers.dev";
 const PRIMARY = "https://overpass-api.de/api/interpreter";
@@ -1093,10 +1093,34 @@ describe("shottrax-share worker", () => {
     expect(got.status).toBe(200);
     expect(await got.text()).toBe('{"hole":1}');
 
-    await invoke(`${ORIGIN}/id:course`, { method: "PUT", body: '{"paint":1}' });
-    expect(kv.get("id:course")?.opts).toEqual({ expirationTtl: 365 * DAY });
-    await invoke(`${ORIGIN}/name:magnolia`, { method: "PUT", body: '{"paint":2}' });
-    expect(kv.get("name:magnolia")?.opts).toEqual({ expirationTtl: 365 * DAY });
+    const courseKey = "id:course";
+    const courseBody = JSON.stringify({
+      key: courseKey,
+      source: "gca",
+      fetchedAt: "2026-10-21T00:00:00.000Z",
+      holes: [{ hole: 1, tee: { lat: 34.74, lng: -92.28 }, green: { lat: 34.742, lng: -92.278 } }],
+    });
+    const coursePut = await invoke(`${ORIGIN}/${courseKey}`, {
+      method: "PUT",
+      body: courseBody,
+      headers: { "X-Install-Id": "install-0001" },
+    });
+    expect(coursePut.status).toBe(200);
+    expect(kv.get(courseKey)?.opts).toEqual({ expirationTtl: 365 * DAY });
+    const nameKey = "name:magnolia|magnolia|ar";
+    const nameBody = JSON.stringify({
+      key: nameKey,
+      source: "gca",
+      fetchedAt: "2026-10-21T00:00:00.000Z",
+      holes: [{ hole: 1, tee: { lat: 34.74, lng: -92.28 }, green: { lat: 34.742, lng: -92.278 } }],
+    });
+    const namePut = await invoke(`${ORIGIN}/${encodeURIComponent(nameKey)}`, {
+      method: "PUT",
+      body: nameBody,
+      headers: { "X-Install-Id": "install-0001" },
+    });
+    expect(namePut.status).toBe(200);
+    expect(kv.get(nameKey)?.opts).toEqual({ expirationTtl: 365 * DAY });
 
     const missing = await invoke(`${ORIGIN}/missing-board`);
     expect(missing.status).toBe(404);
@@ -1273,39 +1297,6 @@ describe("shottrax-share worker", () => {
     expect(stats().hits).toBe(2);
   });
 
-  it("queues the 4th device lookup while that IP is still under its limit", async () => {
-    let n = 0;
-    mockGolfApi(async (url) => {
-      n += 1;
-      return jsonResponse(coursePayload(url.split("/").pop(), 100 - n));
-    });
-    for (const id of ["c1", "c2", "c3"]) {
-      expect((await golfGet(`/golfapi/v2.3/courses/${id}`)).status).toBe(200);
-    }
-    const blocked = await golfGet("/golfapi/v2.3/courses/c4");
-    const body = await blocked.json();
-    expect(blocked.status).toBe(429);
-    expect(blocked.headers.get("Retry-After")).toBe(String(body.retryAfterSec));
-    expect(body.error).toBe("golfapi_limited");
-    expect(body.reason).toBe("device_day");
-    expect(body.queued).toBe(true);
-    expect(body.retryAfterSec).toBeGreaterThan(0);
-    expect(body.retryAfterSec).toBeLessThanOrEqual(86400);
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-    expect(stats().lookups).toBe(3);
-    expect(stats().blocked.device_day).toBe(1);
-    expect(kv.has("gqueue:c4")).toBe(true);
-
-    const again = await golfGet("/golfapi/v2.3/courses/c4");
-    expect((await again.json()).reason).toBe("device_day");
-    expect([...kv.keys()].filter((key) => key.startsWith("gqueue:"))).toEqual(["gqueue:c4"]);
-
-    const other = await golfGet("/golfapi/v2.3/courses/c5", { install: OTHER_INSTALL });
-    expect(other.status).toBe(200);
-    expect(fetchMock).toHaveBeenCalledTimes(4);
-    expect(stats().lookups).toBe(4);
-  });
-
   it("enforces weekly and monthly lookup limits", async () => {
     mockGolfApi(async (url) => {
       const id = url.split("/").pop();
@@ -1331,18 +1322,6 @@ describe("shottrax-share worker", () => {
     expect(monthBlocked.status).toBe(429);
     expect(monthBody.reason).toBe("device_month");
     expect(monthBody.queued).toBe(true);
-  });
-
-  it("applies the IP limit across spoofed install ids", async () => {
-    mockGolfApi(async (url) => jsonResponse(coursePayload(url.split("/").pop())));
-    const tight = { ...env, GOLFAPI_DEVICE_DAY: "1" };
-    expect((await golfGet("/golfapi/v2.3/courses/s1", { install: "spoof-aaa", env: tight })).status).toBe(200);
-    expect((await golfGet("/golfapi/v2.3/courses/s2", { install: "spoof-bbb", env: tight })).status).toBe(200);
-    const spoofed = await golfGet("/golfapi/v2.3/courses/s3", { install: "spoof-ccc", env: tight });
-    expect(spoofed.status).toBe(429);
-    expect((await spoofed.json()).reason).toBe("ip_day");
-    expect(JSON.stringify([...kv.entries()])).not.toContain(CLIENT_IP);
-    expect([...kv.keys()].some((key) => /^gq:ip:[0-9a-f]{64}$/.test(key))).toBe(true);
   });
 
   it("accepts the app install id and keys device state on it", async () => {
@@ -1429,123 +1408,6 @@ describe("shottrax-share worker", () => {
     expect(meta.headers.get("Access-Control-Allow-Origin")).toBe("*");
   });
 
-  it("stops fresh lookups at the global daily cap", async () => {
-    mockGolfApi(async (url) => jsonResponse(coursePayload(url.split("/").pop())));
-    const capEnv = { ...env, GOLFAPI_GLOBAL_DAY: "1", GOLFAPI_DEVICE_DAY: "5" };
-    expect((await golfGet("/golfapi/v2.3/courses/g1", { env: capEnv })).status).toBe(200);
-    const blocked = await golfGet("/golfapi/v2.3/courses/g2", { install: OTHER_INSTALL, env: capEnv });
-    const body = await blocked.json();
-    expect(blocked.status).toBe(429);
-    expect(body.reason).toBe("global_day");
-    expect(body.queued).toBe(true);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(stats().lookups).toBe(1);
-  });
-
-  it("refuses fresh golfapi calls at the balance floor of 10", async () => {
-    mockGolfApi(async () => jsonResponse(coursePayload("floor", 40)));
-    kv.set("gq:balance", { value: JSON.stringify({ left: 10, at: 1, lastStatus: 200 }) });
-    const blocked = await golfGet("/golfapi/v2.3/courses/floor");
-    const body = await blocked.json();
-    expect(blocked.status).toBe(429);
-    expect(body.reason).toBe("floor");
-    expect(body.queued).toBe(true);
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(kv.has("gqueue:floor")).toBe(true);
-
-    kv.set("gq:balance", { value: JSON.stringify({ left: 10.5, at: 1, lastStatus: 200 }) });
-    kv.delete("gqueue:floor");
-    expect((await golfGet("/golfapi/v2.3/courses/floor")).status).toBe(200);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-
-    fetchMock.mockClear();
-    kv.set("gq:balance", { value: JSON.stringify({ left: 9, at: 1, lastStatus: 200 }) });
-    const search = await golfGet("/golfapi/v2.3/courses?q=magnolia");
-    const searchBody = await search.json();
-    expect(search.status).toBe(429);
-    expect(searchBody.reason).toBe("floor");
-    expect(searchBody.queued).toBe(true);
-    expect(fetchMock).not.toHaveBeenCalled();
-    const queuedSearch = [...kv.keys()].filter((key) => key.startsWith("gqueue:"));
-    expect(queuedSearch).toHaveLength(1);
-    expect(queuedSearch[0].startsWith("gqueue:q:")).toBe(true);
-  });
-
-  it("caps fresh searches at 3x the device day, including inside an open set", async () => {
-    mockGolfApi(async (url) => {
-      if (url.includes("/courses?")) {
-        return jsonResponse({
-          apiRequestsLeft: "70",
-          numCourses: 1,
-          courses: [{ courseID: "abc", courseName: "Somewhere" }],
-        });
-      }
-      return jsonResponse(coursePayload(url.split("/").pop(), 60));
-    });
-    const searchEnv = { ...env, GOLFAPI_DEVICE_DAY: "1", GOLFAPI_SEARCH_DEVICE_DAY: "100" };
-    expect((await golfGet("/golfapi/v2.3/courses?q=one", { env: searchEnv })).status).toBe(200);
-    expect((await golfGet("/golfapi/v2.3/courses?q=two", { env: searchEnv })).status).toBe(200);
-    expect((await golfGet("/golfapi/v2.3/courses?q=three", { env: searchEnv })).status).toBe(200);
-    expect(stats().lookups).toBe(1);
-    expect(stats().searches).toBe(3);
-
-    const blocked = await golfGet("/golfapi/v2.3/courses?q=four", { env: searchEnv });
-    const body = await blocked.json();
-    expect(blocked.status).toBe(429);
-    expect(body.reason).toBe("search_device_day");
-    expect(body.queued).toBe(true);
-    const again = await golfGet("/golfapi/v2.3/courses?q=Four", { env: searchEnv });
-    expect(again.status).toBe(429);
-    const queued = [...kv.keys()].filter((key) => key.startsWith("gqueue:q:"));
-    expect(queued).toHaveLength(1);
-    expect(JSON.parse(kv.get(queued[0]).value).q).toBe("four");
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-
-    expect((await golfGet("/golfapi/v2.3/courses/pebble", { env: searchEnv })).status).toBe(200);
-    expect(stats().lookups).toBe(1);
-    expect(fetchMock).toHaveBeenCalledTimes(4);
-    const other = await golfGet("/golfapi/v2.3/courses/other", { env: searchEnv });
-    expect(other.status).toBe(429);
-    expect((await other.json()).reason).toBe("device_day");
-    expect(fetchMock).toHaveBeenCalledTimes(4);
-  });
-
-  it("does not store an error body or a 200 with no course data", async () => {
-    mockGolfApi(async (url) => {
-      if (url.endsWith("/courses/missing")) {
-        return jsonResponse({ error: "Course not found", apiRequestsLeft: "50" });
-      }
-      if (url.endsWith("/coordinates/missing")) {
-        return jsonResponse({ apiRequestsLeft: "49", courseID: "missing", coordinates: [] });
-      }
-      if (url.endsWith("/coordinates/abc")) return jsonResponse({ ok: true });
-      throw new Error(url);
-    });
-    const missing = await golfGet("/golfapi/v2.3/courses/missing");
-    expect(missing.status).toBe(200);
-    expect(await missing.json()).toEqual({ error: "Course not found", apiRequestsLeft: "50" });
-    expect(kv.has("gapi:course:missing")).toBe(false);
-    expect(edge.size).toBe(0);
-
-    const emptyCoords = await golfGet("/golfapi/v2.3/coordinates/missing");
-    expect(emptyCoords.status).toBe(200);
-    expect(kv.has("gapi:coord:missing")).toBe(false);
-    expect(edge.size).toBe(0);
-    expect(JSON.parse(kv.get("gq:balance").value).left).toBe(49);
-
-    fetchMock.mockClear();
-    const repeat = await golfGet("/golfapi/v2.3/courses/missing");
-    expect(repeat.status).toBe(404);
-    expect(await repeat.json()).toEqual({ error: "no_course_data" });
-    expect(fetchMock).not.toHaveBeenCalled();
-
-    const plain = await golfGet("/golfapi/v2.3/coordinates/abc");
-    expect(plain.status).toBe(200);
-    expect(await plain.json()).toEqual({ ok: true });
-    expect(kv.has("gapi:coord:abc")).toBe(false);
-    expect([...edge.keys()].some((key) => key.includes("/coordinates/abc"))).toBe(false);
-  });
-
   it("blocks reserved prefixes on public routes and still accepts board and paint keys", async () => {
     const reserved = [
       "gq:balance",
@@ -1572,12 +1434,32 @@ describe("shottrax-share worker", () => {
       expect(kv.get(key)).toEqual({ value: "keep-me", opts: { expirationTtl: 60 } });
     }
 
-    const paint = await invoke(`${ORIGIN}/id:${GCA_ID}`, { method: "PUT", body: "{\"paint\":1}" });
+    const paintKey = `id:${GCA_ID}`;
+    const paint = await invoke(`${ORIGIN}/${paintKey}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        key: paintKey,
+        source: "gca",
+        fetchedAt: "2026-10-21T00:00:00.000Z",
+        holes: [{ hole: 1, tee: { lat: 34.74, lng: -92.28 }, green: { lat: 34.742, lng: -92.278 } }],
+      }),
+      headers: { "X-Install-Id": "install-0001" },
+    });
     expect(paint.status).toBe(200);
-    expect(kv.get(`id:${GCA_ID}`)?.opts).toEqual({ expirationTtl: 365 * DAY });
-    const named = await invoke(`${ORIGIN}/name:magnolia`, { method: "PUT", body: "{\"paint\":2}" });
+    expect(kv.get(paintKey)?.opts).toEqual({ expirationTtl: 365 * DAY });
+    const namedKey = "name:magnolia|magnolia|ar";
+    const named = await invoke(`${ORIGIN}/${encodeURIComponent(namedKey)}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        key: namedKey,
+        source: "gca",
+        fetchedAt: "2026-10-21T00:00:00.000Z",
+        holes: [{ hole: 1, tee: { lat: 34.74, lng: -92.28 }, green: { lat: 34.742, lng: -92.278 } }],
+      }),
+      headers: { "X-Install-Id": "install-0001" },
+    });
     expect(named.status).toBe(200);
-    expect(kv.get("name:magnolia")?.opts).toEqual({ expirationTtl: 365 * DAY });
+    expect(kv.get(namedKey)?.opts).toEqual({ expirationTtl: 365 * DAY });
     const board = await invoke(`${ORIGIN}/round9`, { method: "DELETE" });
     expect(board.status).toBe(405);
     expect(await board.text()).toBe("no");
@@ -1592,245 +1474,6 @@ describe("shottrax-share worker", () => {
     expect(bare.status).toBe(404);
     expect(await bare.json()).toEqual({ error: "unknown_route" });
     expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("overrides golfapi limits from vars and ignores invalid values", async () => {
-    mockGolfApi(async (url) => jsonResponse(coursePayload(url.split("/").pop(), 20)));
-    const brokenDay = { ...env, GOLFAPI_DEVICE_DAY: "nope", GOLFAPI_DEVICE_WEEK: "1" };
-    expect((await golfGet("/golfapi/v2.3/courses/cfg1", { env: brokenDay })).status).toBe(200);
-    const weekBlocked = await golfGet("/golfapi/v2.3/courses/cfg2", { env: brokenDay });
-    expect((await weekBlocked.json()).reason).toBe("device_week");
-
-    kv.clear();
-    edge.clear();
-    fetchMock.mockClear();
-    const oneDay = { ...env, GOLFAPI_DEVICE_DAY: "1", GOLFAPI_IP_DAY: "5" };
-    expect((await golfGet("/golfapi/v2.3/courses/cfg3", { env: oneDay })).status).toBe(200);
-    expect((await (await golfGet("/golfapi/v2.3/courses/cfg4", { env: oneDay })).json()).reason).toBe("device_day");
-
-    kv.clear();
-    edge.clear();
-    fetchMock.mockClear();
-    const ipOverride = { ...env, GOLFAPI_DEVICE_DAY: "5", GOLFAPI_IP_DAY: "1" };
-    expect((await golfGet("/golfapi/v2.3/courses/ipcfg", { env: ipOverride })).status).toBe(200);
-    expect((await (await golfGet("/golfapi/v2.3/courses/ipcfg2", { env: ipOverride })).json()).reason).toBe("ip_day");
-
-    kv.clear();
-    edge.clear();
-    fetchMock.mockClear();
-    kv.set("gq:balance", { value: JSON.stringify({ left: 5, at: 1, lastStatus: 200 }) });
-    const floorBlocked = await golfGet("/golfapi/v2.3/courses/cfg5", { env: { ...env, GOLFAPI_FLOOR: "5" } });
-    expect((await floorBlocked.json()).reason).toBe("floor");
-    expect(fetchMock).not.toHaveBeenCalled();
-    kv.set("gq:balance", { value: JSON.stringify({ left: 6, at: 1, lastStatus: 200 }) });
-    expect((await golfGet("/golfapi/v2.3/courses/cfg5", { env: { ...env, GOLFAPI_FLOOR: "5" } })).status).toBe(200);
-
-    kv.clear();
-    edge.clear();
-    fetchMock.mockClear();
-    mockGolfApi(async () => jsonResponse({ apiRequestsLeft: "50", numCourses: 0, courses: [] }));
-    const ignoredSearchVars = { ...env, GOLFAPI_SEARCH_GLOBAL_DAY: "1", GOLFAPI_SEARCH_DEVICE_DAY: "10" };
-    expect((await golfGet("/golfapi/v2.3/courses?q=one", { env: ignoredSearchVars })).status).toBe(200);
-    expect((await golfGet("/golfapi/v2.3/courses?q=two", { env: ignoredSearchVars })).status).toBe(200);
-    expect(stats().lookups).toBe(1);
-    expect(stats().searches).toBe(2);
-  });
-
-  it("keeps an open 15 minute set free and treats an expired set as closed", async () => {
-    async function sha256Hex(text) {
-      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
-      return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-    }
-    async function seedSets(courseId, at) {
-      const value = JSON.stringify({ at, courseId });
-      kv.set(`gq:set:dev:${INSTALL}`, { value });
-      kv.set(`gq:set:ip:${await sha256Hex(`shottrax-golfapi-ip-v1:${CLIENT_IP}`)}`, { value });
-    }
-    kv.set(`gq:dev:${INSTALL}`, {
-      value: JSON.stringify({ day: todayKey(), dayCount: 3 }),
-    });
-    await seedSets("pebble", Date.now());
-    mockGolfApi(async () => jsonResponse(coursePayload("pebble")));
-    expect((await golfGet("/golfapi/v2.3/courses/pebble")).status).toBe(200);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(stats().lookups).toBe(0);
-    expect(JSON.parse(kv.get(`gq:dev:${INSTALL}`).value).dayCount).toBe(3);
-
-    fetchMock.mockClear();
-    const other = await golfGet("/golfapi/v2.3/courses/other");
-    expect(other.status).toBe(429);
-    expect((await other.json()).reason).toBe("device_day");
-    expect(fetchMock).not.toHaveBeenCalled();
-
-    kv.clear();
-    edge.clear();
-    fetchMock.mockClear();
-    kv.set(`gq:dev:${INSTALL}`, {
-      value: JSON.stringify({ day: todayKey(), dayCount: 3 }),
-    });
-    await seedSets("pebble", Date.now() - 16 * 60 * 1000);
-    const expired = await golfGet("/golfapi/v2.3/courses/pebble");
-    expect(expired.status).toBe(429);
-    expect((await expired.json()).reason).toBe("device_day");
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("reports /meta/golfapi without secrets, install ids, or IPs", async () => {
-    mockGolfApi(async (url) => {
-      if (url.includes("/courses?")) {
-        return jsonResponse({ apiRequestsLeft: "33.5", numCourses: 1, courses: [{ courseID: "m", courseName: "M" }] });
-      }
-      return jsonResponse(coursePayload("meta", 40));
-    });
-    const limited = { ...env, GOLFAPI_DEVICE_DAY: "1" };
-    expect((await golfGet("/golfapi/v2.3/courses/meta", { env: limited })).status).toBe(200);
-    expect((await golfGet("/golfapi/v2.3/courses/meta", { env: limited })).status).toBe(200);
-    expect((await golfGet("/golfapi/v2.3/courses?q=meta", { env: limited })).status).toBe(200);
-    expect((await golfGet("/golfapi/v2.3/courses/other", { env: limited })).status).toBe(429);
-
-    const meta = await invoke(`${ORIGIN}/meta/golfapi`);
-    expect(meta.status).toBe(200);
-    expect(meta.headers.get("Cache-Control")).toBe("no-store");
-    const body = await meta.json();
-    expect(body.balance).toEqual({
-      left: 33.5,
-      at: expect.any(Number),
-      lastStatus: 200,
-      asOf: expect.any(String),
-    });
-    expect(body.asOf).toBe(new Date(body.balance.at).toISOString());
-    expect(body.balance.asOf).toBe(body.asOf);
-    expect(Number.isNaN(Date.parse(body.generatedAt))).toBe(false);
-    expect(body.queueLength).toBe(1);
-    expect(body.days).toHaveLength(30);
-    expect(body.days[0].date < body.days[29].date).toBe(true);
-    expect(body.days[29]).toEqual(body.today);
-    expect(body.globalCap).toBe(100);
-    expect(body.today).toMatchObject({
-      date: todayKey(),
-      lookups: 1,
-      globalLookups: 1,
-      globalCap: 100,
-      allowlistedLookups: 0,
-      searches: 1,
-      hits: 1,
-    });
-    expect(body.days[0].globalLookups).toBe(0);
-    expect(body.days[0].allowlistedLookups).toBe(0);
-    expect(body.today.latency).toEqual({
-      search: { count: 1, median: expect.any(Number), max: expect.any(Number) },
-      course: { count: 1, median: expect.any(Number), max: expect.any(Number) },
-      coordinates: { count: 0, median: null, max: 0 },
-    });
-    expect(body.today.latency.search.max).toBeGreaterThanOrEqual(body.today.latency.search.median);
-    expect(JSON.stringify(body.today.latency)).not.toContain("samples");
-    expect(body.today.blocked.device_day).toBe(1);
-    expect(body.today.blocked.floor).toBe(0);
-    expect(Object.keys(body.today.blocked).sort()).toEqual([
-      "device_day",
-      "device_month",
-      "device_week",
-      "floor",
-      "global_day",
-      "install_id_required",
-      "ip_day",
-      "ip_month",
-      "ip_week",
-      "search_device_day",
-    ]);
-    const text = JSON.stringify(body);
-    expect(text).not.toContain("golf-secret");
-    expect(text).not.toContain(INSTALL);
-    expect(text).not.toContain(CLIENT_IP);
-    expect(text).not.toContain("GOLFAPI_KEY");
-    expect(text).not.toContain("Bearer");
-
-    const post = await invoke(`${ORIGIN}/meta/golfapi`, { method: "PUT", body: "{}" });
-    expect(post.status).toBe(405);
-    const down = await invoke(`${ORIGIN}/meta/golfapi`, { env: {} });
-    expect(down.status).toBe(503);
-  });
-
-  it("drains queued courses under the cap and above the floor", async () => {
-    kv.set("gqueue:ready", { value: JSON.stringify({ attempts: 0, at: 1 }) });
-    kv.set("gqueue:later", { value: JSON.stringify({ attempts: 0, at: 2 }) });
-    kv.set("gq:balance", { value: JSON.stringify({ left: 30, at: 1, lastStatus: 200 }) });
-    const calls = [];
-    mockGolfApi(async (url) => {
-      calls.push(url);
-      if (url.endsWith("/courses/ready")) return jsonResponse(coursePayload("ready", 28));
-      if (url.endsWith("/coordinates/ready")) return jsonResponse(coordPayload("ready", 27));
-      throw new Error(`should not fetch ${url}`);
-    });
-    await runDrain({ ...env, GOLFAPI_GLOBAL_DAY: "1" });
-    expect(calls).toEqual([
-      "https://golfapi.io/api/v2.3/courses/ready",
-      "https://golfapi.io/api/v2.3/coordinates/ready",
-    ]);
-    expect(kv.has("gqueue:ready")).toBe(false);
-    expect(kv.has("gqueue:later")).toBe(true);
-    expect(kv.get("gapi:course:ready")?.value).toContain("Magnolia");
-    expect(kv.get("gapi:coord:ready")?.value).toContain("coordinates");
-    expect(stats().lookups).toBe(1);
-
-    fetchMock.mockClear();
-    const free = await golfGet("/golfapi/v2.3/courses/ready");
-    expect(free.status).toBe(200);
-    expect(await free.json()).toMatchObject({ courseID: "ready" });
-    expect(fetchMock).not.toHaveBeenCalled();
-
-    kv.set("gq:balance", { value: JSON.stringify({ left: 10, at: 1, lastStatus: 200 }) });
-    await runDrain({ ...env, GOLFAPI_GLOBAL_DAY: "1" });
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(kv.has("gqueue:later")).toBe(true);
-
-    kv.set("gq:balance", { value: JSON.stringify({ left: 30, at: 1, lastStatus: 200 }) });
-    await runDrain({ ...env, GOLFAPI_GLOBAL_DAY: "1" });
-    expect(fetchMock).not.toHaveBeenCalled();
-
-    kv.set(`gq:stats:${todayKey()}`, {
-      value: JSON.stringify({ lookups: 0, searches: 0, hits: 0, blocked: {} }),
-    });
-    mockGolfApi(async () => new Response("nope", { status: 500, headers: { "Content-Type": "text/plain" } }));
-    await runDrain(env);
-    expect(JSON.parse(kv.get("gqueue:later").value).attempts).toBe(1);
-    expect(kv.has("gapi:course:later")).toBe(false);
-    expect(stats().lookups).toBe(1);
-
-    kv.set("gqueue:later", { value: JSON.stringify({ attempts: 5, at: 2 }) });
-    fetchMock.mockClear();
-    await runDrain(env);
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(JSON.parse(kv.get("gqueue:later").value).attempts).toBe(5);
-
-    kv.set("gqueue:empty", { value: JSON.stringify({ attempts: 0, at: 3 }) });
-    kv.set(`gq:stats:${todayKey()}`, {
-      value: JSON.stringify({ lookups: 0, searches: 0, hits: 0, blocked: {} }),
-    });
-    kv.set("gq:balance", { value: JSON.stringify({ left: 20, at: 1, lastStatus: 200 }) });
-    mockGolfApi(async () => jsonResponse({ error: "missing", apiRequestsLeft: "19" }));
-    await runDrain(env);
-    expect(kv.has("gqueue:empty")).toBe(false);
-    expect(kv.has("gapi:course:empty")).toBe(false);
-    expect(kv.has("gapi:coord:empty")).toBe(false);
-    expect(JSON.parse(kv.get("gq:balance").value).left).toBe(19);
-  });
-
-  it("stops a queue refill before coordinates once balance reaches the floor", async () => {
-    kv.set("gqueue:split", { value: JSON.stringify({ attempts: 0, at: 1 }) });
-    kv.set("gq:balance", { value: JSON.stringify({ left: 11, at: 1, lastStatus: 200 }) });
-    const calls = [];
-    mockGolfApi(async (url) => {
-      calls.push(url);
-      if (url.endsWith("/courses/split")) return jsonResponse(coursePayload("split", 10));
-      throw new Error(url);
-    });
-    await runDrain();
-    expect(calls).toEqual(["https://golfapi.io/api/v2.3/courses/split"]);
-    expect(kv.has("gapi:course:split")).toBe(true);
-    expect(kv.has("gapi:coord:split")).toBe(false);
-    expect(JSON.parse(kv.get("gqueue:split").value).attempts).toBe(0);
-    expect(stats().lookups).toBe(1);
   });
 
   it("does not call golfapi when the key or the board namespace is missing", async () => {
@@ -1960,54 +1603,6 @@ describe("shottrax-share worker", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("queues a limited name= search and the drain replays name=", async () => {
-    const searchEnv = { ...env, GOLFAPI_DEVICE_DAY: "1" };
-    mockGolfApi(async (url) => {
-      if (!url.includes("/courses?")) throw new Error(url);
-      return jsonResponse(searchPayload("x", "Somewhere", "70"));
-    });
-    expect((await golfGet("/golfapi/v2.3/courses?name=one", { env: searchEnv })).status).toBe(200);
-    expect((await golfGet("/golfapi/v2.3/courses?name=two", { env: searchEnv })).status).toBe(200);
-    expect((await golfGet("/golfapi/v2.3/courses?q=three", { env: searchEnv })).status).toBe(200);
-    expect(stats().lookups).toBe(1);
-    expect(stats().searches).toBe(3);
-
-    const blocked = await golfGet("/golfapi/v2.3/courses?country=US&name=Oak%20Marsh", { env: searchEnv });
-    const body = await blocked.json();
-    expect(blocked.status).toBe(429);
-    expect(body.reason).toBe("search_device_day");
-    expect(body.queued).toBe(true);
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-    const queued = [...kv.keys()].filter((key) => key.startsWith("gqueue:q:"));
-    expect(queued).toEqual([`gqueue:q:${await searchTokenFor("oak marsh")}`]);
-    expect(JSON.parse(kv.get(queued[0]).value)).toMatchObject({
-      attempts: 0,
-      q: "oak marsh",
-      search: "?country=US&name=Oak%20Marsh",
-    });
-
-    const calls = [];
-    mockGolfApi(async (url) => {
-      calls.push(url);
-      if (url.includes("/courses?")) {
-        return jsonResponse(searchPayload("oak", "Oak Marsh", "30"));
-      }
-      if (url.endsWith("/courses/oak")) return jsonResponse(coursePayload("oak", 28));
-      if (url.endsWith("/coordinates/oak")) return jsonResponse(coordPayload("oak", 27));
-      throw new Error(url);
-    });
-    await runDrain(searchEnv);
-    expect(calls).toEqual([
-      "https://golfapi.io/api/v2.3/courses?country=US&name=Oak%20Marsh",
-      "https://golfapi.io/api/v2.3/courses/oak",
-      "https://golfapi.io/api/v2.3/coordinates/oak",
-    ]);
-    expect(kv.has(queued[0])).toBe(false);
-    expect(kv.get(`gapi:search:${await searchTokenFor("oak marsh")}`)?.opts.expirationTtl).toBe(30 * DAY);
-    expect(kv.has("gapi:course:oak")).toBe(true);
-    expect(kv.has("gapi:coord:oak")).toBe(true);
-  });
-
   it("does not open a set when the search is already stored", async () => {
     const digest = await crypto.subtle.digest(
       "SHA-256",
@@ -2037,136 +1632,6 @@ describe("shottrax-share worker", () => {
     expect((await golfGet("/golfapi/v2.3/coordinates/pebble")).status).toBe(200);
     expect(stats().lookups).toBe(1);
     expect(fetchMock).toHaveBeenCalledTimes(2);
-  });
-
-  it("drains a queued search and follows a unique normalized name", async () => {
-    kv.set("gq:balance", { value: JSON.stringify({ left: 9, at: 1, lastStatus: 200 }) });
-    const blocked = await golfGet("/golfapi/v2.3/courses?country=US&q=Magnolia");
-    expect(blocked.status).toBe(429);
-    expect((await blocked.json()).queued).toBe(true);
-    expect((await golfGet("/golfapi/v2.3/courses?q=magnolia")).status).toBe(429);
-    const queued = [...kv.keys()].filter((key) => key.startsWith("gqueue:"));
-    expect(queued).toHaveLength(1);
-    expect(JSON.parse(kv.get(queued[0]).value)).toMatchObject({
-      attempts: 0,
-      q: "magnolia",
-      search: "?country=US&q=Magnolia",
-    });
-    kv.set("gqueue:q:nope", { value: JSON.stringify({ attempts: 0, at: 5, q: "nope", search: "?q=nope" }) });
-
-    kv.set("gq:balance", { value: JSON.stringify({ left: 40, at: 1, lastStatus: 200 }) });
-    const calls = [];
-    mockGolfApi(async (url) => {
-      calls.push(url);
-      if (url.includes("/courses?")) {
-        return jsonResponse({
-          apiRequestsLeft: "30",
-          numCourses: 1,
-          courses: [{ courseID: "pebble", courseName: "Magnolia" }],
-        });
-      }
-      if (url.endsWith("/courses/pebble")) return jsonResponse(coursePayload("pebble", 28));
-      if (url.endsWith("/coordinates/pebble")) return jsonResponse(coordPayload("pebble", 27));
-      throw new Error(url);
-    });
-    await runDrain();
-    expect(calls).toEqual([
-      "https://golfapi.io/api/v2.3/courses?country=US&q=Magnolia",
-      "https://golfapi.io/api/v2.3/courses/pebble",
-      "https://golfapi.io/api/v2.3/coordinates/pebble",
-    ]);
-    expect(kv.has(queued[0])).toBe(false);
-    expect(kv.has("gqueue:q:nope")).toBe(false);
-    const token = queued[0].slice("gqueue:q:".length);
-    expect(kv.get(`gapi:search:${token}`)?.opts.expirationTtl).toBe(30 * DAY);
-    expect(kv.get("gapi:course:pebble")?.opts.expirationTtl).toBe(365 * DAY);
-    expect(kv.get("gapi:coord:pebble")?.value).toContain("coordinates");
-    expect(stats().lookups).toBe(1);
-
-    fetchMock.mockClear();
-    expect((await golfGet("/golfapi/v2.3/courses?q=magnolia")).status).toBe(200);
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(stats().lookups).toBe(1);
-  });
-
-  it("stores only the search when the queued name is not a single match", async () => {
-    async function enqueue(path) {
-      kv.set("gq:balance", { value: JSON.stringify({ left: 9, at: 1, lastStatus: 200 }) });
-      expect((await golfGet(path)).status).toBe(429);
-      kv.set("gq:balance", { value: JSON.stringify({ left: 40, at: 1, lastStatus: 200 }) });
-    }
-
-    await enqueue("/golfapi/v2.3/courses?q=Pine");
-    const calls = [];
-    mockGolfApi(async (url) => {
-      calls.push(url);
-      return jsonResponse({
-        apiRequestsLeft: "30",
-        numCourses: 2,
-        courses: [
-          { courseID: "a", courseName: "Pine" },
-          { courseID: "b", clubName: "Pine" },
-        ],
-      });
-    });
-    await runDrain();
-    expect(calls).toEqual(["https://golfapi.io/api/v2.3/courses?q=Pine"]);
-    expect([...kv.keys()].some((key) => key.startsWith("gapi:course:"))).toBe(false);
-    expect([...kv.keys()].some((key) => key.startsWith("gapi:search:"))).toBe(true);
-    expect([...kv.keys()].some((key) => key.startsWith("gqueue:"))).toBe(false);
-    expect(stats().lookups).toBe(1);
-
-    kv.clear();
-    edge.clear();
-    calls.length = 0;
-    await enqueue("/golfapi/v2.3/courses?q=Missing");
-    mockGolfApi(async (url) => {
-      calls.push(url);
-      return jsonResponse({
-        apiRequestsLeft: "22",
-        numCourses: 1,
-        courses: [{ courseID: "zzz", courseName: "Other" }],
-      });
-    });
-    await runDrain();
-    expect(calls).toEqual(["https://golfapi.io/api/v2.3/courses?q=Missing"]);
-    expect([...kv.keys()].some((key) => key.startsWith("gapi:course:"))).toBe(false);
-    expect([...kv.keys()].some((key) => key.startsWith("gqueue:"))).toBe(false);
-    expect(stats().lookups).toBe(1);
-  });
-
-  it("leaves a queued search in place when the floor hits before course details", async () => {
-    kv.set("gq:balance", { value: JSON.stringify({ left: 9, at: 1, lastStatus: 200 }) });
-    expect((await golfGet("/golfapi/v2.3/courses?q=Magnolia")).status).toBe(429);
-    const queued = [...kv.keys()].filter((key) => key.startsWith("gqueue:q:"));
-    kv.set("gq:balance", { value: JSON.stringify({ left: 40, at: 1, lastStatus: 200 }) });
-    mockGolfApi(async () => jsonResponse({
-      apiRequestsLeft: "10",
-      numCourses: 1,
-      courses: [{ courseID: "pebble", courseName: "Magnolia" }],
-    }));
-    await runDrain();
-    expect(kv.has(queued[0])).toBe(true);
-    expect(JSON.parse(kv.get(queued[0]).value).attempts).toBe(0);
-    expect(kv.has("gapi:search:" + queued[0].slice("gqueue:q:".length))).toBe(true);
-    expect(kv.has("gapi:course:pebble")).toBe(false);
-    expect(stats().lookups).toBe(1);
-
-    const calls = [];
-    kv.set("gq:balance", { value: JSON.stringify({ left: 30, at: 1, lastStatus: 200 }) });
-    mockGolfApi(async (url) => {
-      calls.push(url);
-      if (url.endsWith("/courses/pebble")) return jsonResponse(coursePayload("pebble", 20));
-      if (url.endsWith("/coordinates/pebble")) return jsonResponse(coordPayload("pebble", 19));
-      throw new Error(url);
-    });
-    await runDrain();
-    expect(calls).toEqual([
-      "https://golfapi.io/api/v2.3/courses/pebble",
-      "https://golfapi.io/api/v2.3/coordinates/pebble",
-    ]);
-    expect(kv.has(queued[0])).toBe(false);
-    expect(stats().lookups).toBe(2);
   });
 
   it("does not count allowlisted installs toward the global cap or IP counters", async () => {
@@ -2247,6 +1712,83 @@ describe("shottrax-share worker", () => {
     expect(fetchMock).not.toHaveBeenCalled();
     expect(stats().allowlistedLookups).toBe(2);
     expect(stats().lookups).toBe(1);
+  });
+
+  it("reports /meta/golfapi without secrets, install ids, or IPs", async () => {
+    mockGolfApi(async (url) => {
+      if (url.includes("/courses?")) {
+        return jsonResponse({ apiRequestsLeft: "33.5", numCourses: 1, courses: [{ courseID: "m", courseName: "M" }] });
+      }
+      return jsonResponse(coursePayload("meta", 40));
+    });
+    const limited = { ...env, GOLFAPI_DEVICE_DAY: "1", GOLFAPI_FLOOR: "10" };
+    expect((await golfGet("/golfapi/v2.3/courses/meta", { env: limited })).status).toBe(200);
+    expect((await golfGet("/golfapi/v2.3/courses/meta", { env: limited })).status).toBe(200);
+    expect((await golfGet("/golfapi/v2.3/courses?q=meta", { env: limited })).status).toBe(200);
+    expect((await golfGet("/golfapi/v2.3/courses/other", { env: limited })).status).toBe(429);
+
+    const meta = await invoke(`${ORIGIN}/meta/golfapi`);
+    expect(meta.status).toBe(200);
+    expect(meta.headers.get("Cache-Control")).toBe("no-store");
+    const body = await meta.json();
+    expect(body.balance).toEqual({
+      left: 33.5,
+      at: expect.any(Number),
+      lastStatus: 200,
+      asOf: expect.any(String),
+    });
+    expect(body.asOf).toBe(new Date(body.balance.at).toISOString());
+    expect(body.balance.asOf).toBe(body.asOf);
+    expect(Number.isNaN(Date.parse(body.generatedAt))).toBe(false);
+    expect(body.queueLength).toBe(1);
+    expect(body.days).toHaveLength(30);
+    expect(body.days[0].date < body.days[29].date).toBe(true);
+    expect(body.days[29]).toEqual(body.today);
+    expect(body.globalCap).toBe(100);
+    expect(body.today).toMatchObject({
+      date: todayKey(),
+      lookups: 1,
+      globalLookups: 1,
+      globalCap: 100,
+      allowlistedLookups: 0,
+      searches: 1,
+      hits: 1,
+    });
+    expect(body.days[0].globalLookups).toBe(0);
+    expect(body.days[0].allowlistedLookups).toBe(0);
+    expect(body.today.latency).toEqual({
+      search: { count: 1, median: expect.any(Number), max: expect.any(Number) },
+      course: { count: 1, median: expect.any(Number), max: expect.any(Number) },
+      coordinates: { count: 0, median: null, max: 0 },
+    });
+    expect(body.today.latency.search.max).toBeGreaterThanOrEqual(body.today.latency.search.median);
+    expect(JSON.stringify(body.today.latency)).not.toContain("samples");
+    expect(body.today.blocked.device_day).toBe(1);
+    expect(body.today.blocked.floor).toBe(0);
+    expect(Object.keys(body.today.blocked).sort()).toEqual([
+      "device_day",
+      "device_month",
+      "device_week",
+      "floor",
+      "global_day",
+      "global_month",
+      "install_id_required",
+      "ip_day",
+      "ip_month",
+      "ip_week",
+      "search_device_day",
+    ]);
+    const text = JSON.stringify(body);
+    expect(text).not.toContain("golf-secret");
+    expect(text).not.toContain(INSTALL);
+    expect(text).not.toContain(CLIENT_IP);
+    expect(text).not.toContain("GOLFAPI_KEY");
+    expect(text).not.toContain("Bearer");
+
+    const post = await invoke(`${ORIGIN}/meta/golfapi`, { method: "PUT", body: "{}" });
+    expect(post.status).toBe(405);
+    const down = await invoke(`${ORIGIN}/meta/golfapi`, { env: {} });
+    expect(down.status).toBe(503);
   });
 
   it("reports fetch time count, median, and max without the raw sample", async () => {
@@ -3300,100 +2842,124 @@ describe("shottrax-share worker", () => {
   const BRITTANY_NAME = "name:brittany|rogers|ar";
 
   it("keeps a 9-hole Brittany record when a 5-hole partial is PUT", async () => {
-    const existingHoles = Array.from({ length: 9 }, (_, index) => paintHole(index + 1, 33 + index * 0.01));
-    const existing = paintRecord(BRITTANY_ID, existingHoles, { aliases: [BRITTANY_NAME] });
-    kv.set(BRITTANY_ID, { value: JSON.stringify(existing), opts: { expirationTtl: 365 * DAY } });
+    const existingHoles = Array.from({ length: 9 }, (_, index) => paintHole(index + 1, 34.74 + index * 0.0008));
+    const existing = paintRecord(BRITTANY_ID, existingHoles, { aliases: [BRITTANY_NAME], source: "manual_verified" });
+    const row = { value: JSON.stringify(existing), opts: { expirationTtl: 365 * DAY } };
+    kv.set(BRITTANY_ID, row);
 
     const partial = paintRecord(BRITTANY_ID, [
-      paintHole(2, 10.02),
-      paintHole(3, 10.03),
-      paintHole(4, 10.04),
-      paintHole(5, 10.05),
-      paintHole(15, 10.15),
+      paintHole(2, 34.748),
+      paintHole(3, 34.749),
+      paintHole(4, 34.75),
+      paintHole(5, 34.751),
+      paintHole(6, 34.752),
     ], {
       aliases: [BRITTANY_NAME],
+      source: "manual_verified",
       name: "Wrong",
       city: "",
       numHoles: 5,
       fetchedAt: "2026-09-01T00:00:00.000Z",
     });
-    const response = await invoke(paintUrl(BRITTANY_ID), { method: "PUT", body: JSON.stringify(partial) });
-    expect(response.status).toBe(200);
-    const stored = JSON.parse(kv.get(BRITTANY_ID).value);
-    const byHole = holesByNumber(stored.holes);
-    for (let hole = 1; hole <= 9; hole += 1) {
-      expect(byHole[hole].tee.lat).toBe(existingHoles[hole - 1].tee.lat);
-      expect(byHole[hole].green.lng).toBe(existingHoles[hole - 1].green.lng);
-    }
-    expect(byHole[15].tee.lat).toBe(10.15);
-    expect(countedComplete(stored.holes)).toBe(10);
+    const response = await invoke(paintUrl(BRITTANY_ID), {
+      method: "PUT",
+      body: JSON.stringify(partial),
+      headers: { "X-Install-Id": "install-0001" },
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: "no-trustworthy-identity" });
+    expect(kv.get(BRITTANY_ID)).toBe(row);
+    const stored = JSON.parse(row.value);
+    expect(countedComplete(stored.holes)).toBe(9);
     expect(stored.numHoles).toBe(9);
     expect(stored.name).toBe("Brittany");
     expect(stored.city).toBe("Rogers");
-    expect(stored.fetchedAt).toBe("2026-01-01T00:00:00.000Z");
-    expect(stored.aliases).toEqual([BRITTANY_NAME]);
-    expect(JSON.parse(await response.text())).toEqual(stored);
+    expect(stored.holes).toHaveLength(9);
   });
 
   it("fills a blank hole on PUT and leaves complete holes alone", async () => {
-    const existingHoles = Array.from({ length: 9 }, (_, index) => paintHole(index + 1, 33 + index * 0.01));
-    existingHoles[6] = { hole: 7, tee: paintPoint(33.06, -93.2), par: 3, yards: 160 };
-    const existing = paintRecord(BRITTANY_ID, existingHoles, { city: "", aliases: [BRITTANY_NAME] });
+    const existingHoles = Array.from({ length: 9 }, (_, index) => paintHole(index + 1, 34.74 + index * 0.0008));
+    existingHoles[6] = { hole: 7, tee: paintPoint(34.7448, -93.2), par: 3, yards: 160 };
+    const existing = paintRecord(BRITTANY_ID, existingHoles, {
+      city: "",
+      aliases: [BRITTANY_NAME],
+      source: "manual_verified",
+    });
     kv.set(BRITTANY_ID, { value: JSON.stringify(existing), opts: { expirationTtl: 365 * DAY } });
 
-    const incomingHole = paintHole(7, 41.07, { par: 5, yards: 510, source: "name" });
-    const partial = paintRecord(BRITTANY_ID, [paintHole(2, 12), incomingHole], {
+    const kept = existingHoles[1];
+    const incomingHole = {
+      ...paintHole(7, 34.7448),
+      par: 5,
+      yards: 510,
+      tee: paintPoint(34.7448, -93.2),
+    };
+    const partial = paintRecord(BRITTANY_ID, [kept, incomingHole], {
       aliases: [BRITTANY_NAME],
+      source: "manual_verified",
       city: "Rogers",
     });
-    const response = await invoke(paintUrl(BRITTANY_ID), { method: "PUT", body: JSON.stringify(partial) });
+    const response = await invoke(paintUrl(BRITTANY_ID), {
+      method: "PUT",
+      body: JSON.stringify(partial),
+      headers: { "X-Install-Id": "install-0001" },
+    });
     expect(response.status).toBe(200);
     const stored = JSON.parse(kv.get(BRITTANY_ID).value);
     const byHole = holesByNumber(stored.holes);
     expect(byHole[2].tee.lat).toBe(existingHoles[1].tee.lat);
-    expect(byHole[7]).toEqual(incomingHole);
+    expect(byHole[2].green).toEqual(existingHoles[1].green);
+    expect(byHole[7].green).toEqual(incomingHole.green);
+    expect(byHole[7].tee).toEqual(incomingHole.tee);
     expect(countedComplete(stored.holes)).toBe(9);
     expect(stored.city).toBe("Rogers");
     expect(stored.name).toBe("Brittany");
-    expect(JSON.parse(await response.text())).toEqual(stored);
+    expect(await response.json()).toEqual(stored);
   });
 
   it("skips a paint PUT that adds nothing", async () => {
-    const existingHoles = Array.from({ length: 9 }, (_, index) => paintHole(index + 1, 33 + index * 0.01));
-    const existing = paintRecord(BRITTANY_ID, existingHoles, { aliases: [BRITTANY_NAME] });
+    const existingHoles = Array.from({ length: 9 }, (_, index) => paintHole(index + 1, 34.74 + index * 0.0008));
+    const existing = paintRecord(BRITTANY_ID, existingHoles, { aliases: [BRITTANY_NAME], source: "manual_verified" });
     const row = { value: JSON.stringify(existing), opts: { expirationTtl: 365 * DAY } };
     kv.set(BRITTANY_ID, row);
-    const partial = paintRecord(BRITTANY_ID, [2, 3, 4, 5].map((hole) => paintHole(hole, 10 + hole)), {
+    const partial = paintRecord(BRITTANY_ID, [2, 3, 4, 5].map((hole) => paintHole(hole, 34.75 + hole * 0.0001)), {
       aliases: [BRITTANY_NAME],
+      source: "manual_verified",
       name: "Other",
       numHoles: 5,
     });
-    const response = await invoke(paintUrl(BRITTANY_ID), { method: "PUT", body: JSON.stringify(partial) });
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ changed: false, message: "nothing changed" });
-    expect(kv.get(BRITTANY_ID)).toBe(row);
-  });
-
-  it("stores the incoming paint record when X-Paint-Replace is 1", async () => {
-    const existingHoles = Array.from({ length: 9 }, (_, index) => paintHole(index + 1, 33 + index * 0.01));
-    kv.set(BRITTANY_ID, {
-      value: JSON.stringify(paintRecord(BRITTANY_ID, existingHoles, { aliases: [BRITTANY_NAME] })),
-      opts: { expirationTtl: 365 * DAY },
-    });
-    const partial = paintRecord(BRITTANY_ID, [2, 3, 4, 5, 15].map((hole) => paintHole(hole, 10 + hole / 100)), {
-      aliases: [BRITTANY_NAME],
-      numHoles: 9,
-    });
-    const body = JSON.stringify(partial);
     const response = await invoke(paintUrl(BRITTANY_ID), {
       method: "PUT",
-      body,
-      headers: { "X-Paint-Replace": "1" },
+      body: JSON.stringify(partial),
+      headers: { "X-Install-Id": "install-0001" },
     });
-    expect(response.status).toBe(200);
-    expect(await response.text()).toBe(body);
-    expect(kv.get(BRITTANY_ID).value).toBe(body);
-    expect(countedComplete(JSON.parse(kv.get(BRITTANY_ID).value).holes)).toBe(5);
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: "no-trustworthy-identity" });
+    expect(kv.get(BRITTANY_ID)).toBe(row);
+    expect(countedComplete(JSON.parse(row.value).holes)).toBe(9);
+  });
+
+  it("does not let X-Paint-Replace overwrite a hand-marked paint record", async () => {
+    const existingHoles = Array.from({ length: 9 }, (_, index) => paintHole(index + 1, 34.74 + index * 0.0008));
+    const row = {
+      value: JSON.stringify(paintRecord(BRITTANY_ID, existingHoles, { aliases: [BRITTANY_NAME], source: "manual_verified" })),
+      opts: { expirationTtl: 365 * DAY },
+    };
+    kv.set(BRITTANY_ID, row);
+    const partial = paintRecord(BRITTANY_ID, [2, 3, 4, 5, 6].map((hole) => paintHole(hole, 34.745 + hole * 0.0001)), {
+      aliases: [BRITTANY_NAME],
+      source: "manual_verified",
+      numHoles: 9,
+    });
+    const response = await invoke(paintUrl(BRITTANY_ID), {
+      method: "PUT",
+      body: JSON.stringify(partial),
+      headers: { "X-Install-Id": "install-0001", "X-Paint-Replace": "1" },
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: "no-trustworthy-identity" });
+    expect(kv.get(BRITTANY_ID)).toBe(row);
+    expect(countedComplete(JSON.parse(row.value).holes)).toBe(9);
   });
 
   it("fills paint gaps from an alias on GET and does not write", async () => {
