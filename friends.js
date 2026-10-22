@@ -61,6 +61,8 @@ export const LIVE_SHOT_LIMIT = 15;
 export const LIVE_SHOT_MAX_YARDS = 700;
 export const LIVE_SHOT_RESULTS = ["fairway", "rough", "sand", "green", "holed", "missed"];
 const LIVE_PUTT_CLUB = "Putt";
+// 100 ids of 64 characters plus quotes and commas.
+const DELETE_ROUNDS_BODY_LIMIT = 8192;
 const PAST_BODY_LIMIT = 256 * 1024;
 const PHOTO_BODY_LIMIT = 96 * 1024;
 const ROUND_TTL_SECONDS = 365 * 24 * 60 * 60;
@@ -223,6 +225,7 @@ const FRIEND_ROUTES = {
   "/v1/friends/unblock": { POST: unblockPerson },
   "/v1/friends/remove": { POST: removeFriend },
   "/v1/friends/rounds": { PUT: publishRound, GET: fetchRounds },
+  "/v1/friends/rounds/delete": { POST: deleteRounds },
   "/v1/friends/past": { PUT: setPastRounds },
 };
 
@@ -673,6 +676,37 @@ async function publishRound(request, env, cors) {
     expirationTtl: ROUND_TTL_SECONDS,
   });
   return friendJson(200, { ok: true, id: stored.id }, cors);
+}
+
+/**
+ * Delete some of the caller's own rounds by id. Body { ids: [roundId, ...] }, 1 to ROUND_CAP ids.
+ * Takes both normal shares and past-round picks. Ids the caller never shared
+ * (or already deleted) are fine, so a phone can retry after a lost answer.
+ * Only the caller's own fr:rounds: value is read or written.
+ */
+async function deleteRounds(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const parsed = await readJsonObject(request, DELETE_ROUNDS_BODY_LIMIT, false);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  const body = parsed.value;
+  if (unknownFields(body, ["ids"]) || !Array.isArray(body.ids)) return friendJson(400, { error: "invalid_body" }, cors);
+  if (body.ids.length < 1 || body.ids.length > ROUND_CAP) return friendJson(400, { error: "invalid_body" }, cors);
+  if (!body.ids.every((id) => typeof id === "string" && ROUND_ID_RE.test(id))) {
+    return friendJson(400, { error: "invalid_body" }, cors);
+  }
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const limited = await consumeIpAction(request, env, "ippub:", cors);
+  if (limited) return limited;
+  const drop = new Set(body.ids);
+  const existing = await loadOwnedRounds(boards, caller.ownerId);
+  const kept = existing.filter((round) => !drop.has(round.id));
+  const removed = existing.length - kept.length;
+  if (removed > 0) await saveOwnedRounds(boards, caller.ownerId, kept);
+  return friendJson(200, { ok: true, removed }, cors);
 }
 
 async function listRequests(request, env, cors) {
