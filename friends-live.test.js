@@ -331,9 +331,10 @@ describe("live rounds for friends", () => {
   });
 
   // Made-up clubs and yards only (Brian OK 2026-10-22 9:26 AM CT).
+  // Coordinates are made up (not a real course).
   const SHOTS = [
-    { n: 1, club: "Dr", yd: 248, res: "fairway" },
-    { n: 2, club: "7i", yd: 162 },
+    { n: 1, club: "Dr", yd: 248, s: [10.12345, 20.12345], e: [10.12545, 20.12445], res: "fairway" },
+    { n: 2, club: "7i", yd: 162, s: [10.12545, 20.12445], e: [10.12671, 20.12512] },
     { n: 3, club: "PW", res: "green" },
     { n: 4, club: "Putt", res: "missed" },
     { n: 5, club: "Putt", res: "holed" },
@@ -366,21 +367,26 @@ describe("live rounds for friends", () => {
 
   it("live shots: the body limit is 24 KB", async () => {
     const golfer = await mint("shot-big");
-    const pad = "x".repeat(25 * 1024);
-    const res = await invoke("/v1/friends/live", { method: "PUT", friend: golfer.key, body: { ...WITH_SHOTS, pad } });
-    expect([400, 413]).toContain(res.status);
+    // Every field valid, 18 holes x 15 widest shots is about 31 KB: over the limit.
+    const holes = Array.from({ length: 18 }, (_, i) => ({
+      hole: i + 1, score: 15, par: 4, clubs: Array(8).fill("Dr 12345"),
+      shots: Array.from({ length: 15 }, (_, j) => ({ n: j + 1, club: "Dr 12345", yd: 700, s: [-10.12345, -120.12345], e: [-10.12345, -120.12345], res: "fairway" })),
+    }));
+    const over = await invoke("/v1/friends/live", { method: "PUT", friend: golfer.key, body: { courseName: "M".repeat(200), hole: 18, holes } });
+    expect(over.status).toBe(413);
+    expect(kv.has(`fr:live:${golfer.ownerId}`)).toBe(false);
     const big = await invoke("/v1/friends/live", { method: "PUT", friend: golfer.key, body: { ...WITH_SHOTS, courseName: "M".repeat(200) } });
     expect(big.status).toBe(200);
     expect(kv.has(`fr:live:${golfer.ownerId}`)).toBe(true);
   });
 
-  it("live shots: a full 18 holes x 15 shots fits under the limit", async () => {
+  it("live shots: 18 holes x 10 shots at the widest field values fits under the limit", async () => {
     const golfer = await mint("shot-full");
     const holes = Array.from({ length: 18 }, (_, i) => ({
-      hole: i + 1, score: 15, par: 4, clubs: ["Dr", "7i"],
-      shots: Array.from({ length: 15 }, (_, j) => ({ n: j + 1, club: "Dr", yd: 700, res: "fairway" })),
+      hole: i + 1, score: 15, par: 4, clubs: Array(8).fill("Dr 12345"),
+      shots: Array.from({ length: 10 }, (_, j) => ({ n: j + 1, club: "Dr 12345", yd: 700, s: [-10.12345, -120.12345], e: [-10.12345, -120.12345], res: "fairway" })),
     }));
-    expect((await putLive(golfer, { courseName: "Mock Pines GC", hole: 18, holes })).status).toBe(200);
+    expect((await putLive(golfer, { courseName: "M".repeat(200), hole: 18, holes })).status).toBe(200);
   });
 
   const rejectShot = (name, shot) =>
@@ -391,7 +397,14 @@ describe("live rounds for friends", () => {
       expect(kv.has(`fr:live:${golfer.ownerId}`)).toBe(false);
     });
   rejectShot("an unknown shot field", { n: 1, club: "Dr", note: "x" });
-  rejectShot("shot coordinates", { n: 1, club: "Dr", lat: 10.1, lng: 20.1 });
+  rejectShot("lat/lng fields on a shot", { n: 1, club: "Dr", lat: 10.1, lng: 20.1 });
+  rejectShot("6 decimal places", { n: 1, club: "Dr", s: [10.123456, 20.12345] });
+  rejectShot("a latitude out of range", { n: 1, club: "Dr", s: [90.5, 20.1] });
+  rejectShot("a longitude out of range", { n: 1, club: "Dr", e: [10.1, 180.5] });
+  rejectShot("a point that is not a pair", { n: 1, club: "Dr", s: [10.1] });
+  rejectShot("a point with strings", { n: 1, club: "Dr", s: ["10.1", "20.1"] });
+  rejectShot("an object point", { n: 1, club: "Dr", e: { lat: 10.1, lng: 20.1 } });
+  rejectShot("coordinates on a putt", { n: 1, club: "Putt", s: [10.1, 20.1] });
   rejectShot("a missing n", { club: "Dr" });
   rejectShot("n of 0", { n: 0 });
   rejectShot("n of 16", { n: 16 });

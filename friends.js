@@ -1165,10 +1165,13 @@ function sanitizeShots(shots, scored) {
   return out.sort((a, b) => a.n - b.n);
 }
 
-/** Allowlist: n, club, yd, res. Putts carry no yards; Holed only on a scored hole. */
+/**
+ * Allowlist: n, club, yd, s, e, res. s and e are [lat, lng] at most 5 decimals.
+ * Putts carry no yards and no coordinates; Holed only on a scored hole.
+ */
 export function sanitizeShot(shot, scored = true) {
   if (shot == null || typeof shot !== "object" || Array.isArray(shot)) return null;
-  if (unknownFields(shot, ["n", "club", "yd", "res"])) return null;
+  if (unknownFields(shot, ["n", "club", "yd", "s", "e", "res"])) return null;
   if (!Number.isInteger(shot.n) || shot.n < 1 || shot.n > LIVE_SHOT_LIMIT) return null;
   const clean = { n: shot.n };
   if (Object.hasOwn(shot, "club")) {
@@ -1180,12 +1183,26 @@ export function sanitizeShot(shot, scored = true) {
     if (putt || !Number.isInteger(shot.yd) || shot.yd < 0 || shot.yd > LIVE_SHOT_MAX_YARDS) return null;
     clean.yd = shot.yd;
   }
+  for (const key of ["s", "e"]) {
+    if (!Object.hasOwn(shot, key)) continue;
+    if (putt || !validLivePoint(shot[key])) return null;
+    clean[key] = [shot[key][0], shot[key][1]];
+  }
   if (Object.hasOwn(shot, "res")) {
     if (typeof shot.res !== "string" || !LIVE_SHOT_RESULTS.includes(shot.res)) return null;
     if (shot.res === "holed" && !scored) return null;
     clean.res = shot.res;
   }
   return clean;
+}
+
+/** [lat, lng], finite, in range, no more than 5 decimal places (about 1 m). */
+function validLivePoint(point) {
+  if (!Array.isArray(point) || point.length !== 2) return false;
+  const [lat, lng] = point;
+  if (typeof lat !== "number" || typeof lng !== "number" || !Number.isFinite(lat) || !Number.isFinite(lng)) return false;
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return false;
+  return Math.round(lat * 1e5) / 1e5 === lat && Math.round(lng * 1e5) / 1e5 === lng;
 }
 
 function validClubs(clubs) {
