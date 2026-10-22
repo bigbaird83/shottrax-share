@@ -539,7 +539,8 @@ describe("friend read routes", () => {
       incoming: [{ ownerId: incoming }],
       outgoing: [{ ownerId: outgoing }],
     });
-    expect(requestCounts).toEqual({ get: 4, put: 0, delete: 0, list: 2 });
+    // 4 base reads + one fr:ownname: read per returned entry.
+    expect(requestCounts).toEqual({ get: 6, put: 0, delete: 0, list: 2 });
 
     const first = "h".repeat(22);
     const second = "j".repeat(22);
@@ -549,7 +550,8 @@ describe("friend read routes", () => {
     const friendCounts = countKv();
     const friends = await viaEntry("/v1/friends/list", { friend: caller.key });
     expect(ownerIds(friends.json.friends)).toEqual([first, second]);
-    expect(friendCounts).toEqual({ get: 10, put: 0, delete: 0, list: 0 });
+    // 10 base reads + one fr:ownname: read per listed friend.
+    expect(friendCounts).toEqual({ get: 12, put: 0, delete: 0, list: 0 });
   });
 
   it("follows the request list cursor", async () => {
