@@ -212,6 +212,7 @@ const FRIEND_ROUTES = {
   "/v1/friends/requests": { POST: sendRequest, GET: listRequests },
   "/v1/friends/list": { GET: listFriends },
   "/v1/friends/requests/accept": { POST: acceptRequest },
+  "/v1/friends/requests/cancel": { POST: cancelRequest },
   "/v1/friends/block": { POST: blockPerson },
   "/v1/friends/unblock": { POST: unblockPerson },
   "/v1/friends/remove": { POST: removeFriend },
@@ -567,6 +568,20 @@ async function acceptRequest(request, env, cors) {
   await deleteOutgoingNote(boards, ownerId, caller.ownerId);
   await friendDelete(boards, reqKey);
   return friendJson(200, { status: "friends", ownerId }, cors);
+}
+
+/**
+ * Withdraw a request the caller sent. Deletes only the caller's own pending row
+ * (and any quiet-block note), so the recipient no longer sees it. Idempotent:
+ * nothing pending is still 200. Never touches friendships, blocks or rounds.
+ */
+async function cancelRequest(request, env, cors) {
+  const ready = await readyOwnerCall(request, env, cors);
+  if (ready.error) return ready.error;
+  const { boards, caller, ownerId } = ready;
+  await deleteIfPresent(boards, requestKey(ownerId, caller.ownerId));
+  await deleteOutgoingNote(boards, caller.ownerId, ownerId);
+  return friendJson(200, { ok: true }, cors);
 }
 
 async function blockPerson(request, env, cors) {
