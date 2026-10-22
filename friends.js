@@ -270,6 +270,7 @@ async function resetCode(request, env, cors) {
   await friendDelete(boards, friendKvKey("code", previous));
   // The invite name lives with the code. A reset deletes it; it does not move to the new code.
   await deleteIfPresent(boards, friendKvKey("invname", previous));
+  await deleteIfPresent(boards, friendKvKey("ownname", existing.ownerId));
   await deleteIfPresent(boards, friendKvKey("invphoto", previous));
   return friendJson(200, { code, ownerId: existing.ownerId }, cors);
 }
@@ -329,8 +330,15 @@ async function setInviteName(request, env, cors) {
   const caller = await loadCaller(boards, friendKey);
   if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
   const key = friendKvKey("invname", caller.code);
-  if (name) await friendPut(boards, key, name);
-  else await deleteIfPresent(boards, key);
+  // The same name is kept by ownerId so friend and request lists can show it.
+  const ownKey = friendKvKey("ownname", caller.ownerId);
+  if (name) {
+    await friendPut(boards, key, name);
+    await friendPut(boards, ownKey, name);
+  } else {
+    await deleteIfPresent(boards, key);
+    await deleteIfPresent(boards, ownKey);
+  }
   return friendJson(200, { ok: true }, cors);
 }
 
@@ -384,6 +392,19 @@ function readInvitePhoto(raw) {
   // JPEG files start with FF D8 FF ("/9j/" in base64).
   if (!data.startsWith("/9j/")) return null;
   return { type: INVITE_PHOTO_TYPE, data };
+}
+
+async function backfillOwnName(boards, caller) {
+  const ownKey = friendKvKey("ownname", caller.ownerId);
+  if (readInviteName(await friendGet(boards, ownKey))) return;
+  const name = readInviteName(await friendGet(boards, friendKvKey("invname", caller.code)));
+  if (name) await friendPut(boards, ownKey, name);
+}
+
+/** The other person's invite name for list rows, or the bare entry when unset or invalid. */
+async function withOwnerName(boards, ownerId) {
+  const name = readInviteName(await friendGet(boards, friendKvKey("ownname", ownerId)));
+  return name ? { ownerId, name } : { ownerId };
 }
 
 function readInviteName(raw) {
@@ -748,7 +769,11 @@ async function listRequests(request, env, cors) {
   }
   const incomingSorted = dedupeByOwnerId(incoming).sort(compareByOwnerId);
   const outgoingSorted = dedupeByOwnerId(outgoing).sort(compareByOwnerId);
-  return friendJson(200, { incoming: incomingSorted, outgoing: outgoingSorted }, cors);
+  const incomingNamed = [];
+  for (const row of incomingSorted) incomingNamed.push(await withOwnerName(boards, row.ownerId));
+  const outgoingNamed = [];
+  for (const row of outgoingSorted) outgoingNamed.push(await withOwnerName(boards, row.ownerId));
+  return friendJson(200, { incoming: incomingNamed, outgoing: outgoingNamed }, cors);
 }
 
 async function listFriends(request, env, cors) {
@@ -757,6 +782,8 @@ async function listFriends(request, env, cors) {
   const { boards, caller, friendKey } = ready;
   const limited = await consumeReadLimit(request, env, friendKey, "keylist:", "iplist:", cors);
   if (limited) return limited;
+  // Backfill: an invite name saved before fr:ownname: existed is copied once from the code row.
+  await backfillOwnName(boards, caller);
   // accept stores at most FRIEND_CAP ids. Inspect that many, in stored order.
   const ids = (await loadFriendIds(boards, caller.ownerId)).slice(0, FRIEND_CAP);
   const friends = [];
@@ -770,7 +797,9 @@ async function listFriends(request, env, cors) {
     // The friend row is "1". No created time is stored, so there is no since.
     friends.push({ ownerId: otherId });
   }
-  return friendJson(200, { friends: dedupeByOwnerId(friends).sort(compareByOwnerId) }, cors);
+  const named = [];
+  for (const row of dedupeByOwnerId(friends).sort(compareByOwnerId)) named.push(await withOwnerName(boards, row.ownerId));
+  return friendJson(200, { friends: named }, cors);
 }
 
 async function fetchRounds(request, env, cors) {
@@ -1402,6 +1431,7 @@ function friendKvKey(kind, id) {
     kind !== "block" &&
     kind !== "invname" &&
     kind !== "invphoto" &&
+    kind !== "ownname" &&
     kind !== "live"
   ) {
     throw new Error("friend_namespace");

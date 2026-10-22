@@ -151,7 +151,7 @@ Auth is `X-Friend-Key`, the same as the other friends routes. A missing or bad k
 }
 ```
 
-`incoming` is pending requests other people sent the caller. `outgoing` is pending requests the caller sent: `fr:req:<recipient>:<caller>` rows and the caller's own `fr:out:<caller>:<recipient>` notes. Each entry is the other person's `ownerId` only. The stored row is the string `pending`. It has no display name and no created time, so this route does not add those fields. The raw value is not returned. A friend code, a friend key, a raw KV key, and anyone who is not the other party of that request are not returned.
+`incoming` is pending requests other people sent the caller. `outgoing` is pending requests the caller sent: `fr:req:<recipient>:<caller>` rows and the caller's own `fr:out:<caller>:<recipient>` notes. Each entry is the other person's `ownerId`, plus `name` when that person has set an invite name (read from `fr:ownname:<ownerId>`, validated like lookup, omitted when unset or invalid). The stored row is the string `pending`. It has no created time. The raw value is not returned. A friend code, a friend key, a raw KV key, and anyone who is not the other party of that request are not returned.
 
 A requester the caller has blocked is left out of `incoming`. A stored outgoing `fr:req:` row is still returned to the sender when the recipient has a block row. A quiet-block note is returned in that same `outgoing` array, in the same `{ "ownerId" }` shape, in the same `ownerId` sort. Hiding either one would tell the sender they were blocked. Incoming reads `fr:req:` only. A note is not an incoming row. `listFriends`, `fetchRounds`, accept, block, unblock, and remove do not read `fr:out:`.
 
@@ -261,16 +261,16 @@ No body. The `Content-Length` rules, auth errors, and `boards_not_configured` er
 `200`
 
 ```json
-{ "friends": [ { "ownerId": "k3mR9xQ2nB8wL4pT6vYs1A" } ] }
+{ "friends": [ { "ownerId": "k3mR9xQ2nB8wL4pT6vYs1A", "name": "Jordan Pike" } ] }
 ```
 
 Each entry is a current friend: an id in the caller's `fr:friends:` list, with both `fr:friend:` rows present (`fr:friend:<caller>:<friend>` and `fr:friend:<friend>:<caller>`). That is the accepted pair `accept` writes and the pair `remove` and `block` require. One row without the other is not a friend and is not listed. A block in either direction hides the friend, the same rule `fetchRounds` uses when it skips a friend's rounds. The response is at most 50 friends. Only the first 50 ids in the stored array are inspected, in that stored order, and ids past the cap are ignored.
 
-`since` is the friendship's created time when a row stores one. Today each `fr:friend:` value is the string `1`, and the `fr:friends:` array is only ids, so no created time is stored. The field is omitted. An entry is `{ "ownerId" }` only. No friend code, friend key, raw KV key, name, or other person's data is returned.
+`since` is the friendship's created time when a row stores one. Today each `fr:friend:` value is the string `1`, and the `fr:friends:` array is only ids, so no created time is stored. The field is omitted. An entry is `{ "ownerId" }` plus optional `name`, the friend's own invite name from `fr:ownname:<ownerId>` (1–24 characters, no control characters, omitted when unset or invalid). No friend code, friend key, raw KV key, or other person's data is returned. Older apps ignore `name`.
 
 Sort: `friends` is sorted by `ownerId` ascending, JavaScript string order. There is no cursor.
 
-KV reads, no KV writes, no list. Formula: `2 + N + P + 2M` gets. `N` is the number of ids inspected, `N = min(length of fr:friends:<caller>, 50)`. `P` is how many of those have a caller→friend row, so the reverse row is read. `M` is how many have both rows, so both block rows are read (`M ≤ P ≤ N`). The `2` is the auth row and the `fr:friends:` value. A clean list, every inspected id a mutual friend whether or not a block remains, is `2 + 4N` gets. No `put` and no `delete`.
+KV reads, no list. Formula: `3 + N + P + 2M + F` gets, plus 1 when the caller has no `fr:ownname:` row (then `fr:invname:<caller CODE>` is read, and when it holds a valid name it is copied to `fr:ownname:<caller>`: the only write, a one-time backfill for names saved before `fr:ownname:` existed). `F` is the number of friends returned (one `fr:ownname:` read each). `N` is the number of ids inspected, `N = min(length of fr:friends:<caller>, 50)`. `P` is how many of those have a caller→friend row, so the reverse row is read. `M` is how many have both rows, so both block rows are read (`M ≤ P ≤ N`). The `2` is the auth row and the `fr:friends:` value. A clean list, every inspected id a mutual unblocked friend, caller name already stored, is `3 + 5N` gets. No `delete`.
 
 The read limit is 60 calls per friend key per 60 minutes (`keylist:`) and 60 per IP hash per 60 minutes when `CF-Connecting-IP` is present (`iplist:`). It does not share the listRequests counters, the code-guess counters, `ipget:`, or `ippub:`. No IP header skips the IP limit. Over the limit is `429` `{ "error": "rate_limited" }` and `Retry-After`, and that request does not read the friend list. A bad body does not consume a call.
 
@@ -431,6 +431,7 @@ Friend rows use the `fr:` prefix only. The keys this API writes are:
 - `fr:block:<blocker>:<blocked>` — the caller's block. The value is `1`.
 - `fr:rounds:<ownerId>` — JSON array of that owner's shared rounds, one value, `expirationTtl` of 365 days. This replaces per-round `fr:round:<owner>:<id>` keys. A past round carries `to: [ownerIds]`, the friends it was given to.
 - `fr:invname:<CODE>` — the invite name for that code, a plain string of 1–24 characters. `resetCode` deletes it with the old code.
+- `fr:ownname:<ownerId>` — the same invite name keyed by owner, written and cleared by setInviteName, deleted by resetCode. listFriends and listRequests return it as optional `name`. Names set before this key existed appear once the owner saves their invite name again.
 
 None of these routes read or write `id:`, `name:`, `osm:`, `gq:`, `gapi:`, `gqueue:`, `gca:`, or `cr:`. `GET /v1/friends/requests` and `GET /v1/friends/list` do not `put` or `delete` any KV key. The only mutation on those calls is the Durable Object attempt counter. Board `GET`, `PUT`, and `DELETE` reserve the `fr:` prefix and return `400` with no KV read or write. That includes a percent-encoded path (`fr%3A` and `fr%3a`), so a board path cannot read, replace, or forge a friend row. Guess counts live in the Durable Object, not in KV.
 
