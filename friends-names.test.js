@@ -220,4 +220,15 @@ describe("names on friend and request lists", () => {
     const res = await invoke("/v1/friends/list", { method: "GET", friend: sender.key });
     expect(res.text).not.toContain("Jordan Pike");
   });
+
+  it("backfills a name saved before fr:ownname: existed on the owner's next list call", async () => {
+    const sender = await mint("nm-s7");
+    const accepter = await mint("nm-a7");
+    await befriend(sender, accepter);
+    kv.set(`fr:invname:${accepter.code}`, { value: "Jordan Pike" });
+    expect((await list(sender)).friends).toEqual([{ ownerId: accepter.ownerId }]);
+    await list(accepter);
+    expect(kv.get(`fr:ownname:${accepter.ownerId}`).value).toBe("Jordan Pike");
+    expect((await list(sender)).friends).toEqual([{ ownerId: accepter.ownerId, name: "Jordan Pike" }]);
+  });
 });

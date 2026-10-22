@@ -550,8 +550,9 @@ describe("friend read routes", () => {
     const friendCounts = countKv();
     const friends = await viaEntry("/v1/friends/list", { friend: caller.key });
     expect(ownerIds(friends.json.friends)).toEqual([first, second]);
-    // 10 base reads + one fr:ownname: read per listed friend.
-    expect(friendCounts).toEqual({ get: 12, put: 0, delete: 0, list: 0 });
+    // 10 base reads + one fr:ownname: read per listed friend + the caller's own
+    // fr:ownname: and fr:invname: backfill check (no invite name set here).
+    expect(friendCounts).toEqual({ get: 14, put: 0, delete: 0, list: 0 });
   });
 
   it("follows the request list cursor", async () => {

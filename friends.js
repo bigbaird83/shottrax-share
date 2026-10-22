@@ -385,6 +385,13 @@ function readInvitePhoto(raw) {
   return { type: INVITE_PHOTO_TYPE, data };
 }
 
+async function backfillOwnName(boards, caller) {
+  const ownKey = friendKvKey("ownname", caller.ownerId);
+  if (readInviteName(await friendGet(boards, ownKey))) return;
+  const name = readInviteName(await friendGet(boards, friendKvKey("invname", caller.code)));
+  if (name) await friendPut(boards, ownKey, name);
+}
+
 /** The other person's invite name for list rows, or the bare entry when unset or invalid. */
 async function withOwnerName(boards, ownerId) {
   const name = readInviteName(await friendGet(boards, friendKvKey("ownname", ownerId)));
@@ -735,6 +742,8 @@ async function listFriends(request, env, cors) {
   const { boards, caller, friendKey } = ready;
   const limited = await consumeReadLimit(request, env, friendKey, "keylist:", "iplist:", cors);
   if (limited) return limited;
+  // Backfill: an invite name saved before fr:ownname: existed is copied once from the code row.
+  await backfillOwnName(boards, caller);
   // accept stores at most FRIEND_CAP ids. Inspect that many, in stored order.
   const ids = (await loadFriendIds(boards, caller.ownerId)).slice(0, FRIEND_CAP);
   const friends = [];
