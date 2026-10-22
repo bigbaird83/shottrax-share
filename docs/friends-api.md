@@ -88,7 +88,11 @@ Returned only by code lookup as `photo` next to `name`. `resetCode` deletes it f
 { "courseName": "Pine Hollow GC", "hole": 7, "holes": [ { "hole": 1, "score": 5, "par": 4 } ] }
 ```
 
-Your round in progress, for friends. `hole` is the current hole (1 to 18). `holes` (0 to 18) use the publishRound hole allowlist: `score` and `par` always, and `fir`, `gir`, `putts` and `clubs` only when the phone's Round stats and Club averages switches are on. GPS, position or any other field is `400`. Stored at `fr:live:<ownerId>` with `updatedAt`, and replaced on every update. KV TTL is 30 minutes. The phone sends it only while "Share live rounds with friends" is on and that round is shared. Rate limited on the `iplive:` IP counter (240 per hour, shared with fetchLive). `200` `{ "ok": true }`.
+Your round in progress, for friends. `hole` is the current hole (1 to 18). `courseName` is the shared-round rule: a trimmed string of 1–200 characters with no ASCII controls (U+0000–U+001F and U+007F). `holes` (0 to 18) may include `hole`, `score`, and `par`, plus optional `fir`, `gir`, and `putts` when the phone's Round stats switches are on. The same hole rules as a published round apply to those fields (`hole` 1–18 and unique, `score` 1–20, `par` 3–6, `fir` and `gir` booleans, `putts` 0–10).
+
+`clubs` is not a live field. If any hole object has a `clubs` key, the request is `400` `{ "error": "clubs_not_allowed" }`. The value does not matter: a valid club list, `[]`, and `null` are the same refusal. Nothing is written. An existing `fr:live:<ownerId>` row is left as it was. This check runs before the other hole checks and does not spend the `iplive:` counter. Club lists stay on published rounds (`PUT /v1/friends/rounds`) only.
+
+GPS, position, or any other field is `400` `{ "error": "invalid_body" }`. An accepted body is stored at `fr:live:<ownerId>` with `updatedAt`, and replaced on every accepted update. KV TTL is 30 minutes. The phone sends it only while "Share live rounds with friends" is on and that round is shared. An accepted update, and `GET`, are rate limited on the `iplive:` IP counter (240 per hour, shared with fetchLive). `200` `{ "ok": true }`.
 
 `GET /v1/friends/live` returns `200` `{ "live": [ { "ownerId", "courseName", "hole", "toPar", "holes", "updatedAt" } ] }`: only accepted friends both ways, not blocked either way, whose row was updated in the last 30 minutes. `toPar` is worked out from `holes`. Your own row, non-friends' rows and anything older than 30 minutes are never returned.
 

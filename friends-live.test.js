@@ -329,4 +329,102 @@ describe("live rounds for friends", () => {
     expect((await putLive(golfer, { ...LIVE, courseName: "" })).status).toBe(400);
     expect((await putLive(golfer, { ...LIVE, holes: [] })).status).toBe(200);
   });
+
+  // Mutants for PUT /v1/friends/live clubs refusal. Each row is killed by the test named in the last column.
+  // | Mutant | Behavior | Killed by |
+  // | strip clubs | Delete `clubs` and store the hole, respond 200 | refuses a live PUT when one hole carries clubs |
+  // | first hole only | Reject `clubs` only on holes[0] | refuses clubs on a later hole, not only the first |
+  // | valid clubs only | 400 only when the array passes validClubs; null or [] fall through | refuses a clubs field when the value is null or empty |
+  // | 400 but still write | Respond clubs_not_allowed and still put fr:live | refuses a live PUT when one hole carries clubs |
+  it("refuses a live PUT when one hole carries clubs and stores nothing", async () => {
+    const golfer = await mint("live-clubs");
+    const pal = await mint("live-clubs-pal");
+    await befriend(pal, golfer);
+    const refused = await putLive(golfer, {
+      ...LIVE,
+      holes: [{ hole: 1, score: 5, par: 4, clubs: ["Driver", "7i"] }],
+    });
+    expect(refused.status).toBe(400);
+    expect(refused.json).toEqual({ error: "clubs_not_allowed" });
+    expect(kv.has(`fr:live:${golfer.ownerId}`)).toBe(false);
+    const seen = await getLive(pal);
+    expect(seen.status).toBe(200);
+    expect(seen.json).toEqual({ live: [] });
+    expect(seen.text).not.toContain("clubs");
+    expect(seen.text).not.toContain("Driver");
+
+    const courseName = "C".repeat(80);
+    const accepted = await putLive(golfer, {
+      courseName,
+      hole: 18,
+      holes: [
+        { hole: 1, score: 5, par: 4 },
+        { hole: 18, score: 3, par: 3, putts: 1, fir: true, gir: false },
+      ],
+    });
+    expect(accepted.status).toBe(200);
+    expect(accepted.json).toEqual({ ok: true });
+    const after = await getLive(pal);
+    expect(after.status).toBe(200);
+    expect(after.json.live).toHaveLength(1);
+    expect(after.json.live[0]).toMatchObject({ ownerId: golfer.ownerId, courseName, hole: 18, toPar: 1 });
+    expect(after.json.live[0].holes).toEqual([
+      { hole: 1, score: 5, par: 4 },
+      { hole: 18, score: 3, par: 3, putts: 1, fir: true, gir: false },
+    ]);
+    for (const hole of after.json.live[0].holes) expect(hole).not.toHaveProperty("clubs");
+    expect(after.text).not.toContain("clubs");
+    const stored = kv.get(`fr:live:${golfer.ownerId}`).value;
+    expect(stored).not.toContain("clubs");
+    const replaced = await putLive(golfer, {
+      courseName,
+      hole: 18,
+      holes: [
+        { hole: 1, score: 5, par: 4 },
+        { hole: 18, score: 3, par: 3, putts: 1, fir: true, gir: false, clubs: ["Driver"] },
+      ],
+    });
+    expect(replaced.status).toBe(400);
+    expect(replaced.json).toEqual({ error: "clubs_not_allowed" });
+    expect(kv.get(`fr:live:${golfer.ownerId}`).value).toBe(stored);
+    const still = await getLive(pal);
+    expect(still.json.live[0].holes).toEqual(after.json.live[0].holes);
+    expect(still.text).not.toContain("clubs");
+  });
+
+  it("refuses clubs on a later hole, not only the first", async () => {
+    const golfer = await mint("live-clubs-later");
+    const pal = await mint("live-clubs-later-pal");
+    await befriend(pal, golfer);
+    const refused = await putLive(golfer, {
+      ...LIVE,
+      holes: [
+        { hole: 1, score: 5, par: 4 },
+        { hole: 2, score: 3, par: 3, putts: 1, fir: true, gir: true, clubs: ["PW"] },
+      ],
+    });
+    expect(refused.status).toBe(400);
+    expect(refused.json).toEqual({ error: "clubs_not_allowed" });
+    expect(kv.has(`fr:live:${golfer.ownerId}`)).toBe(false);
+    const seen = await getLive(pal);
+    expect(seen.json).toEqual({ live: [] });
+    expect(seen.text).not.toContain("clubs");
+    expect(seen.text).not.toContain("PW");
+  });
+
+  it("refuses a clubs field when the value is null or empty", async () => {
+    const golfer = await mint("live-clubs-empty");
+    const pal = await mint("live-clubs-empty-pal");
+    await befriend(pal, golfer);
+    for (const clubs of [null, []]) {
+      const refused = await putLive(golfer, {
+        ...LIVE,
+        holes: [{ hole: 1, score: 4, par: 4, clubs }],
+      });
+      expect(refused.status).toBe(400);
+      expect(refused.json).toEqual({ error: "clubs_not_allowed" });
+      expect(kv.has(`fr:live:${golfer.ownerId}`)).toBe(false);
+    }
+    expect((await getLive(pal)).json).toEqual({ live: [] });
+  });
 });

@@ -744,11 +744,15 @@ async function fetchRounds(request, env, cors) {
 }
 
 /**
- * Your live round for friends. Body { courseName, hole, holes }. holes use the
- * publishRound hole allowlist (score and par always; fir, gir, putts, clubs only
- * when the phone's switches are on), so GPS or any other field is 400.
- * Stored at fr:live:<ownerId> and replaced on every update. The phone sends this
- * only while "Share live rounds with friends" is on and the round is shared.
+ * Your live round for friends. Body { courseName, hole, holes }.
+ * courseName stays validCourseName (trimmed, 1–200, no ASCII controls).
+ * hole is the current hole, an integer 1–18. holes is 0–18 objects of
+ * { hole, score, par, putts?, fir?, gir? }. A `clubs` field on any hole is
+ * refused with 400 { error: "clubs_not_allowed" } and nothing is written.
+ * sanitizeHole still accepts clubs for a published round; this route does not.
+ * GPS or any other field is 400 invalid_body. An accepted body is stored at
+ * fr:live:<ownerId> and replaced on every accepted update. The phone sends
+ * this only while "Share live rounds with friends" is on and the round is shared.
  */
 async function putLive(request, env, cors) {
   const friendKey = readFriendKey(request);
@@ -763,6 +767,9 @@ async function putLive(request, env, cors) {
   const holes = [];
   const seen = new Set();
   for (const hole of body.holes) {
+    // Presence, not shape. A valid list, [], and null are the same refusal.
+    // Checked on every hole before sanitizeHole, which would otherwise copy clubs.
+    if (holeCarriesClubs(hole)) return friendJson(400, { error: "clubs_not_allowed" }, cors);
     const clean = sanitizeHole(hole);
     if (!clean || seen.has(clean.hole)) return friendJson(400, { error: "invalid_body" }, cors);
     seen.add(clean.hole);
@@ -1075,6 +1082,11 @@ function sanitizeRound(round, callerOwnerId) {
     toPar: round.toPar,
     holes,
   };
+}
+
+/** Live PUT only. Published rounds still store clubs through sanitizeHole. */
+function holeCarriesClubs(hole) {
+  return hole != null && typeof hole === "object" && !Array.isArray(hole) && Object.hasOwn(hole, "clubs");
 }
 
 function sanitizeHole(hole) {
