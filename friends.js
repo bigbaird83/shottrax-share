@@ -55,6 +55,14 @@ const FRIEND_KEY_HASH_PREFIX = "shottrax-friend-key-v1:";
 const FRIEND_IP_HASH_PREFIX = "shottrax-friend-guess-ip-v1:";
 const FRIEND_BODY_LIMIT = 2048;
 const PUBLISH_BODY_LIMIT = 8192;
+/** Live rounds carry each shot (club, yards, result): up to 15 per hole. */
+export const LIVE_BODY_LIMIT = 24 * 1024;
+export const LIVE_SHOT_LIMIT = 15;
+export const LIVE_SHOT_MAX_YARDS = 700;
+export const LIVE_SHOT_RESULTS = ["fairway", "rough", "sand", "green", "holed", "missed"];
+const LIVE_PUTT_CLUB = "Putt";
+// 100 ids of 64 characters plus quotes and commas.
+const DELETE_ROUNDS_BODY_LIMIT = 8192;
 const PAST_BODY_LIMIT = 256 * 1024;
 const PHOTO_BODY_LIMIT = 96 * 1024;
 const ROUND_TTL_SECONDS = 365 * 24 * 60 * 60;
@@ -217,6 +225,7 @@ const FRIEND_ROUTES = {
   "/v1/friends/unblock": { POST: unblockPerson },
   "/v1/friends/remove": { POST: removeFriend },
   "/v1/friends/rounds": { PUT: publishRound, GET: fetchRounds },
+  "/v1/friends/rounds/delete": { POST: deleteRounds },
   "/v1/friends/past": { PUT: setPastRounds },
 };
 
@@ -690,6 +699,37 @@ async function publishRound(request, env, cors) {
   return friendJson(200, { ok: true, id: stored.id }, cors);
 }
 
+/**
+ * Delete some of the caller's own rounds by id. Body { ids: [roundId, ...] }, 1 to ROUND_CAP ids.
+ * Takes both normal shares and past-round picks. Ids the caller never shared
+ * (or already deleted) are fine, so a phone can retry after a lost answer.
+ * Only the caller's own fr:rounds: value is read or written.
+ */
+async function deleteRounds(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const parsed = await readJsonObject(request, DELETE_ROUNDS_BODY_LIMIT, false);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  const body = parsed.value;
+  if (unknownFields(body, ["ids"]) || !Array.isArray(body.ids)) return friendJson(400, { error: "invalid_body" }, cors);
+  if (body.ids.length < 1 || body.ids.length > ROUND_CAP) return friendJson(400, { error: "invalid_body" }, cors);
+  if (!body.ids.every((id) => typeof id === "string" && ROUND_ID_RE.test(id))) {
+    return friendJson(400, { error: "invalid_body" }, cors);
+  }
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const limited = await consumeIpAction(request, env, "ippub:", cors);
+  if (limited) return limited;
+  const drop = new Set(body.ids);
+  const existing = await loadOwnedRounds(boards, caller.ownerId);
+  const kept = existing.filter((round) => !drop.has(round.id));
+  const removed = existing.length - kept.length;
+  if (removed > 0) await saveOwnedRounds(boards, caller.ownerId, kept);
+  return friendJson(200, { ok: true, removed }, cors);
+}
+
 async function listRequests(request, env, cors) {
   const ready = await readyReadCall(request, env, cors);
   if (ready.error) return ready.error;
@@ -797,22 +837,28 @@ async function fetchRounds(request, env, cors) {
 async function putLive(request, env, cors) {
   const friendKey = readFriendKey(request);
   if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
-  const parsed = await readJsonObject(request, PUBLISH_BODY_LIMIT, false);
+  const parsed = await readJsonObject(request, LIVE_BODY_LIMIT, false);
   if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
   const body = parsed.value;
-  if (unknownFields(body, ["courseName", "hole", "holes"])) return friendJson(400, { error: "invalid_body" }, cors);
+  if (unknownFields(body, ["courseName", "hole", "holes", "shots"])) return friendJson(400, { error: "invalid_body" }, cors);
   if (!validCourseName(body.courseName)) return friendJson(400, { error: "invalid_body" }, cors);
   if (!Number.isInteger(body.hole) || body.hole < 1 || body.hole > 18) return friendJson(400, { error: "invalid_body" }, cors);
   if (!Array.isArray(body.holes) || body.holes.length > 18) return friendJson(400, { error: "invalid_body" }, cors);
   const holes = [];
   const seen = new Set();
   for (const hole of body.holes) {
-    const clean = sanitizeHole(hole);
+    const clean = sanitizeLiveHole(hole);
     if (!clean || seen.has(clean.hole)) return friendJson(400, { error: "invalid_body" }, cors);
     seen.add(clean.hole);
     holes.push(clean);
   }
   holes.sort((a, b) => a.hole - b.hole);
+  // Top-level shots are the current hole's, so only while that hole has no score.
+  let currentShots = null;
+  if (Object.hasOwn(body, "shots")) {
+    currentShots = sanitizeShots(body.shots, false);
+    if (!currentShots || seen.has(body.hole)) return friendJson(400, { error: "invalid_body" }, cors);
+  }
   const boards = boardsBinding(env);
   if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
   const caller = await loadCaller(boards, friendKey);
@@ -820,6 +866,7 @@ async function putLive(request, env, cors) {
   const limited = await consumeIpAction(request, env, "iplive:", cors);
   if (limited) return limited;
   const row = { courseName: body.courseName, hole: body.hole, holes, updatedAt: Date.now() };
+  if (currentShots) row.shots = currentShots;
   await friendPut(boards, friendKvKey("live", caller.ownerId), JSON.stringify(row), {
     expirationTtl: Math.ceil(FRIEND_LIVE_TTL_MS / 1000),
   });
@@ -874,15 +921,18 @@ function readLiveRow(raw, now) {
   if (!value || typeof value !== "object") return null;
   if (!Number.isFinite(value.updatedAt) || now - value.updatedAt > FRIEND_LIVE_TTL_MS || value.updatedAt > now + 60_000) return null;
   if (!validCourseName(value.courseName) || !Number.isInteger(value.hole)) return null;
-  const holes = Array.isArray(value.holes) ? value.holes.map(sanitizeHole).filter(Boolean) : [];
+  const holes = Array.isArray(value.holes) ? value.holes.map(sanitizeLiveHole).filter(Boolean) : [];
   const toPar = holes.reduce((sum, hole) => sum + hole.score - hole.par, 0);
-  return {
+  const out = {
     courseName: value.courseName,
     hole: value.hole,
     toPar,
     holes,
     updatedAt: new Date(value.updatedAt).toISOString(),
   };
+  const shots = Object.hasOwn(value, "shots") ? sanitizeShots(value.shots, false) : null;
+  if (shots) out.shots = shots;
+  return out;
 }
 
 async function readyReadCall(request, env, cors) {
@@ -1145,6 +1195,77 @@ function sanitizeHole(hole) {
     clean.clubs = hole.clubs.slice();
   }
   return clean;
+}
+
+/**
+ * Live rounds only (Brian OK 2026-10-22 9:26 AM CT): a hole may also carry shots.
+ * Published rounds and share links still use sanitizeHole, which refuses shots.
+ */
+function sanitizeLiveHole(hole) {
+  if (hole == null || typeof hole !== "object" || Array.isArray(hole)) return null;
+  const { shots, ...rest } = hole;
+  const clean = sanitizeHole(rest);
+  if (!clean) return null;
+  if (Object.hasOwn(hole, "shots")) {
+    const list = sanitizeShots(shots, true);
+    if (!list) return null;
+    clean.shots = list;
+  }
+  return clean;
+}
+
+/** 1 to 15 shots, numbered 1..15 with no repeats, in stroke order. Null on anything else. */
+function sanitizeShots(shots, scored) {
+  if (!Array.isArray(shots) || shots.length < 1 || shots.length > LIVE_SHOT_LIMIT) return null;
+  const out = [];
+  const seen = new Set();
+  for (const shot of shots) {
+    const clean = sanitizeShot(shot, scored);
+    if (!clean || seen.has(clean.n)) return null;
+    seen.add(clean.n);
+    out.push(clean);
+  }
+  return out.sort((a, b) => a.n - b.n);
+}
+
+/**
+ * Allowlist: n, club, yd, s, e, res. s and e are [lat, lng] at most 5 decimals.
+ * Putts carry no yards and no coordinates; Holed only on a scored hole.
+ */
+export function sanitizeShot(shot, scored = true) {
+  if (shot == null || typeof shot !== "object" || Array.isArray(shot)) return null;
+  if (unknownFields(shot, ["n", "club", "yd", "s", "e", "res"])) return null;
+  if (!Number.isInteger(shot.n) || shot.n < 1 || shot.n > LIVE_SHOT_LIMIT) return null;
+  const clean = { n: shot.n };
+  if (Object.hasOwn(shot, "club")) {
+    if (typeof shot.club !== "string" || !CLUB_RE.test(shot.club)) return null;
+    clean.club = shot.club;
+  }
+  const putt = clean.club === LIVE_PUTT_CLUB;
+  if (Object.hasOwn(shot, "yd")) {
+    if (putt || !Number.isInteger(shot.yd) || shot.yd < 0 || shot.yd > LIVE_SHOT_MAX_YARDS) return null;
+    clean.yd = shot.yd;
+  }
+  for (const key of ["s", "e"]) {
+    if (!Object.hasOwn(shot, key)) continue;
+    if (putt || !validLivePoint(shot[key])) return null;
+    clean[key] = [shot[key][0], shot[key][1]];
+  }
+  if (Object.hasOwn(shot, "res")) {
+    if (typeof shot.res !== "string" || !LIVE_SHOT_RESULTS.includes(shot.res)) return null;
+    if (shot.res === "holed" && !scored) return null;
+    clean.res = shot.res;
+  }
+  return clean;
+}
+
+/** [lat, lng], finite, in range, no more than 5 decimal places (about 1 m). */
+function validLivePoint(point) {
+  if (!Array.isArray(point) || point.length !== 2) return false;
+  const [lat, lng] = point;
+  if (typeof lat !== "number" || typeof lng !== "number" || !Number.isFinite(lat) || !Number.isFinite(lng)) return false;
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return false;
+  return Math.round(lat * 1e5) / 1e5 === lat && Math.round(lng * 1e5) / 1e5 === lng;
 }
 
 function validClubs(clubs) {
