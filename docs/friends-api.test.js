@@ -25,6 +25,9 @@ const FRIEND_CODE_CALLS = [
   ["GET", "/v1/friends/list"],
   ["POST", "/v1/friends/code/name"],
   ["POST", "/v1/friends/code/photo"],
+  ["PUT", "/v1/friends/live"],
+  ["GET", "/v1/friends/live"],
+  ["POST", "/v1/friends/live/stop"],
   ["PUT", "/v1/friends/past"],
 ];
 

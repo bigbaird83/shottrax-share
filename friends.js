@@ -36,6 +36,10 @@ export const FRIEND_READ_IP_LIMIT = 60;
 export const FRIEND_GUESS_WINDOW_MS = 60 * 60 * 1000;
 export const FRIEND_CAP = 50;
 export const ROUND_CAP = 100;
+// Live rounds for friends (approved 2026-10-21 11:10 CT). A row is gone 30 minutes after its last update.
+export const FRIEND_LIVE_TTL_MS = 30 * 60 * 1000;
+// One update per hole plus a Friends-screen poll about once a minute.
+export const FRIEND_LIVE_IP_LIMIT = 240;
 // Invite name: the sharer's own name for this invite, stored with the code.
 // It is never in the URL. lookup returns it; reset deletes it with the old code.
 export const INVITE_NAME_MAX = 24;
@@ -86,6 +90,7 @@ function limitForDurableObjectName(name) {
   // "keyreq:" and "keylist:" must not inherit the 8-guess default.
   if (name.startsWith("ipget:")) return FRIEND_GETCODE_IP_LIMIT;
   if (name.startsWith("ippub:")) return FRIEND_PUBLISH_IP_LIMIT;
+  if (name.startsWith("iplive:")) return FRIEND_LIVE_IP_LIMIT;
   if (name.startsWith("ipreq:")) return FRIEND_READ_IP_LIMIT;
   if (name.startsWith("iplist:")) return FRIEND_READ_IP_LIMIT;
   if (name.startsWith("ip:")) return FRIEND_IP_GUESS_LIMIT;
@@ -203,10 +208,13 @@ const FRIEND_ROUTES = {
   "/v1/friends/code/reset": { POST: resetCode },
   "/v1/friends/code/name": { POST: setInviteName },
   "/v1/friends/code/photo": { POST: setInvitePhoto },
+  "/v1/friends/live": { PUT: putLive, GET: fetchLive },
+  "/v1/friends/live/stop": { POST: stopLive },
   "/v1/friends/codes/lookup": { POST: lookupCode },
   "/v1/friends/requests": { POST: sendRequest, GET: listRequests },
   "/v1/friends/list": { GET: listFriends },
   "/v1/friends/requests/accept": { POST: acceptRequest },
+  "/v1/friends/requests/cancel": { POST: cancelRequest },
   "/v1/friends/block": { POST: blockPerson },
   "/v1/friends/unblock": { POST: unblockPerson },
   "/v1/friends/remove": { POST: removeFriend },
@@ -565,6 +573,20 @@ async function acceptRequest(request, env, cors) {
   return friendJson(200, { status: "friends", ownerId }, cors);
 }
 
+/**
+ * Withdraw a request the caller sent. Deletes only the caller's own pending row
+ * (and any quiet-block note), so the recipient no longer sees it. Idempotent:
+ * nothing pending is still 200. Never touches friendships, blocks or rounds.
+ */
+async function cancelRequest(request, env, cors) {
+  const ready = await readyOwnerCall(request, env, cors);
+  if (ready.error) return ready.error;
+  const { boards, caller, ownerId } = ready;
+  await deleteIfPresent(boards, requestKey(ownerId, caller.ownerId));
+  await deleteOutgoingNote(boards, caller.ownerId, ownerId);
+  return friendJson(200, { ok: true }, cors);
+}
+
 async function blockPerson(request, env, cors) {
   const ready = await readyOwnerCall(request, env, cors);
   if (ready.error) return ready.error;
@@ -768,6 +790,104 @@ async function fetchRounds(request, env, cors) {
   }
   rounds.sort(compareRounds);
   return friendJson(200, { rounds: rounds.map(publicRound) }, cors);
+}
+
+/**
+ * Your live round for friends. Body { courseName, hole, holes }. holes use the
+ * publishRound hole allowlist (score and par always; fir, gir, putts, clubs only
+ * when the phone's switches are on), so GPS or any other field is 400.
+ * Stored at fr:live:<ownerId> and replaced on every update. The phone sends this
+ * only while "Share live rounds with friends" is on and the round is shared.
+ */
+async function putLive(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const parsed = await readJsonObject(request, PUBLISH_BODY_LIMIT, false);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  const body = parsed.value;
+  if (unknownFields(body, ["courseName", "hole", "holes"])) return friendJson(400, { error: "invalid_body" }, cors);
+  if (!validCourseName(body.courseName)) return friendJson(400, { error: "invalid_body" }, cors);
+  if (!Number.isInteger(body.hole) || body.hole < 1 || body.hole > 18) return friendJson(400, { error: "invalid_body" }, cors);
+  if (!Array.isArray(body.holes) || body.holes.length > 18) return friendJson(400, { error: "invalid_body" }, cors);
+  const holes = [];
+  const seen = new Set();
+  for (const hole of body.holes) {
+    const clean = sanitizeHole(hole);
+    if (!clean || seen.has(clean.hole)) return friendJson(400, { error: "invalid_body" }, cors);
+    seen.add(clean.hole);
+    holes.push(clean);
+  }
+  holes.sort((a, b) => a.hole - b.hole);
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const limited = await consumeIpAction(request, env, "iplive:", cors);
+  if (limited) return limited;
+  const row = { courseName: body.courseName, hole: body.hole, holes, updatedAt: Date.now() };
+  await friendPut(boards, friendKvKey("live", caller.ownerId), JSON.stringify(row), {
+    expirationTtl: Math.ceil(FRIEND_LIVE_TTL_MS / 1000),
+  });
+  return friendJson(200, { ok: true }, cors);
+}
+
+/** Round finished, switch turned off, or "Friends can follow" tapped: the row is deleted. */
+async function stopLive(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const parsed = await readJsonObject(request, FRIEND_BODY_LIMIT, true);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (!parsed.empty && unknownFields(parsed.value, [])) return friendJson(400, { error: "invalid_body" }, cors);
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  await deleteIfPresent(boards, friendKvKey("live", caller.ownerId));
+  return friendJson(200, { ok: true }, cors);
+}
+
+/**
+ * Friends playing now: accepted friends both ways, not blocked either way,
+ * with a live row updated in the last 30 minutes. Never your own row, never a
+ * non-friend's, and no field beyond the stored allowlist.
+ */
+async function fetchLive(request, env, cors) {
+  const ready = await readyReadCall(request, env, cors);
+  if (ready.error) return ready.error;
+  const { boards, caller } = ready;
+  const limited = await consumeIpAction(request, env, "iplive:", cors);
+  if (limited) return limited;
+  const now = Date.now();
+  const live = [];
+  for (const otherId of await loadFriendIds(boards, caller.ownerId)) {
+    if (!(await areFriends(boards, otherId, caller.ownerId))) continue;
+    if ((await hasBlock(boards, caller.ownerId, otherId)) || (await hasBlock(boards, otherId, caller.ownerId))) continue;
+    const row = readLiveRow(await friendGet(boards, friendKvKey("live", otherId)), now);
+    if (row) live.push({ ownerId: otherId, ...row });
+  }
+  return friendJson(200, { live }, cors);
+}
+
+function readLiveRow(raw, now) {
+  if (typeof raw !== "string") return null;
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== "object") return null;
+  if (!Number.isFinite(value.updatedAt) || now - value.updatedAt > FRIEND_LIVE_TTL_MS || value.updatedAt > now + 60_000) return null;
+  if (!validCourseName(value.courseName) || !Number.isInteger(value.hole)) return null;
+  const holes = Array.isArray(value.holes) ? value.holes.map(sanitizeHole).filter(Boolean) : [];
+  const toPar = holes.reduce((sum, hole) => sum + hole.score - hole.par, 0);
+  return {
+    courseName: value.courseName,
+    hole: value.hole,
+    toPar,
+    holes,
+    updatedAt: new Date(value.updatedAt).toISOString(),
+  };
 }
 
 async function readyReadCall(request, env, cors) {
@@ -1194,7 +1314,8 @@ function friendKvKey(kind, id) {
     kind !== "rounds" &&
     kind !== "block" &&
     kind !== "invname" &&
-    kind !== "invphoto"
+    kind !== "invphoto" &&
+    kind !== "live"
   ) {
     throw new Error("friend_namespace");
   }

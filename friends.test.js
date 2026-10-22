@@ -978,6 +978,46 @@ describe("friend codes", () => {
     return storedRounds(ownerId).some((round) => round && round.id === id);
   }
 
+  it("cancel withdraws only the caller's own sent request", async () => {
+    const sender = await mint("cx-sender");
+    const target = await mint("cx-target");
+    const other = await mint("cx-other");
+    await invoke("/v1/friends/requests", { friend: sender.key, body: { code: target.code } });
+    await invoke("/v1/friends/requests", { friend: other.key, body: { code: target.code } });
+    await invoke("/v1/friends/requests", { friend: target.key, body: { code: sender.code } });
+    expect(kv.has(`fr:req:${target.ownerId}:${sender.ownerId}`)).toBe(true);
+    const cancelled = await invoke("/v1/friends/requests/cancel", { friend: sender.key, body: { ownerId: target.ownerId } });
+    expect(cancelled.status).toBe(200);
+    expect(cancelled.json).toEqual({ ok: true });
+    expect(kv.has(`fr:req:${target.ownerId}:${sender.ownerId}`)).toBe(false);
+    // The other sender's request and the reverse request are untouched.
+    expect(kv.has(`fr:req:${target.ownerId}:${other.ownerId}`)).toBe(true);
+    expect(kv.has(`fr:req:${sender.ownerId}:${target.ownerId}`)).toBe(true);
+    const late = await invoke("/v1/friends/requests/accept", { friend: target.key, body: { ownerId: sender.ownerId } });
+    expect(late.status).toBe(409);
+    expect(late.json).toEqual({ error: "not_friends" });
+    const again = await invoke("/v1/friends/requests/cancel", { friend: sender.key, body: { ownerId: target.ownerId } });
+    expect(again.status).toBe(200);
+  });
+
+  it("cancel keeps friendships and validates its body", async () => {
+    const left = await mint("cx-left");
+    const right = await mint("cx-right");
+    await befriend(left, right);
+    const before = kvSnapshot();
+    const cancelled = await invoke("/v1/friends/requests/cancel", { friend: left.key, body: { ownerId: right.ownerId } });
+    expect(cancelled.status).toBe(200);
+    expect(kvSnapshot()).toEqual(before);
+    const empty = await invoke("/v1/friends/requests/cancel", { friend: left.key, body: {} });
+    expect(empty.status).toBe(400);
+    const extra = await invoke("/v1/friends/requests/cancel", { friend: left.key, body: { ownerId: right.ownerId, x: 1 } });
+    expect(extra.status).toBe(400);
+    const self = await invoke("/v1/friends/requests/cancel", { friend: left.key, body: { ownerId: left.ownerId } });
+    expect(self.status).toBe(400);
+    const nokey = await invoke("/v1/friends/requests/cancel", { body: { ownerId: right.ownerId } });
+    expect(nokey.status).toBe(401);
+  });
+
   function deleteRounds(friend, body) {
     return invoke("/v1/friends/rounds/delete", { method: "POST", friend, body });
   }
