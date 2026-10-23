@@ -544,15 +544,22 @@ async function sendRequest(request, env, cors) {
     await storeOutgoingNote(boards, caller.ownerId, ownerId);
     return friendJson(200, { status: "pending", ownerId }, cors);
   }
+  // No duplicates: an existing friend or a pending request in either direction
+  // is reported with `already` and nothing new is written.
   if (await areFriends(boards, caller.ownerId, ownerId)) {
     await deleteOutgoingNote(boards, caller.ownerId, ownerId);
-    return friendJson(200, { status: "friends", ownerId }, cors);
+    return friendJson(200, { status: "friends", ownerId, already: "friends" }, cors);
   }
   const reqKey = requestKey(ownerId, caller.ownerId);
   const pending = await friendGet(boards, reqKey);
   if (typeof pending === "string" && pending.length > 0) {
     await deleteOutgoingNote(boards, caller.ownerId, ownerId);
-    return friendJson(200, { status: "pending", ownerId }, cors);
+    return friendJson(200, { status: "pending", ownerId, already: "outgoing" }, cors);
+  }
+  const reverse = await friendGet(boards, requestKey(caller.ownerId, ownerId));
+  if (typeof reverse === "string" && reverse.length > 0) {
+    // They already asked you: no second request. Accept theirs instead.
+    return friendJson(200, { status: "pending", ownerId, already: "incoming" }, cors);
   }
   await friendPut(boards, reqKey, "pending");
   await deleteOutgoingNote(boards, caller.ownerId, ownerId);
@@ -633,7 +640,10 @@ async function blockPerson(request, env, cors) {
   await saveFriendIds(boards, ownerId, removeFriendId(await loadFriendIds(boards, ownerId), caller.ownerId));
   await deleteIfPresent(boards, requestKey(ownerId, caller.ownerId));
   await deleteIfPresent(boards, requestKey(caller.ownerId, ownerId));
-  await deleteOwnedRounds(boards, caller.ownerId);
+  // Only this friend loses access. Normal shared rounds reach friends through the
+  // friend list, so ending the friendship already ends access; the caller's rounds
+  // stay for everyone else. Past picks given to this one person are taken back both ways.
+  await deletePastRoundsFor(boards, caller.ownerId, ownerId);
   await deletePastRoundsFor(boards, ownerId, caller.ownerId);
   return friendJson(200, { ok: true }, cors);
 }
@@ -660,7 +670,10 @@ async function removeFriend(request, env, cors) {
   await friendDelete(boards, friendKvKey("friend", `${ownerId}:${caller.ownerId}`));
   await saveFriendIds(boards, caller.ownerId, removeFriendId(await loadFriendIds(boards, caller.ownerId), ownerId));
   await saveFriendIds(boards, ownerId, removeFriendId(await loadFriendIds(boards, ownerId), caller.ownerId));
-  await deleteOwnedRounds(boards, caller.ownerId);
+  // Only this friend loses access. Normal shared rounds reach friends through the
+  // friend list, so ending the friendship already ends access; the caller's rounds
+  // stay for everyone else. Past picks given to this one person are taken back both ways.
+  await deletePastRoundsFor(boards, caller.ownerId, ownerId);
   await deletePastRoundsFor(boards, ownerId, caller.ownerId);
   return friendJson(200, { ok: true }, cors);
 }

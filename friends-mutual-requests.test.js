@@ -168,17 +168,57 @@ describe("build 169: mutual requests and shared rounds", () => {
   const send = (from, to) => invoke("/v1/friends/requests", { friend: from.key, body: { code: to.code } });
   const accept = (who, other) => invoke("/v1/friends/requests/accept", { friend: who.key, body: { ownerId: other.ownerId } });
 
-  it("accept clears both directions when each person sent a request", async () => {
+  it("no duplicate: a send to someone who already asked you writes nothing and says so", async () => {
     const owner = await mint("mu-owner");
     const pal = await mint("mu-pal");
     await send(owner, pal);
-    await send(pal, owner);
-    expect((await accept(owner, pal)).json).toEqual({ status: "friends", ownerId: pal.ownerId });
+    const back = await send(pal, owner);
+    expect(back.json).toEqual({ status: "pending", ownerId: owner.ownerId, already: "incoming" });
     expect(kv.has(`fr:req:${owner.ownerId}:${pal.ownerId}`)).toBe(false);
-    expect(kv.has(`fr:req:${pal.ownerId}:${owner.ownerId}`)).toBe(false);
-    expect((await requests(pal)).incoming).toEqual([]);
-    expect((await requests(owner)).incoming).toEqual([]);
+    expect((await accept(pal, owner)).json).toEqual({ status: "friends", ownerId: owner.ownerId });
+    expect([...kv.keys()].filter((k) => k.startsWith("fr:req:"))).toEqual([]);
   });
+
+  it("no duplicate: sending again while pending or after you are friends says already", async () => {
+    const owner = await mint("mu-own4");
+    const pal = await mint("mu-pal4");
+    await send(owner, pal);
+    expect((await send(owner, pal)).json).toEqual({ status: "pending", ownerId: pal.ownerId, already: "outgoing" });
+    await accept(pal, owner);
+    expect((await send(owner, pal)).json).toEqual({ status: "friends", ownerId: pal.ownerId, already: "friends" });
+    expect((await send(pal, owner)).json).toEqual({ status: "friends", ownerId: owner.ownerId, already: "friends" });
+    expect(JSON.parse(kv.get(`fr:friends:${owner.ownerId}`).value)).toEqual([pal.ownerId]);
+    expect(JSON.parse(kv.get(`fr:friends:${pal.ownerId}`).value)).toEqual([owner.ownerId]);
+  });
+
+  it("accept clears a leftover reverse request from before this fix", async () => {
+    const owner = await mint("mu-own5");
+    const pal = await mint("mu-pal5");
+    await send(owner, pal);
+    kv.set(`fr:req:${owner.ownerId}:${pal.ownerId}`, { value: "pending" });
+    await accept(pal, owner);
+    expect([...kv.keys()].filter((k) => k.startsWith("fr:req:"))).toEqual([]);
+  });
+
+  for (const action of ["remove", "block"]) {
+    it(`${action} one friend stops sharing only with them; other friends keep every round`, async () => {
+      const owner = await mint(`mu-o-${action}`);
+      const old = await mint(`mu-k-${action}`);
+      const dup = await mint(`mu-d-${action}`);
+      await befriend(old, owner);
+      await befriend(dup, owner);
+      for (const id of ["mock_r1", "mock_r2", "mock_r3"]) {
+        await invoke("/v1/friends/rounds", { method: "PUT", friend: owner.key, body: { share: true, round: round(id) } });
+      }
+      await invoke("/v1/friends/past", { method: "PUT", friend: owner.key, body: { ownerId: dup.ownerId, choice: "10", rounds: [round("mock_past")] } });
+      expect((await invoke(`/v1/friends/${action}`, { friend: owner.key, body: { ownerId: dup.ownerId } })).json).toEqual({ ok: true });
+      const ids = async (who) => (await invoke("/v1/friends/rounds", { method: "GET", friend: who.key })).json.rounds.map((r) => r.id);
+      expect(await ids(owner)).toEqual(["mock_r1", "mock_r2", "mock_r3"]);
+      expect(await ids(old)).toEqual(["mock_r1", "mock_r2", "mock_r3"]);
+      expect(await ids(dup)).toEqual([]);
+      expect(kv.get(`fr:rounds:${owner.ownerId}`).value).not.toContain(dup.ownerId);
+    });
+  }
 
   it("adding a new friend and setting past rounds keeps every shared round", async () => {
     const owner = await mint("mu-own3");

@@ -157,7 +157,7 @@ describe("friend read routes", () => {
 
   async function befriend(from, to) {
     const sent = await viaEntry("/v1/friends/requests", { method: "POST", friend: from.key, body: { code: to.code } });
-    expect(sent.json).toEqual({ status: "pending", ownerId: to.ownerId });
+    expect(sent.json).toMatchObject({ status: "pending", ownerId: to.ownerId });
     const accepted = await viaEntry("/v1/friends/requests/accept", { method: "POST", friend: to.key, body: { ownerId: from.ownerId } });
     expect(accepted.json).toEqual({ status: "friends", ownerId: from.ownerId });
   }
@@ -474,7 +474,7 @@ describe("friend read routes", () => {
     const caller = await mint("nowrite");
     const other = await mint("nowrite-other");
     await viaEntry("/v1/friends/requests", { method: "POST", friend: caller.key, body: { code: other.code } });
-    await befriend(other, caller);
+    await viaEntry("/v1/friends/requests/accept", { method: "POST", friend: other.key, body: { ownerId: caller.ownerId } });
     const counts = countKv();
     const requests = await viaEntry("/v1/friends/requests", { friend: caller.key });
     const friends = await viaEntry("/v1/friends/list", { friend: caller.key });

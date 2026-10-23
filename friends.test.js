@@ -644,7 +644,8 @@ describe("friend codes", () => {
     expect(blocked.json).toEqual({ ok: true });
     expect(rows("fr:friend:")).toEqual([]);
     expect(rows("fr:req:")).toEqual([]);
-    expect(kv.has(`fr:rounds:${left.ownerId}`)).toBe(false);
+    // Build 169 (Brian, Oct 23): block ends only this friendship; the caller's rounds stay for everyone else.
+    expect(kv.get(`fr:rounds:${left.ownerId}`).value).toBe("[{\"id\":\"round_left\"}]");
     expect(kv.get(`fr:rounds:${right.ownerId}`).value).toBe("[{\"id\":\"round_right\"}]");
     expect(kv.get(`fr:rounds:${bystander}`).value).toBe("[{\"id\":\"round_other\"}]");
     expect(kv.get("id:14322").value).toBe("{\"holes\":1}");
@@ -656,7 +657,8 @@ describe("friend codes", () => {
     expect(rows("fr:friend:")).toEqual([]);
     expect(rows("fr:req:")).toEqual([]);
     expect(rows("fr:block:")).toEqual([]);
-    expect(kv.has(`fr:rounds:${left.ownerId}`)).toBe(false);
+    // Build 169 (Brian, Oct 23): block ends only this friendship; the caller's rounds stay for everyone else.
+    expect(kv.get(`fr:rounds:${left.ownerId}`).value).toBe("[{\"id\":\"round_left\"}]");
     expect(kv.get(`fr:rounds:${right.ownerId}`).value).toBe("[{\"id\":\"round_right\"}]");
     expect(kv.get(`fr:rounds:${bystander}`).value).toBe("[{\"id\":\"round_other\"}]");
     const still = await invoke("/v1/friends/requests/accept", { friend: right.key, body: { ownerId: left.ownerId } });
@@ -722,7 +724,7 @@ describe("friend codes", () => {
     expect(rows("fr:req:")).toEqual([]);
 
     const repeat = await invoke("/v1/friends/requests", { friend: other.key, body: { code: caller.code } });
-    expect(repeat.json).toEqual({ status: "friends", ownerId: caller.ownerId });
+    expect(repeat.json).toEqual({ status: "friends", ownerId: caller.ownerId, already: "friends" });
     expect(rows("fr:req:")).toEqual([]);
   });
 
@@ -870,7 +872,7 @@ describe("friend codes", () => {
     const first = await invoke("/v1/friends/requests", { friend: from.key, body: { code: to.code } });
     const second = await invoke("/v1/friends/requests", { friend: from.key, body: { code: to.code } });
     expect(second.status).toBe(200);
-    expect(second.json).toEqual(first.json);
+    expect(second.json).toEqual({ ...first.json, already: "outgoing" });
     expect(rows("fr:req:")).toEqual([`fr:req:${to.ownerId}:${from.ownerId}`]);
     const named = await invoke("/v1/friends/requests", { friend: from.key, body: { code: to.code, name: DISPLAY_NAME } });
     expect(named.status).toBe(400);
@@ -992,7 +994,8 @@ describe("friend codes", () => {
     expect(kv.has(`fr:req:${target.ownerId}:${sender.ownerId}`)).toBe(false);
     // The other sender's request and the reverse request are untouched.
     expect(kv.has(`fr:req:${target.ownerId}:${other.ownerId}`)).toBe(true);
-    expect(kv.has(`fr:req:${sender.ownerId}:${target.ownerId}`)).toBe(true);
+    // The reverse send was merged into the sender's pending request, so it never stored a row.
+    expect(kv.has(`fr:req:${sender.ownerId}:${target.ownerId}`)).toBe(false);
     const late = await invoke("/v1/friends/requests/accept", { friend: target.key, body: { ownerId: sender.ownerId } });
     expect(late.status).toBe(409);
     expect(late.json).toEqual({ error: "not_friends" });
@@ -1120,7 +1123,7 @@ describe("friend codes", () => {
     expect(hasRound(other.ownerId, "round_keep")).toBe(true);
   });
 
-  it("remove deletes only the caller's rounds and keeps them for other friends", async () => {
+  it("remove ends only that friendship; everyone keeps their rounds for their other friends", async () => {
     const left = await mint("rm-left");
     const right = await mint("rm-right");
     const third = await mint("rm-third");
@@ -1142,7 +1145,7 @@ describe("friend codes", () => {
     expect(kv.has(`fr:friend:${right.ownerId}:${left.ownerId}`)).toBe(false);
     expect(kv.has(`fr:friend:${left.ownerId}:${third.ownerId}`)).toBe(true);
     expect(kv.has(`fr:friend:${third.ownerId}:${left.ownerId}`)).toBe(true);
-    expect(hasRound(left.ownerId, "round_left")).toBe(false);
+    expect(hasRound(left.ownerId, "round_left")).toBe(true);
     expect(hasRound(right.ownerId, "round_right")).toBe(true);
     expect(hasRound(third.ownerId, "round_third")).toBe(true);
     expect(hasRound(bystander.ownerId, "round_by")).toBe(true);
@@ -1152,10 +1155,10 @@ describe("friend codes", () => {
     const leftFetch = await fetchRounds(left.key);
     const rightFetch = await fetchRounds(right.key);
     const thirdFetch = await fetchRounds(third.key);
-    expect(leftFetch.json.rounds.map((round) => round.id)).toEqual(["round_third"]);
+    expect(leftFetch.json.rounds.map((round) => round.id)).toEqual(["round_left", "round_third"]);
     expect(rightFetch.json.rounds.map((round) => round.id)).toEqual(["round_right", "round_third"]);
-    expect(thirdFetch.json.rounds.map((round) => round.id)).toEqual(["round_right", "round_third"]);
-    expect(thirdFetch.text).not.toContain("round_left");
+    expect(rightFetch.text).not.toContain("round_left");
+    expect(thirdFetch.json.rounds.map((round) => round.id)).toEqual(["round_left", "round_right", "round_third"]);
     expect(rows("fr:round:")).toEqual([]);
   });
 
@@ -1427,14 +1430,14 @@ describe("friend codes", () => {
     expect((await putRound(other.key, baseRound({ id: "round_old_other", playedOn: "2026-10-02" }))).status).toBe(200);
     const blocked = await invoke("/v1/friends/block", { friend: opener.key, body: { ownerId: other.ownerId } });
     expect(blocked.json).toEqual({ ok: true });
-    expect(hasRound(opener.ownerId, "round_old_opener")).toBe(false);
+    expect(hasRound(opener.ownerId, "round_old_opener")).toBe(true);
     expect(hasRound(other.ownerId, "round_old_other")).toBe(true);
     expect((await putRound(other.key, baseRound({ id: "round_new_other", playedOn: "2026-10-04" }))).status).toBe(200);
     expect((await putRound(opener.key, baseRound({ id: "round_new_opener", playedOn: "2026-10-03" }))).status).toBe(200);
     const openerFetch = await fetchRounds(opener.key);
     const otherFetch = await fetchRounds(other.key);
     const thirdFetch = await fetchRounds(third.key);
-    expect(openerFetch.json.rounds.map((round) => round.id)).toEqual(["round_new_opener"]);
+    expect(openerFetch.json.rounds.map((round) => round.id)).toEqual(["round_old_opener", "round_new_opener"]);
     expect(otherFetch.json.rounds.map((round) => round.id)).toEqual(["round_old_other", "round_new_other"]);
     expect(thirdFetch.json.rounds.map((round) => round.id)).toEqual(["round_old_other", "round_new_other"]);
     expect(thirdFetch.text).not.toContain("round_old_opener");
@@ -1746,7 +1749,7 @@ describe("friend codes", () => {
     }), env, { waitUntil() {} });
     expect(removed.status).toBe(200);
     expect(await removed.json()).toEqual({ ok: true });
-    expect(hasRound(caller.ownerId, "round_entry")).toBe(false);
+    expect(hasRound(caller.ownerId, "round_entry")).toBe(true);
   });
 
   it("lookup requires a minted code before it spends a guess", async () => {
