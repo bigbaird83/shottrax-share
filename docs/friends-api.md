@@ -85,14 +85,27 @@ Returned only by code lookup as `photo` next to `name`. `resetCode` deletes it f
 `PUT /v1/friends/live`
 
 ```json
-{ "courseName": "Pine Hollow GC", "hole": 7, "holes": [ { "hole": 1, "score": 5, "par": 4 } ] }
+{ "courseName": "Pine Hollow GC", "hole": 7, "roundStats": true, "clubAverages": false, "holes": [ { "hole": 1, "score": 5, "par": 4, "shots": [ { "n": 1, "club": "Dr", "yd": 248, "s": [10.12345, 20.12345], "e": [10.12545, 20.12445] } ] } ] }
 ```
 
-Your round in progress, for friends. `hole` is the current hole (1 to 18). `holes` (0 to 18) use the publishRound hole allowlist: `score` and `par` always, and `fir`, `gir`, `putts` and `clubs` only when the phone's Round stats and Club averages switches are on. GPS, position or any other field is `400`. Stored at `fr:live:<ownerId>` with `updatedAt`, and replaced on every update. KV TTL is 30 minutes. The phone sends it only while "Share live rounds with friends" is on and that round is shared. Rate limited on the `iplive:` IP counter (240 per hour, shared with fetchLive). `200` `{ "ok": true }`.
+Your round in progress, for friends. `hole` is the current hole (1 to 18). `holes` (0 to 18) use the publishRound hole allowlist for `score` and `par`. The phone draft has no field for the Round stats or Club averages switches. This call adds these booleans. Any other value is `invalid_body`.
 
-`GET /v1/friends/live` returns `200` `{ "live": [ { "ownerId", "courseName", "hole", "toPar", "holes", "updatedAt" } ] }`: only accepted friends both ways, not blocked either way, whose row was updated in the last 30 minutes. `toPar` is worked out from `holes`. Your own row, non-friends' rows and anything older than 30 minutes are never returned.
+| Field | Rule |
+|---|---|
+| `roundStats` | Boolean. The Round stats setting. When `true`, `fir`, `gir`, and `putts` on each hole are stored and served to followers. When `false`, those three are omitted from the stored row and from `GET /v1/friends/live`, even if the hole objects included them. When the field is omitted, a stat that is present is served. That keeps phones that already drop the stat when the switch is off. |
+| `clubAverages` | Boolean. The Club averages setting. When `false`, the hole `clubs` array is omitted from the stored row and from the follower response. Per-shot `club`, `yd`, and `s` / `e` lat/lon are still accepted and served. When the field is omitted or `true`, a `clubs` array that is present is served. |
+| `roundKind` | `"round"`, `"practice"`, or `"test"`. Leading and trailing space is ignored and the match is case-insensitive. `"practice"` and `"test"` are `400` `{ "error": "practice_or_test" }`. Nothing is written, and an existing live row is left as it was. |
+| `finished` | Boolean. `true` deletes `fr:live:<ownerId>`, including every shot location, and returns `200` `{ "ok": true }`. The rest of the body is not stored. This is checked before the practice/test refusal, so a finished practice round still deletes. `false` is a normal update. |
 
-`POST /v1/friends/live/stop` (empty body) deletes your row: at round finish, when the switch is turned off, or when "Friends can follow" is tapped. `200` `{ "ok": true }`.
+Shots (live rounds only) sit on a hole as `shots`, 1 to 15, and top-level `shots` is the current hole. Top-level `shots` is refused when that hole already has a score. Shot allowlist: `n`, `club`, `yd`, `s`, `e`, `res`. `s` and `e` are `[lat, lon]`. On write, each coordinate that is already within `1e-9` of the 5-decimal grid is stored snapped to 5 decimal places, and followers are served that snapped value. A coordinate farther from the grid than that, including 6 decimal places such as `10.123456`, is `invalid_body` and nothing is stored. Putts (`club` `"Putt"`) carry no yards and no coordinates. `res` is `fairway`, `rough`, `sand`, `green`, `holed`, or `missed`. `holed` is only on a scored hole. Per-shot `club`, `yd`, and lat/lon are served to followers whether or not `clubAverages` is on. Published rounds and past rounds still refuse `shots`.
+
+Round-level or hole-level GPS (`lat`, `lng`, `lon`, `position`, and any other key not in the allowlist) is `400` `{ "error": "invalid_body" }`. Shot coordinates are only the `s` and `e` pairs above.
+
+Stored at `fr:live:<ownerId>` with `updatedAt`, and replaced on every update. KV `expirationTtl` is 30 minutes (1800 seconds), from the last update. The phone sends it only while "Share live rounds with friends" is on and that round is shared. Rate limited on the `iplive:` IP counter (240 per hour, shared with fetchLive). A practice/test refusal and a finish delete do not take a slot on that counter. `200` `{ "ok": true }`.
+
+`GET /v1/friends/live` returns `200` `{ "live": [ { "ownerId", "courseName", "hole", "toPar", "holes", "updatedAt" } ] }`, plus top-level `shots` when the current hole has them: only accepted friends both ways, not blocked either way, whose row was updated in the last 30 minutes. `toPar` is worked out from `holes`. Your own row, non-friends' rows and anything older than 30 minutes are never returned. A follower read that finds a row older than 30 minutes deletes that key, so the shot locations are gone, and a later read still returns nothing. `fir`, `gir`, and `putts` are left out of each hole when the stored `roundStats` is `false`. The hole `clubs` array is left out when the stored `clubAverages` is `false`. Per-shot club, yards, and the rounded lat/lon stay. The setting flags themselves are not returned.
+
+`POST /v1/friends/live/stop` (empty body) deletes your row, including every shot location: at round finish, when the switch is turned off, or when "Friends can follow" is tapped. `PUT` with `{ "finished": true }` does the same delete. `200` `{ "ok": true }`.
 
 ### setPastRounds
 
@@ -432,6 +445,7 @@ Friend rows use the `fr:` prefix only. The keys this API writes are:
 - `fr:rounds:<ownerId>` — JSON array of that owner's shared rounds, one value, `expirationTtl` of 365 days. This replaces per-round `fr:round:<owner>:<id>` keys. A past round carries `to: [ownerIds]`, the friends it was given to.
 - `fr:invname:<CODE>` — the invite name for that code, a plain string of 1–24 characters. `resetCode` deletes it with the old code.
 - `fr:ownname:<ownerId>` — the same invite name keyed by owner, written and cleared by setInviteName, deleted by resetCode. listFriends and listRequests return it as optional `name`. Names set before this key existed appear once the owner saves their invite name again.
+- `fr:live:<ownerId>` — that owner's live round, one JSON value, `expirationTtl` of 30 minutes from the last `PUT`. Shot lat/lon live only inside this value. Deleted by `POST /v1/friends/live/stop`, by `PUT` with `finished: true`, and by a follower read that finds the row older than 30 minutes.
 
 None of these routes read or write `id:`, `name:`, `osm:`, `gq:`, `gapi:`, `gqueue:`, `gca:`, or `cr:`. `GET /v1/friends/requests` and `GET /v1/friends/list` do not `put` or `delete` any KV key. The only mutation on those calls is the Durable Object attempt counter. Board `GET`, `PUT`, and `DELETE` reserve the `fr:` prefix and return `400` with no KV read or write. That includes a percent-encoded path (`fr%3A` and `fr%3a`), so a board path cannot read, replace, or forge a friend row. Guess counts live in the Durable Object, not in KV.
 
@@ -455,6 +469,6 @@ ShotTraxx PR #533 `src/domain/friendsApi.ts` returns `FriendsApiResult` on every
 | `publishRound({ round, share })` | `PUT /v1/friends/rounds`. `share: true` and a round publishes it. `share: false` and `round: null` unshares and deletes the caller's shared rounds. |
 | `fetchRounds()` | `GET /v1/friends/rounds` → `{ rounds }` |
 
-`off` is the phone switch. No request is sent. `todo` is a call the phone has not finished, or a server that is not ready: `unknown_route`, `boards_not_configured`, `guess_limiter_not_configured`. `refused` is every other error: `friend_key_required`, `invalid_body`, `payload_too_large`, `method_not_allowed`, `code_not_found`, `not_friends`, `friend_limit`, `round_limit`, `rate_limited`, and `blocked`.
+`off` is the phone switch. No request is sent. `todo` is a call the phone has not finished, or a server that is not ready: `unknown_route`, `boards_not_configured`, `guess_limiter_not_configured`. `refused` is every other error: `friend_key_required`, `invalid_body`, `payload_too_large`, `method_not_allowed`, `code_not_found`, `not_friends`, `friend_limit`, `round_limit`, `rate_limited`, `blocked`, and `practice_or_test`.
 
 `blocked` is returned only to the person who blocked, and the phone maps it to `refused`, the same reason it uses for `code_not_found` and `not_friends`. The blocked person never receives `blocked`. Their `sendRequest` is the normal `200` pending body, and their `accept` is `not_friends`. That is a success or a `refused`, not a block.
