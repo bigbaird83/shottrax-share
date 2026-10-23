@@ -445,4 +445,176 @@ describe("live rounds for friends", () => {
     const withShots = { ...base, holes: [{ hole: 1, score: 5, par: 4, shots: SHOTS }] };
     expect((await setPast(golfer, pal, "10", [withShots])).status).toBe(400);
   });
+
+  // Made-up course, clubs, yards, and coordinates. These lock the follower rules
+  // on top of the live-shot allowlist: club averages does not hide a shot,
+  // round stats gate fir/gir/putts, practice/test is refused, finish and a
+  // 30-minute-stale read delete the row (and every shot location with it).
+  const RULE_SHOT = {
+    n: 1,
+    club: "Dr",
+    yd: 248,
+    s: [10.12345, 20.12345],
+    e: [10.12545, 20.12445],
+    res: "fairway",
+  };
+
+  it("live rules: serves per-shot club, yards, and lat/lon when club averages are off", async () => {
+    const golfer = await mint("rule-club");
+    const pal = await mint("rule-club-pal");
+    await befriend(pal, golfer);
+    const body = {
+      courseName: "Mock Pines GC",
+      hole: 2,
+      clubAverages: false,
+      holes: [{ hole: 1, score: 5, par: 4, clubs: ["Dr", "7i"], shots: [RULE_SHOT] }],
+    };
+    expect((await putLive(golfer, body)).status).toBe(200);
+    const seen = (await getLive(pal)).json.live[0];
+    expect(seen.holes[0].shots).toEqual([RULE_SHOT]);
+    expect(seen.holes[0].shots[0]).toMatchObject({ club: "Dr", yd: 248, s: [10.12345, 20.12345], e: [10.12545, 20.12445] });
+    expect(seen.holes[0].clubs).toBeUndefined();
+    expect(JSON.stringify(seen.holes[0].shots)).toMatch(/"club":"Dr"/);
+  });
+
+  it("live rules: rounds shot lat/lon to 5 decimals on write and serves the rounded value", async () => {
+    const golfer = await mint("rule-rnd");
+    const pal = await mint("rule-rnd-pal");
+    await befriend(pal, golfer);
+    const noisy = {
+      n: 1,
+      club: "7i",
+      yd: 162,
+      s: [10.123450000001, -20.123450000001],
+      e: [10.12345, 20.123450000001],
+      res: "rough",
+    };
+    const rounded = {
+      n: 1,
+      club: "7i",
+      yd: 162,
+      s: [10.12345, -20.12345],
+      e: [10.12345, 20.12345],
+      res: "rough",
+    };
+    expect((await putLive(golfer, {
+      courseName: "Mock Pines GC",
+      hole: 2,
+      holes: [{ hole: 1, score: 5, par: 4, shots: [noisy] }],
+    })).status).toBe(200);
+    const storedShot = JSON.parse(kv.get(`fr:live:${golfer.ownerId}`).value).holes[0].shots[0];
+    expect(storedShot).toEqual(rounded);
+    expect(storedShot.s).not.toEqual(noisy.s);
+    expect(storedShot.e).not.toEqual(noisy.e);
+    const seen = (await getLive(pal)).json.live[0].holes[0].shots[0];
+    expect(seen).toEqual(rounded);
+  });
+
+  it("live rules: omits putts, fir, and gir when round stats are off", async () => {
+    const golfer = await mint("rule-stat");
+    const pal = await mint("rule-stat-pal");
+    await befriend(pal, golfer);
+    const body = {
+      courseName: "Mock Pines GC",
+      hole: 3,
+      roundStats: false,
+      holes: [
+        { hole: 1, score: 5, par: 4, fir: true, gir: false, putts: 2, shots: [RULE_SHOT] },
+        { hole: 2, score: 3, par: 3, putts: 1, fir: true, gir: true },
+      ],
+    };
+    expect((await putLive(golfer, body)).status).toBe(200);
+    const seen = (await getLive(pal)).json.live[0];
+    expect(seen.holes).toEqual([
+      { hole: 1, score: 5, par: 4, shots: [RULE_SHOT] },
+      { hole: 2, score: 3, par: 3 },
+    ]);
+    expect(seen.holes[0].shots[0]).toMatchObject({ club: "Dr", yd: 248 });
+    expect(JSON.stringify(seen)).not.toMatch(/"fir"|"gir"|"putts"/);
+  });
+
+  it("live rules: serves putts, fir, and gir when round stats are on", async () => {
+    const golfer = await mint("rule-stat-on");
+    const pal = await mint("rule-stat-on-pal");
+    await befriend(pal, golfer);
+    const holes = [
+      { hole: 1, score: 5, par: 4, fir: true, gir: false, putts: 2 },
+      { hole: 2, score: 3, par: 3, putts: 1, fir: false, gir: true },
+    ];
+    expect((await putLive(golfer, { courseName: "Mock Pines GC", hole: 3, roundStats: true, holes })).status).toBe(200);
+    expect((await getLive(pal)).json.live[0].holes).toEqual(holes);
+  });
+
+  it("live rules: rejects practice and test rounds and stores nothing", async () => {
+    const golfer = await mint("rule-prac");
+    const pal = await mint("rule-prac-pal");
+    await befriend(pal, golfer);
+    const practiceShot = { n: 1, club: "Dr", yd: 10, s: [12.34567, 98.76543], e: [12.34568, 98.76544] };
+    for (const roundKind of ["practice", "Practice", "test", "Test"]) {
+      const refused = await putLive(golfer, {
+        courseName: "Mock Pines GC",
+        hole: 2,
+        roundKind,
+        holes: [{ hole: 1, score: 5, par: 4, shots: [practiceShot] }],
+      });
+      expect(refused.status, roundKind).toBe(400);
+      expect(refused.json, roundKind).toEqual({ error: "practice_or_test" });
+      expect(kv.has(`fr:live:${golfer.ownerId}`), roundKind).toBe(false);
+    }
+    expect((await putLive(golfer, { ...LIVE, roundKind: "round" })).status).toBe(200);
+    const before = kv.get(`fr:live:${golfer.ownerId}`).value;
+    const again = await putLive(golfer, {
+      courseName: "Mock Pines GC",
+      hole: 4,
+      roundKind: "practice",
+      holes: [{ hole: 1, score: 4, par: 4, fir: true, putts: 2, shots: [practiceShot] }],
+    });
+    expect(again.status).toBe(400);
+    expect(again.json).toEqual({ error: "practice_or_test" });
+    expect(kv.get(`fr:live:${golfer.ownerId}`).value).toBe(before);
+    expect(before).not.toMatch(/12\.34567/);
+    expect((await getLive(pal)).json.live[0].courseName).toBe("Pine Hollow GC");
+    expect(JSON.stringify([...kv.values()])).not.toMatch(/12\.34567/);
+  });
+
+  it("live rules: deletes the live row and shot locations when the round finishes", async () => {
+    const golfer = await mint("rule-fin");
+    const pal = await mint("rule-fin-pal");
+    await befriend(pal, golfer);
+    const shot = { n: 1, club: "3w", yd: 220, s: [13.13131, -98.11111], e: [13.13132, -98.11112], res: "fairway" };
+    expect((await putLive(golfer, {
+      courseName: "Mock Pines GC",
+      hole: 2,
+      holes: [{ hole: 1, score: 5, par: 4, shots: [shot] }],
+    })).status).toBe(200);
+    expect(kv.has(`fr:live:${golfer.ownerId}`)).toBe(true);
+    const done = await putLive(golfer, { finished: true });
+    expect(done.status).toBe(200);
+    expect(done.json).toEqual({ ok: true });
+    expect(kv.has(`fr:live:${golfer.ownerId}`)).toBe(false);
+    expect((await getLive(pal)).json).toEqual({ live: [] });
+    expect(JSON.stringify([...kv.values()])).not.toMatch(/13\.13131|13\.13132/);
+  });
+
+  it("live rules: deletes shot locations 30 minutes after the last update", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-23T12:00:00.000Z"));
+    const golfer = await mint("rule-ttl");
+    const pal = await mint("rule-ttl-pal");
+    await befriend(pal, golfer);
+    const shot = { n: 1, club: "PW", yd: 90, s: [14.14141, -97.22222], e: [14.14142, -97.22223], res: "green" };
+    expect((await putLive(golfer, {
+      courseName: "Mock Pines GC",
+      hole: 2,
+      holes: [{ hole: 1, score: 4, par: 4, shots: [shot] }],
+    })).status).toBe(200);
+    expect(kv.get(`fr:live:${golfer.ownerId}`).expirationTtl).toBe(30 * 60);
+    vi.setSystemTime(new Date("2026-10-23T12:30:00.000Z"));
+    expect((await getLive(pal)).json.live).toHaveLength(1);
+    expect(kv.has(`fr:live:${golfer.ownerId}`)).toBe(true);
+    vi.setSystemTime(new Date("2026-10-23T12:30:01.000Z"));
+    expect((await getLive(pal)).json).toEqual({ live: [] });
+    expect(kv.has(`fr:live:${golfer.ownerId}`)).toBe(false);
+    expect(JSON.stringify([...kv.values()])).not.toMatch(/14\.14141|14\.14142/);
+  });
 });
