@@ -63,9 +63,6 @@ export const LIVE_SHOT_RESULTS = ["fairway", "rough", "sand", "green", "holed", 
 /** Shot lat/lon are stored and served at 5 decimal places (about 1 m). */
 export const LIVE_COORD_DECIMALS = 5;
 const LIVE_COORD_SCALE = 10 ** LIVE_COORD_DECIMALS;
-// Binary noise around a 5-decimal grid point is snapped onto it. A real extra
-// digit (the existing "6 decimal places" refusal) is farther than this.
-const LIVE_COORD_NOISE = 1e-9;
 const LIVE_ROUND_FIELDS = ["courseName", "hole", "holes", "shots", "roundStats", "clubAverages", "roundKind", "finished"];
 const LIVE_PUTT_CLUB = "Putt";
 // 100 ids of 64 characters plus quotes and commas.
@@ -1295,9 +1292,10 @@ export function sanitizeShot(shot, scored = true) {
 }
 
 /**
- * [lat, lon], finite and in range. Values already within LIVE_COORD_NOISE of
- * the 5-decimal grid are stored snapped. Anything farther (a true extra
- * decimal) is refused, same as a 6-decimal coordinate.
+ * [lat, lon]. Brian decided Oct 23, 2026, 10:02 AM CT: 6 or more decimal
+ * places are accepted and rounded to 5 on write (half toward +∞). Followers
+ * are served the rounded value. Non-numeric values, and values outside
+ * -90..90 / -180..180 after rounding, are refused.
  */
 function cleanLivePoint(point) {
   if (!Array.isArray(point) || point.length !== 2) return null;
@@ -1311,7 +1309,7 @@ function cleanLivePoint(point) {
 function snapLiveCoord(value) {
   if (typeof value !== "number" || !Number.isFinite(value)) return null;
   const snapped = Math.round(value * LIVE_COORD_SCALE) / LIVE_COORD_SCALE;
-  if (Math.abs(snapped - value) > LIVE_COORD_NOISE) return null;
+  if (!Number.isFinite(snapped)) return null;
   return snapped;
 }
 
