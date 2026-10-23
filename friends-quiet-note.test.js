@@ -1,8 +1,7 @@
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import entry from "./entry.js";
-import worker, { FriendGuessLimiter } from "./worker.js";
+import entry, { FriendGuessLimiter } from "./entry.js";
 import { FRIEND_CAP, FRIEND_CODE_GUESS_LIMIT, FRIEND_IP_GUESS_LIMIT, ROUND_CAP } from "./friends.js";
 
 const ORIGIN = "https://shottrax-share.bcbaird.workers.dev";
@@ -151,10 +150,6 @@ describe("quiet-block sender note", () => {
     return call(entry.fetch.bind(entry), pathname, options);
   }
 
-  function viaWorker(pathname, options) {
-    return call(worker.fetch.bind(worker), pathname, options);
-  }
-
   async function mint(suffix) {
     const key = friendKey(suffix);
     const created = await viaEntry("/v1/friends/code", { method: "POST", friend: key, body: {} });
@@ -256,8 +251,6 @@ describe("quiet-block sender note", () => {
     expect(ids).toEqual([...ids].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0)));
     expect(ids).toEqual([recipient.ownerId, second.ownerId].sort());
     expect(Object.keys(quietList.json.outgoing[0])).toEqual(["ownerId"]);
-    const mirrored = await viaWorker("/v1/friends/requests", { friend: quietSender.key });
-    expect(mirrored.text).toBe(quietList.text);
 
     const again = await send(quietSender, recipient);
     expect(again.text).toBe(quietSend.text);
