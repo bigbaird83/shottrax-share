@@ -398,7 +398,6 @@ describe("live rounds for friends", () => {
     });
   rejectShot("an unknown shot field", { n: 1, club: "Dr", note: "x" });
   rejectShot("lat/lng fields on a shot", { n: 1, club: "Dr", lat: 10.1, lng: 20.1 });
-  rejectShot("6 decimal places", { n: 1, club: "Dr", s: [10.123456, 20.12345] });
   rejectShot("a latitude out of range", { n: 1, club: "Dr", s: [90.5, 20.1] });
   rejectShot("a longitude out of range", { n: 1, club: "Dr", e: [10.1, 180.5] });
   rejectShot("a point that is not a pair", { n: 1, club: "Dr", s: [10.1] });
@@ -508,6 +507,55 @@ describe("live rounds for friends", () => {
     expect(storedShot.e).not.toEqual(noisy.e);
     const seen = (await getLive(pal)).json.live[0].holes[0].shots[0];
     expect(seen).toEqual(rounded);
+  });
+
+  // Brian decided Oct 23, 2026, 10:02 AM CT: a live shot lat/lon with 6 or more
+  // decimal places is accepted and rounded to 5 on write. Followers get that
+  // rounded value. Half-way cases use Math.round (half toward +∞):
+  // 10.123455 -> 10.12346 and -10.123455 -> -10.12345.
+  // This replaces the #45 test that rejected 6 decimal places.
+  it("live rules: accepts 6 or more lat/lon decimals and serves them rounded to 5", async () => {
+    const golfer = await mint("rule-six");
+    const pal = await mint("rule-six-pal");
+    await befriend(pal, golfer);
+    const cases = [
+      { name: "6 decimals", s: [10.123456, 20.123456], e: [10.123454, -20.123454], wantS: [10.12346, 20.12346], wantE: [10.12345, -20.12345] },
+      { name: "7 decimals", s: [10.1234567, -20.9876543], e: [-10.1234567, 20.9876543], wantS: [10.12346, -20.98765], wantE: [-10.12346, 20.98765] },
+      { name: "many decimals", s: [10.1234567890123, -120.123456789], e: [-10.1234567890123, 120.123456789], wantS: [10.12346, -120.12346], wantE: [-10.12346, 120.12346] },
+      { name: "negative values", s: [-10.123456, -20.123456], e: [-33.333336, -44.444444], wantS: [-10.12346, -20.12346], wantE: [-33.33334, -44.44444] },
+      { name: "positive half toward +infinity", s: [10.123455, 20.123445], e: [0.000005, 179.999995], wantS: [10.12346, 20.12345], wantE: [0.00001, 180] },
+      { name: "negative half toward +infinity", s: [-10.123455, -20.123455], e: [-89.999995, -179.999995], wantS: [-10.12345, -20.12345], wantE: [-89.99999, -179.99999] },
+    ];
+    const shots = cases.map((row, index) => ({ n: index + 1, club: "Dr", yd: 200, s: row.s, e: row.e, res: "fairway" }));
+    expect((await putLive(golfer, {
+      courseName: "Mock Pines GC",
+      hole: 2,
+      holes: [{ hole: 1, score: 5, par: 4, shots }],
+    })).status).toBe(200);
+    const stored = JSON.parse(kv.get(`fr:live:${golfer.ownerId}`).value).holes[0].shots;
+    const seen = (await getLive(pal)).json.live[0].holes[0].shots;
+    cases.forEach((row, index) => {
+      expect(stored[index].s, `${row.name} stored s`).toEqual(row.wantS);
+      expect(stored[index].e, `${row.name} stored e`).toEqual(row.wantE);
+      expect(stored[index].s, `${row.name} stored raw s`).not.toEqual(row.s);
+      expect(stored[index].e, `${row.name} stored raw e`).not.toEqual(row.e);
+      expect(seen[index].s, `${row.name} served s`).toEqual(row.wantS);
+      expect(seen[index].e, `${row.name} served e`).toEqual(row.wantE);
+    });
+    const before = kv.get(`fr:live:${golfer.ownerId}`).value;
+    for (const shot of [
+      { n: 1, club: "Dr", s: [90.000005, 0] },
+      { n: 1, club: "Dr", e: [0, 180.000005] },
+      { n: 1, club: "Dr", s: ["10.123456", 20] },
+    ]) {
+      const refused = await putLive(golfer, {
+        courseName: "Mock Pines GC",
+        hole: 2,
+        holes: [{ hole: 1, score: 5, par: 4, shots: [shot] }],
+      });
+      expect(refused.status).toBe(400);
+      expect(kv.get(`fr:live:${golfer.ownerId}`).value).toBe(before);
+    }
   });
 
   it("live rules: omits putts, fir, and gir when round stats are off", async () => {
