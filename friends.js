@@ -622,6 +622,7 @@ async function cancelRequest(request, env, cors) {
   if (ready.error) return ready.error;
   const { boards, caller, ownerId } = ready;
   await deleteIfPresent(boards, requestKey(ownerId, caller.ownerId));
+  await deleteOutgoingNote(boards, caller.ownerId, ownerId);
   return friendJson(200, { ok: true }, cors);
 }
 

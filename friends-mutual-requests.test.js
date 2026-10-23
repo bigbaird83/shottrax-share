@@ -200,6 +200,42 @@ describe("build 169: mutual requests and shared rounds", () => {
     expect([...kv.keys()].filter((k) => k.startsWith("fr:req:"))).toEqual([]);
   });
 
+  const snapshot = () => JSON.stringify([...kv.entries()].sort(([a], [b]) => (a < b ? -1 : 1)));
+
+  for (const kind of ["friends", "outgoing", "incoming"]) {
+    it(`duplicate ${kind}: the send changes nothing in the store`, async () => {
+      const owner = await mint(`dup-o-${kind}`);
+      const pal = await mint(`dup-p-${kind}`);
+      let from = owner;
+      let to = pal;
+      if (kind === "friends") await befriend(owner, pal);
+      if (kind === "outgoing") await send(owner, pal);
+      if (kind === "incoming") {
+        await send(pal, owner);
+      }
+      const before = snapshot();
+      const res = await send(from, to);
+      expect(res.status).toBe(200);
+      expect(res.json.already).toBe(kind);
+      expect(snapshot()).toBe(before);
+    });
+  }
+
+  it("a quietly blocked sender who cancels ends with no note and an empty outgoing list", async () => {
+    const sender = await mint("qb-sender");
+    const target = await mint("qb-target");
+    await befriend(sender, target);
+    expect((await invoke("/v1/friends/block", { friend: target.key, body: { ownerId: sender.ownerId } })).status).toBe(200);
+    const quiet = await send(sender, target);
+    expect(quiet.json).toEqual({ status: "pending", ownerId: target.ownerId });
+    expect(kv.has(`fr:out:${sender.ownerId}:${target.ownerId}`)).toBe(true);
+    expect((await requests(sender)).outgoing).toEqual([{ ownerId: target.ownerId }]);
+    const cancelled = await invoke("/v1/friends/requests/cancel", { friend: sender.key, body: { ownerId: target.ownerId } });
+    expect(cancelled.json).toEqual({ ok: true });
+    expect(kv.has(`fr:out:${sender.ownerId}:${target.ownerId}`)).toBe(false);
+    expect((await requests(sender)).outgoing).toEqual([]);
+  });
+
   for (const action of ["remove", "block"]) {
     it(`${action} one friend stops sharing only with them; other friends keep every round`, async () => {
       const owner = await mint(`mu-o-${action}`);

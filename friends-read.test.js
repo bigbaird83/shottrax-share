@@ -157,7 +157,7 @@ describe("friend read routes", () => {
 
   async function befriend(from, to) {
     const sent = await viaEntry("/v1/friends/requests", { method: "POST", friend: from.key, body: { code: to.code } });
-    expect(sent.json).toMatchObject({ status: "pending", ownerId: to.ownerId });
+    expect(sent.json).toEqual({ status: "pending", ownerId: to.ownerId });
     const accepted = await viaEntry("/v1/friends/requests/accept", { method: "POST", friend: to.key, body: { ownerId: from.ownerId } });
     expect(accepted.json).toEqual({ status: "friends", ownerId: from.ownerId });
   }
@@ -385,7 +385,8 @@ describe("friend read routes", () => {
     await viaEntry("/v1/friends/requests", { method: "POST", friend: caller.key, body: { code: other.code } });
     kv.set(`fr:req:${other.ownerId}:${caller.ownerId}`, { value: `${caller.code} fr:k:secret ${caller.key}` });
     const requests = await viaEntry("/v1/friends/requests", { friend: caller.key });
-    await befriend(caller, other);
+    // The caller already sent; a second send is a duplicate, so the other side accepts the first one.
+    await viaEntry("/v1/friends/requests/accept", { method: "POST", friend: other.key, body: { ownerId: caller.ownerId } });
     const friends = await viaEntry("/v1/friends/list", { friend: caller.key });
     for (const result of [requests, friends]) {
       expect(result.text).not.toContain(caller.key);
