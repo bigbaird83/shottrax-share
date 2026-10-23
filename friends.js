@@ -596,6 +596,11 @@ async function acceptRequest(request, env, cors) {
   // Drop a leftover sender note before the request row. A retry can still
   // see fr:req: if this delete fails. The note is not read and not accepted.
   await deleteOutgoingNote(boards, ownerId, caller.ownerId);
+  // Both people may have sent a request (each opened the other's link). Drop the
+  // caller's own request to the other side too, so the new friend never sees a
+  // stale incoming row whose Decline (remove) would end the friendship and delete
+  // their shared rounds.
+  await deleteIfPresent(boards, requestKey(ownerId, caller.ownerId));
   await friendDelete(boards, reqKey);
   return friendJson(200, { status: "friends", ownerId }, cors);
 }
@@ -610,7 +615,6 @@ async function cancelRequest(request, env, cors) {
   if (ready.error) return ready.error;
   const { boards, caller, ownerId } = ready;
   await deleteIfPresent(boards, requestKey(ownerId, caller.ownerId));
-  await deleteOutgoingNote(boards, caller.ownerId, ownerId);
   return friendJson(200, { ok: true }, cors);
 }
 

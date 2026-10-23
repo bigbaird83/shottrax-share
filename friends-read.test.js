@@ -480,7 +480,8 @@ describe("friend read routes", () => {
     const friends = await viaEntry("/v1/friends/list", { friend: caller.key });
     expect(requests.status).toBe(200);
     expect(friends.status).toBe(200);
-    expect(requests.json.outgoing).toEqual([{ ownerId: other.ownerId }]);
+    // Accept removed the caller's own earlier request too (build 169: no stale row after mutual sends).
+    expect(requests.json.outgoing).toEqual([]);
     expect(friends.json.friends).toEqual([{ ownerId: other.ownerId }]);
     expect(counts.put).toBe(0);
     expect(counts.delete).toBe(0);
