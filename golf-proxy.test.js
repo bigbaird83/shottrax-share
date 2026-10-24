@@ -2417,6 +2417,50 @@ describe('terrain route', { concurrency: 1 }, () => {
     }
   });
 
+  test('a Durable Object request deletes sample rows older than 48h', async () => {
+    function assertRowExpired(ageMs) {
+      assert.equal(ageMs > 172800 * 1000, true);
+    }
+    assert.throws(() => assertRowExpired(0));
+    assert.throws(() => assertRowExpired(86400 * 1000));
+    assert.throws(() => assertRowExpired(172800 * 1000));
+    assert.throws(() => assertRowExpired(172800 * 1000 - 1));
+    assert.doesNotThrow(() => assertRowExpired(172800 * 1000 + 1));
+    assert.doesNotThrow(() => assertRowExpired(3 * 86400 * 1000));
+
+    const fake = installFakes();
+    try {
+      const now = Date.now();
+      const dayStart = (ms) => Date.UTC(new Date(ms).getUTCFullYear(), new Date(ms).getUTCMonth(), new Date(ms).getUTCDate());
+      const dayKey = (ms) => `terrain:samples:id_auto:${new Date(dayStart(ms)).toISOString().slice(0, 10)}`;
+      const rows = [];
+      for (let i = 0; i <= 6; i += 1) {
+        const at = now - i * 24 * 60 * 60 * 1000;
+        const key = dayKey(at);
+        if (rows.some((row) => row.key === key)) continue;
+        rows.push({ key, age: now - dayStart(at) });
+        fake.counter.sql.map.set(key, '1');
+      }
+      fake.counter.sql.map.set('golfapi:known:keep', 'stay');
+      const expired = rows.filter((row) => row.age > 172800 * 1000);
+      const kept = rows.filter((row) => row.age <= 172800 * 1000);
+      assert.ok(expired.length >= 1);
+      assert.ok(kept.length >= 1);
+
+      await counterOp(fake, { op: 'readUsage', dayKey: 'golfapi:credit:day:unused', monthKey: 'golfapi:credit:month:unused' });
+      for (const row of expired) assert.equal(fake.counter.sql.map.has(row.key), false, row.key);
+      for (const row of kept) assert.equal(fake.counter.sql.map.get(row.key), '1', row.key);
+      assert.equal(fake.counter.sql.map.get('golfapi:known:keep'), 'stay');
+
+      const fresh = `terrain:samples:id_new:${new Date(dayStart(now)).toISOString().slice(0, 10)}`;
+      fake.counter.sql.map.set(fresh, '3');
+      await counterOp(fake, { op: 'readUsage', dayKey: 'golfapi:credit:day:unused', monthKey: 'golfapi:credit:month:unused' });
+      assert.equal(fake.counter.sql.map.get(fresh), '3');
+    } finally {
+      fake.restore();
+    }
+  });
+
   test('cleanup drops stored sample counters whose day is more than 48h old', async () => {
     const fake = installFakes();
     try {
