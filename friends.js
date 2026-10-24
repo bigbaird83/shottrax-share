@@ -851,6 +851,10 @@ async function fetchRounds(request, env, cors) {
  * when the phone's switches are on), so GPS or any other field is 400.
  * Stored at fr:live:<ownerId> and replaced on every update. The phone sends this
  * only while "Share live rounds with friends" is on and the round is shared.
+ * Optional skippedHoles (Brian Baird OK 2026-10-23 11:55 PM CT): hole numbers
+ * 1-18 the golfer skipped, so friends see "Skipped" instead of unscored. Repeats
+ * are merged, at most 18, and a skipped hole may not also be scored. Older apps
+ * leave it out, and the row then carries no skippedHoles at all.
  */
 async function putLive(request, env, cors) {
   const friendKey = readFriendKey(request);
@@ -858,7 +862,7 @@ async function putLive(request, env, cors) {
   const parsed = await readJsonObject(request, LIVE_BODY_LIMIT, false);
   if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
   const body = parsed.value;
-  if (unknownFields(body, ["courseName", "hole", "holes", "shots"])) return friendJson(400, { error: "invalid_body" }, cors);
+  if (unknownFields(body, ["courseName", "hole", "holes", "shots", "skippedHoles"])) return friendJson(400, { error: "invalid_body" }, cors);
   if (!validCourseName(body.courseName)) return friendJson(400, { error: "invalid_body" }, cors);
   if (!Number.isInteger(body.hole) || body.hole < 1 || body.hole > 18) return friendJson(400, { error: "invalid_body" }, cors);
   if (!Array.isArray(body.holes) || body.holes.length > 18) return friendJson(400, { error: "invalid_body" }, cors);
@@ -871,11 +875,16 @@ async function putLive(request, env, cors) {
     holes.push(clean);
   }
   holes.sort((a, b) => a.hole - b.hole);
+  let skippedHoles = null;
+  if (Object.hasOwn(body, "skippedHoles")) {
+    skippedHoles = sanitizeSkippedHoles(body.skippedHoles);
+    if (!skippedHoles || skippedHoles.some((n) => seen.has(n))) return friendJson(400, { error: "invalid_body" }, cors);
+  }
   // Top-level shots are the current hole's, so only while that hole has no score.
   let currentShots = null;
   if (Object.hasOwn(body, "shots")) {
     currentShots = sanitizeShots(body.shots, false);
-    if (!currentShots || seen.has(body.hole)) return friendJson(400, { error: "invalid_body" }, cors);
+    if (!currentShots || seen.has(body.hole) || (skippedHoles && skippedHoles.includes(body.hole))) return friendJson(400, { error: "invalid_body" }, cors);
   }
   const boards = boardsBinding(env);
   if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
@@ -885,6 +894,7 @@ async function putLive(request, env, cors) {
   if (limited) return limited;
   const row = { courseName: body.courseName, hole: body.hole, holes, updatedAt: Date.now() };
   if (currentShots) row.shots = currentShots;
+  if (skippedHoles && skippedHoles.length > 0) row.skippedHoles = skippedHoles;
   await friendPut(boards, friendKvKey("live", caller.ownerId), JSON.stringify(row), {
     expirationTtl: Math.ceil(FRIEND_LIVE_TTL_MS / 1000),
   });
@@ -950,7 +960,26 @@ function readLiveRow(raw, now) {
   };
   const shots = Object.hasOwn(value, "shots") ? sanitizeShots(value.shots, false) : null;
   if (shots) out.shots = shots;
+  if (Object.hasOwn(value, "skippedHoles")) {
+    const scored = new Set(holes.map((hole) => hole.hole));
+    const skipped = sanitizeSkippedHoles(value.skippedHoles);
+    if (skipped) {
+      const unscored = skipped.filter((n) => !scored.has(n));
+      if (unscored.length > 0) out.skippedHoles = unscored;
+    }
+  }
   return out;
+}
+
+/** Skipped hole numbers: an array of at most 18 integers 1-18. Repeats merge, sorted. Null on anything else. */
+function sanitizeSkippedHoles(list) {
+  if (!Array.isArray(list) || list.length > 18) return null;
+  const out = new Set();
+  for (const n of list) {
+    if (!Number.isInteger(n) || n < 1 || n > 18) return null;
+    out.add(n);
+  }
+  return [...out].sort((a, b) => a - b);
 }
 
 async function readyReadCall(request, env, cors) {
