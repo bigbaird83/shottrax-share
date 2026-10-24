@@ -102,8 +102,10 @@
  * The terrain per-phone sample count is the KV key
  * `terrain:samples:{install}:{utc-day}`. Every write sets expirationTtl
  * 172800 (48 hours). The 54/day cap is unchanged. A count already stored in
- * SQLite with no expiry is still read for that same UTC day. Older days are
- * removed only by the one-time cleanup, not by deploy.
+ * SQLite with no expiry is still read for that same UTC day. Every Durable
+ * Object request deletes SQLite `terrain:samples:` rows whose UTC day started
+ * more than 48 hours ago, including rows already stored. The first request
+ * after deploy clears them.
  * The monthly counter uses the golfapi billing cycle (GOLFAPI_CYCLE_DAY,
  * default the 5th, through the 4th), the same cycle as the alert flags.
  * golfapi bills 0.1 for a name search and 1 for a course or coordinates pull.
@@ -1852,7 +1854,8 @@ export function formatTerrainSampleCleanup(summary) {
  * caps cannot overshoot and a threshold cannot send twice.
  * The terrain sample counter is the one KV write from this class:
  * `terrain:samples:{install}:{utc-day}` with expirationTtl 172800.
- * Every other key stays in SQLite.
+ * Every other key stays in SQLite. SQLite sample rows whose UTC day started
+ * more than 48 hours ago are deleted at the start of every request.
  */
 export class GolfapiCounter {
   constructor(ctx, env) {
@@ -2364,9 +2367,10 @@ export class GolfapiCounter {
   }
 
   /**
-   * One-time delete of SQLite sample counters whose day is more than 48h old.
-   * Not called from a route, cron, or deploy. Dry-run unless body.apply is true.
-   * Returns counts only.
+   * Deletes SQLite sample counters whose UTC day started more than 48h ago.
+   * fetch() runs this with apply:true on every other op, so stored rows are
+   * cleared the first time the object handles a request. The manual op still
+   * honors apply:false. Returns counts only.
    */
   async cleanupTerrainSamples(body) {
     const now = body && typeof body.now === 'number' ? body.now : Date.now();
@@ -2471,6 +2475,9 @@ export class GolfapiCounter {
 
   async fetch(request) {
     const body = await request.json();
+    if (body.op !== 'cleanupTerrainSamples') {
+      await this.cleanupTerrainSamples({ now: Date.now(), apply: true });
+    }
     let result;
     if (body.op === 'reserve') result = this.reserve(body);
     else if (body.op === 'settle') result = this.settle(body);

@@ -14,9 +14,9 @@
  * Pass --remote or --local. Neither is assumed, so --apply alone touches nothing.
  * On the live Worker the counter namespace is GOLFAPI_KV (TERRAIN_KV is unset).
  * Rows already stored in GolfapiCounter SQLite are not in that namespace.
- * The same 48-hour rule deletes those rows only when the counter op
- * cleanupTerrainSamples is invoked with apply:true. This script does not
- * call that op, and nothing in deploy calls it either.
+ * The Durable Object deletes those rows on its next request, when the UTC
+ * day on the key started more than 48 hours ago. This script does not do
+ * that, and nothing in deploy runs this script.
  */
 
 import { execFile } from 'node:child_process';
