@@ -90,7 +90,9 @@ Returned only by code lookup as `photo` next to `name`. `resetCode` deletes it f
 
 Your round in progress, for friends. `hole` is the current hole (1 to 18). `holes` (0 to 18) use the publishRound hole allowlist: `score` and `par` always, and `fir`, `gir`, `putts` and `clubs` only when the phone's Round stats and Club averages switches are on. GPS, position or any other field is `400`. Stored at `fr:live:<ownerId>` with `updatedAt`, and replaced on every update. KV TTL is 30 minutes. The phone sends it only while "Share live rounds with friends" is on and that round is shared. Rate limited on the `iplive:` IP counter (240 per hour, shared with fetchLive). `200` `{ "ok": true }`.
 
-`GET /v1/friends/live` returns `200` `{ "live": [ { "ownerId", "courseName", "hole", "toPar", "holes", "updatedAt" } ] }`: only accepted friends both ways, not blocked either way, whose row was updated in the last 30 minutes. `toPar` is worked out from `holes`. Your own row, non-friends' rows and anything older than 30 minutes are never returned.
+Optional `skippedHoles` (Brian Baird OK Oct 23, 2026, 11:55 PM CT): an array of up to 18 hole numbers (integers 1 to 18) the golfer skipped, so friends see "Skipped" instead of unscored. Repeats are merged and the list is stored sorted. A hole that is also in `holes`, or the current `hole` when top-level `shots` are sent, is `400`. An empty list or a missing field stores nothing, so older apps keep working unchanged.
+
+`GET /v1/friends/live` returns `200` `{ "live": [ { "ownerId", "courseName", "hole", "toPar", "holes", "updatedAt" } ] }` (plus `skippedHoles` when the golfer skipped an unscored hole, and `shots` for the current hole when sent): only accepted friends both ways, not blocked either way, whose row was updated in the last 30 minutes. `toPar` is worked out from `holes`. Your own row, non-friends' rows and anything older than 30 minutes are never returned.
 
 `POST /v1/friends/live/stop` (empty body) deletes your row: at round finish, when the switch is turned off, or when "Friends can follow" is tapped. `200` `{ "ok": true }`.
 
