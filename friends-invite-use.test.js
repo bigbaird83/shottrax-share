@@ -168,6 +168,15 @@ describe("single-use invites", () => {
     return invoke("/v1/friends/requests", { method: "GET", friend: person.key });
   }
 
+  function friendsOf(person) {
+    return invoke("/v1/friends/list", { method: "GET", friend: person.key });
+  }
+
+  function acceptLink(person, ownerOrCode) {
+    const code = typeof ownerOrCode === "string" ? ownerOrCode : ownerOrCode.code;
+    return invoke("/v1/friends/codes/accept", { friend: person.key, body: { code } });
+  }
+
   function reqKey(owner, requester) {
     return `fr:req:${owner.ownerId}:${requester.ownerId}`;
   }
@@ -542,5 +551,151 @@ describe("single-use invites", () => {
     });
     expect(kv.get(`fr:block:${owner2.ownerId}:${pal2.ownerId}`).value).toBe("1");
     expect(kv.has(`fr:friend:${owner2.ownerId}:${pal2.ownerId}`)).toBe(false);
+  });
+
+  it("adds both people when the invited person accepts the link", async () => {
+    env.FRIEND_NOW_MS = 1_780_000_000_000;
+    const owner = await mint("link-owner");
+    const pal = await mint("link-pal");
+    const stranger = await mint("link-stranger");
+    const accepted = await acceptLink(pal, owner);
+    expect(accepted.status).toBe(200);
+    expect(accepted.json).toEqual({ status: "friends", ownerId: owner.ownerId });
+    expect(accepted.text.toLowerCase()).not.toContain("push");
+    expect(accepted.text.toLowerCase()).not.toContain("block");
+    expect(kv.has(`fr:friend:${owner.ownerId}:${pal.ownerId}`)).toBe(true);
+    expect(kv.has(`fr:friend:${pal.ownerId}:${owner.ownerId}`)).toBe(true);
+    expect((await friendsOf(owner)).json).toEqual({ friends: [{ ownerId: pal.ownerId }] });
+    expect((await friendsOf(pal)).json).toEqual({ friends: [{ ownerId: owner.ownerId }] });
+    expect((await list(owner)).json).toEqual({ incoming: [], outgoing: [] });
+    expect((await list(pal)).json).toEqual({ incoming: [], outgoing: [] });
+    expect((await friendsOf(owner)).text.toLowerCase()).not.toContain("push");
+    const miss = await acceptLink(stranger, "23456789");
+    const again = await acceptLink(stranger, owner);
+    expect(again.status).toBe(miss.status);
+    expect(again.text).toBe(miss.text);
+    expect(again.json).toEqual(NOT_AVAILABLE);
+    expect([...kv.keys()].filter((key) => key.startsWith("fr:friend:"))).toHaveLength(2);
+    const repeat = await acceptLink(pal, owner);
+    expect(repeat.json).toEqual({ status: "friends", ownerId: owner.ownerId, already: "friends" });
+  });
+
+  it("lets one of two simultaneous link accepts win, and writes one pair of friend rows", async () => {
+    const owner = await mint("race-link-owner");
+    const bob = await mint("race-link-bob");
+    const carol = await mint("race-link-carol");
+    const ops = spyInviteOps();
+    const [left, right] = await Promise.all([acceptLink(bob, owner), acceptLink(carol, owner)]);
+    const wins = [left, right].filter((row) => row.status === 200);
+    const losses = [left, right].filter((row) => row.status === 404);
+    expect(wins).toHaveLength(1);
+    expect(losses).toHaveLength(1);
+    expect(wins[0].json).toEqual({ status: "friends", ownerId: owner.ownerId });
+    expect(losses[0].json).toEqual(NOT_AVAILABLE);
+    expect(ops.filter((op) => op.op === "redeem").length).toBeGreaterThanOrEqual(1);
+    expect(ops.every((op) => op.name.startsWith("inv:"))).toBe(true);
+    const friendKeys = [...kv.keys()].filter((key) => key.startsWith("fr:friend:")).sort();
+    expect(friendKeys).toHaveLength(2);
+    const winnerId = wins[0].json.ownerId === owner.ownerId
+      ? (kv.has(`fr:friend:${owner.ownerId}:${bob.ownerId}`) ? bob.ownerId : carol.ownerId)
+      : wins[0].json.ownerId;
+    expect(friendKeys).toEqual([
+      `fr:friend:${owner.ownerId}:${winnerId}`,
+      `fr:friend:${winnerId}:${owner.ownerId}`,
+    ].sort());
+  });
+
+  it("drops leftover requests in both directions when the link is accepted", async () => {
+    const owner = await mint("stale-owner");
+    const pal = await mint("stale-pal");
+    expect((await send(pal, owner)).json).toEqual({ status: "pending", ownerId: owner.ownerId });
+    kv.set(`fr:req:${pal.ownerId}:${owner.ownerId}`, { value: "pending" });
+    kv.set(`fr:rcode:${pal.ownerId}:${owner.ownerId}`, { value: `${owner.code}:${1_790_000_000_000 + WEEK_MS}` });
+    kv.set(`fr:out:${pal.ownerId}:${owner.ownerId}`, { value: "pending" });
+    kv.set(`fr:out:${owner.ownerId}:${pal.ownerId}`, { value: "pending" });
+    const accepted = await acceptLink(pal, owner);
+    expect(accepted.json).toEqual({ status: "friends", ownerId: owner.ownerId });
+    expect(kv.has(`fr:req:${owner.ownerId}:${pal.ownerId}`)).toBe(false);
+    expect(kv.has(`fr:req:${pal.ownerId}:${owner.ownerId}`)).toBe(false);
+    expect(kv.has(`fr:rcode:${owner.ownerId}:${pal.ownerId}`)).toBe(false);
+    expect(kv.has(`fr:rcode:${pal.ownerId}:${owner.ownerId}`)).toBe(false);
+    expect(kv.has(`fr:out:${pal.ownerId}:${owner.ownerId}`)).toBe(false);
+    expect(kv.has(`fr:out:${owner.ownerId}:${pal.ownerId}`)).toBe(false);
+    expect((await list(owner)).json).toEqual({ incoming: [], outgoing: [] });
+    expect((await list(pal)).json).toEqual({ incoming: [], outgoing: [] });
+  });
+
+  it("does not add a blocked pair, and does not say blocked when the owner blocked the invited person", async () => {
+    const owner = await mint("block-link-owner");
+    const pal = await mint("block-link-pal");
+    const carol = await mint("block-link-carol");
+    const missKey = await mint("block-link-miss");
+    kv.set(`fr:block:${owner.ownerId}:${pal.ownerId}`, { value: "1" });
+    const hidden = await acceptLink(pal, owner);
+    const miss = await acceptLink(missKey, "23456789");
+    expect(hidden.status).toBe(miss.status);
+    expect(hidden.text).toBe(miss.text);
+    expect(hidden.json).toEqual(NOT_AVAILABLE);
+    expect(hidden.text.toLowerCase()).not.toContain("block");
+    expect([...kv.keys()].filter((key) => key.startsWith("fr:friend:"))).toEqual([]);
+    expect((await acceptLink(carol, owner)).json).toEqual({ status: "friends", ownerId: owner.ownerId });
+    expect(kv.has(`fr:friend:${owner.ownerId}:${pal.ownerId}`)).toBe(false);
+
+    const owner2 = await mint("block-link-owner2");
+    const pal2 = await mint("block-link-pal2");
+    const carol2 = await mint("block-link-carol2");
+    kv.set(`fr:block:${pal2.ownerId}:${owner2.ownerId}`, { value: "1" });
+    const known = await acceptLink(pal2, owner2);
+    expect(known.status).toBe(409);
+    expect(known.json).toEqual({ error: "blocked" });
+    expect(kv.has(`fr:friend:${owner2.ownerId}:${pal2.ownerId}`)).toBe(false);
+    expect((await acceptLink(carol2, owner2)).json).toEqual({ status: "friends", ownerId: owner2.ownerId });
+  });
+
+  it("keeps send-then-owner-accept working for an old build", async () => {
+    const owner = await mint("old-path-owner");
+    const pal = await mint("old-path-pal");
+    const sent = await send(pal, owner);
+    expect(sent.json).toEqual({ status: "pending", ownerId: owner.ownerId });
+    expect([...kv.keys()].filter((key) => key.startsWith("fr:friend:"))).toEqual([]);
+    const alone = await accept(owner, pal);
+    expect(alone.status).toBe(200);
+    expect(alone.json).toEqual({ status: "friends", ownerId: pal.ownerId });
+    expect(kv.has(`fr:friend:${owner.ownerId}:${pal.ownerId}`)).toBe(true);
+    expect(kv.has(`fr:friend:${pal.ownerId}:${owner.ownerId}`)).toBe(true);
+    expect(kv.has(reqKey(owner, pal))).toBe(false);
+    const owner2 = await mint("old-path-owner2");
+    const pal2 = await mint("old-path-pal2");
+    expect((await accept(owner2, pal2)).json).toEqual({ error: "not_friends" });
+    expect(kv.has(`fr:friend:${owner2.ownerId}:${pal2.ownerId}`)).toBe(false);
+    expect((await acceptLink(pal2, owner2)).json).toEqual({ status: "friends", ownerId: owner2.ownerId });
+  });
+
+  it("still holds a declined sender off that code without burning it", async () => {
+    const owner = await mint("hold-link-owner");
+    const pal = await mint("hold-link-pal");
+    const carol = await mint("hold-link-carol");
+    const missKey = await mint("hold-link-miss");
+    await send(pal, owner);
+    expect((await decline(owner, pal)).json).toEqual({ ok: true });
+    const held = await acceptLink(pal, owner);
+    const miss = await acceptLink(missKey, "23456789");
+    expect(held.text).toBe(miss.text);
+    expect(held.json).toEqual(NOT_AVAILABLE);
+    expect(kv.has(`fr:friend:${owner.ownerId}:${pal.ownerId}`)).toBe(false);
+    expect((await acceptLink(carol, owner)).json).toEqual({ status: "friends", ownerId: owner.ownerId });
+    expect(kv.has(`fr:friend:${owner.ownerId}:${pal.ownerId}`)).toBe(false);
+    expect(kv.has(`fr:friend:${owner.ownerId}:${carol.ownerId}`)).toBe(true);
+  });
+
+  it("rejects the caller's own code before spending a guess", async () => {
+    const owner = await mint("own-link-owner");
+    for (let i = 0; i < FRIEND_CODE_GUESS_LIMIT; i += 1) {
+      const own = await acceptLink(owner, owner);
+      expect(own.status).toBe(400);
+      expect(own.json).toEqual({ error: "invalid_body" });
+    }
+    expect((await lookup(owner, "23456789")).status).toBe(404);
+    expect((await lookup(owner, "23456789")).json).toEqual(NOT_AVAILABLE);
   });
 });
