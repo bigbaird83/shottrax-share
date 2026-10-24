@@ -60,6 +60,10 @@ export const LIVE_BODY_LIMIT = 24 * 1024;
 export const LIVE_SHOT_LIMIT = 15;
 export const LIVE_SHOT_MAX_YARDS = 700;
 export const LIVE_SHOT_RESULTS = ["fairway", "rough", "sand", "green", "holed", "missed"];
+/** Shot lat/lon are stored and served at 5 decimal places (about 1 m). */
+export const LIVE_COORD_DECIMALS = 5;
+const LIVE_COORD_SCALE = 10 ** LIVE_COORD_DECIMALS;
+const LIVE_ROUND_FIELDS = ["courseName", "hole", "holes", "shots", "skippedHoles", "roundStats", "clubAverages", "roundKind", "finished"];
 const LIVE_PUTT_CLUB = "Putt";
 // 100 ids of 64 characters plus quotes and commas.
 const DELETE_ROUNDS_BODY_LIMIT = 8192;
@@ -846,11 +850,13 @@ async function fetchRounds(request, env, cors) {
 }
 
 /**
- * Your live round for friends. Body { courseName, hole, holes }. holes use the
- * publishRound hole allowlist (score and par always; fir, gir, putts, clubs only
- * when the phone's switches are on), so GPS or any other field is 400.
- * Stored at fr:live:<ownerId> and replaced on every update. The phone sends this
- * only while "Share live rounds with friends" is on and the round is shared.
+ * Your live round for friends. Body { courseName, hole, holes, shots? }.
+ * Per-shot club, yards, s/e lat/lon, and the hole clubs list are kept for
+ * followers even when clubAverages is false. fir, gir, and putts are omitted when roundStats is
+ * false. roundKind practice or test is refused and stores nothing. finished
+ * true deletes the row, including every shot location. Replaced on every
+ * update. The phone sends this only while "Share live rounds with friends"
+ * is on and the round is shared.
  * Optional skippedHoles (Brian Baird OK 2026-10-23 11:55 PM CT): hole numbers
  * 1-18 the golfer skipped, so friends see "Skipped" instead of unscored. Repeats
  * are merged, at most 18, and a skipped hole may not also be scored. Older apps
@@ -862,7 +868,10 @@ async function putLive(request, env, cors) {
   const parsed = await readJsonObject(request, LIVE_BODY_LIMIT, false);
   if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
   const body = parsed.value;
-  if (unknownFields(body, ["courseName", "hole", "holes", "shots", "skippedHoles"])) return friendJson(400, { error: "invalid_body" }, cors);
+  if (unknownFields(body, LIVE_ROUND_FIELDS)) return friendJson(400, { error: "invalid_body" }, cors);
+  if (!validLiveFlags(body)) return friendJson(400, { error: "invalid_body" }, cors);
+  if (body.finished === true) return finishLive(env, cors, friendKey);
+  if (isPracticeOrTest(body)) return friendJson(400, { error: "practice_or_test" }, cors);
   if (!validCourseName(body.courseName)) return friendJson(400, { error: "invalid_body" }, cors);
   if (!Number.isInteger(body.hole) || body.hole < 1 || body.hole > 18) return friendJson(400, { error: "invalid_body" }, cors);
   if (!Array.isArray(body.holes) || body.holes.length > 18) return friendJson(400, { error: "invalid_body" }, cors);
@@ -872,7 +881,7 @@ async function putLive(request, env, cors) {
     const clean = sanitizeLiveHole(hole);
     if (!clean || seen.has(clean.hole)) return friendJson(400, { error: "invalid_body" }, cors);
     seen.add(clean.hole);
-    holes.push(clean);
+    holes.push(holeForFollowers(clean, body));
   }
   holes.sort((a, b) => a.hole - b.hole);
   let skippedHoles = null;
@@ -894,10 +903,22 @@ async function putLive(request, env, cors) {
   if (limited) return limited;
   const row = { courseName: body.courseName, hole: body.hole, holes, updatedAt: Date.now() };
   if (currentShots) row.shots = currentShots;
+  if (typeof body.roundStats === "boolean") row.roundStats = body.roundStats;
+  if (typeof body.clubAverages === "boolean") row.clubAverages = body.clubAverages;
   if (skippedHoles && skippedHoles.length > 0) row.skippedHoles = skippedHoles;
   await friendPut(boards, friendKvKey("live", caller.ownerId), JSON.stringify(row), {
     expirationTtl: Math.ceil(FRIEND_LIVE_TTL_MS / 1000),
   });
+  return friendJson(200, { ok: true }, cors);
+}
+
+/** Round finished: drop the live row and every shot location stored on it. */
+async function finishLive(env, cors, friendKey) {
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  await deleteIfPresent(boards, friendKvKey("live", caller.ownerId));
   return friendJson(200, { ok: true }, cors);
 }
 
@@ -932,7 +953,13 @@ async function fetchLive(request, env, cors) {
   for (const otherId of await loadFriendIds(boards, caller.ownerId)) {
     if (!(await areFriends(boards, otherId, caller.ownerId))) continue;
     if ((await hasBlock(boards, caller.ownerId, otherId)) || (await hasBlock(boards, otherId, caller.ownerId))) continue;
-    const row = readLiveRow(await friendGet(boards, friendKvKey("live", otherId)), now);
+    const liveKey = friendKvKey("live", otherId);
+    const raw = await friendGet(boards, liveKey);
+    if (liveRowExpired(raw, now)) {
+      await friendDelete(boards, liveKey);
+      continue;
+    }
+    const row = readLiveRow(raw, now);
     if (row) live.push({ ownerId: otherId, ...row });
   }
   return friendJson(200, { live }, cors);
@@ -949,7 +976,9 @@ function readLiveRow(raw, now) {
   if (!value || typeof value !== "object") return null;
   if (!Number.isFinite(value.updatedAt) || now - value.updatedAt > FRIEND_LIVE_TTL_MS || value.updatedAt > now + 60_000) return null;
   if (!validCourseName(value.courseName) || !Number.isInteger(value.hole)) return null;
-  const holes = Array.isArray(value.holes) ? value.holes.map(sanitizeLiveHole).filter(Boolean) : [];
+  const holes = Array.isArray(value.holes)
+    ? value.holes.map(sanitizeLiveHole).filter(Boolean).map((hole) => holeForFollowers(hole, value))
+    : [];
   const toPar = holes.reduce((sum, hole) => sum + hole.score - hole.par, 0);
   const out = {
     courseName: value.courseName,
@@ -1276,8 +1305,10 @@ function sanitizeShots(shots, scored) {
 }
 
 /**
- * Allowlist: n, club, yd, s, e, res. s and e are [lat, lng] at most 5 decimals.
- * Putts carry no yards and no coordinates; Holed only on a scored hole.
+ * Allowlist: n, club, yd, s, e, res. s and e are [lat, lon]. Each coordinate is
+ * snapped to LIVE_COORD_DECIMALS on write. Putts carry no yards and no
+ * coordinates; Holed only on a scored hole. Club, yards, and coordinates are
+ * not gated by the Club averages setting.
  */
 export function sanitizeShot(shot, scored = true) {
   if (shot == null || typeof shot !== "object" || Array.isArray(shot)) return null;
@@ -1295,8 +1326,9 @@ export function sanitizeShot(shot, scored = true) {
   }
   for (const key of ["s", "e"]) {
     if (!Object.hasOwn(shot, key)) continue;
-    if (putt || !validLivePoint(shot[key])) return null;
-    clean[key] = [shot[key][0], shot[key][1]];
+    const point = cleanLivePoint(shot[key]);
+    if (putt || !point) return null;
+    clean[key] = point;
   }
   if (Object.hasOwn(shot, "res")) {
     if (typeof shot.res !== "string" || !LIVE_SHOT_RESULTS.includes(shot.res)) return null;
@@ -1306,13 +1338,63 @@ export function sanitizeShot(shot, scored = true) {
   return clean;
 }
 
-/** [lat, lng], finite, in range, no more than 5 decimal places (about 1 m). */
-function validLivePoint(point) {
-  if (!Array.isArray(point) || point.length !== 2) return false;
-  const [lat, lng] = point;
-  if (typeof lat !== "number" || typeof lng !== "number" || !Number.isFinite(lat) || !Number.isFinite(lng)) return false;
-  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return false;
-  return Math.round(lat * 1e5) / 1e5 === lat && Math.round(lng * 1e5) / 1e5 === lng;
+/**
+ * [lat, lon]. Brian decided Oct 23, 2026, 10:02 AM CT: 6 or more decimal
+ * places are accepted and rounded to 5 on write (half toward +∞). Followers
+ * are served the rounded value. Non-numeric values, and values outside
+ * -90..90 / -180..180 after rounding, are refused.
+ */
+function cleanLivePoint(point) {
+  if (!Array.isArray(point) || point.length !== 2) return null;
+  const lat = snapLiveCoord(point[0]);
+  const lon = snapLiveCoord(point[1]);
+  if (lat == null || lon == null) return null;
+  if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
+  return [lat, lon];
+}
+
+function snapLiveCoord(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  const snapped = Math.round(value * LIVE_COORD_SCALE) / LIVE_COORD_SCALE;
+  if (!Number.isFinite(snapped)) return null;
+  return snapped;
+}
+
+function validLiveFlags(body) {
+  if (Object.hasOwn(body, "roundStats") && typeof body.roundStats !== "boolean") return false;
+  if (Object.hasOwn(body, "clubAverages") && typeof body.clubAverages !== "boolean") return false;
+  if (Object.hasOwn(body, "finished") && typeof body.finished !== "boolean") return false;
+  if (!Object.hasOwn(body, "roundKind")) return true;
+  if (typeof body.roundKind !== "string") return false;
+  const kind = body.roundKind.trim().toLowerCase();
+  return kind === "round" || kind === "practice" || kind === "test";
+}
+
+function isPracticeOrTest(body) {
+  return typeof body.roundKind === "string" && /^(practice|test)$/i.test(body.roundKind.trim());
+}
+
+/** Drop round-stats when that follower setting is off. Shots and the hole clubs array stay. */
+function holeForFollowers(hole, settings) {
+  const next = { ...hole };
+  if (settings.roundStats === false) {
+    delete next.fir;
+    delete next.gir;
+    delete next.putts;
+  }
+  return next;
+}
+
+function liveRowExpired(raw, now) {
+  if (typeof raw !== "string") return false;
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+  if (!value || typeof value !== "object" || !Number.isFinite(value.updatedAt)) return false;
+  return now - value.updatedAt > FRIEND_LIVE_TTL_MS;
 }
 
 function validClubs(clubs) {
