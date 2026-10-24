@@ -14,9 +14,10 @@
  * Pass --remote or --local. Neither is assumed, so --apply alone touches nothing.
  * On the live Worker the counter namespace is GOLFAPI_KV (TERRAIN_KV is unset).
  * Rows already stored in GolfapiCounter SQLite are not in that namespace.
- * The Durable Object deletes those rows on its next request, when the UTC
- * day on the key started more than 48 hours ago. This script does not do
- * that, and nothing in deploy runs this script.
+ * The Durable Object deletes those rows from an alarm about 49 hours after
+ * a sample write, and from a request at most once an hour. The first request
+ * after deploy still sweeps. This script does not do that, and nothing in
+ * deploy runs this script.
  */
 
 import { execFile } from 'node:child_process';

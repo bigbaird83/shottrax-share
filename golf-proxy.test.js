@@ -47,13 +47,20 @@ class FakeKV {
 class MemorySql {
   constructor() {
     this.map = new Map();
+    this.queries = [];
   }
   exec(query, ...args) {
     const text = query.replace(/\s+/g, ' ').trim();
+    this.queries.push({ text, args: [...args] });
     if (text.startsWith('CREATE')) return [];
     if (text.startsWith('SELECT key FROM state WHERE key LIKE')) {
       const prefix = String(args[0] ?? '').replace(/%+$/, '');
       return [...this.map.keys()].filter((key) => key.startsWith(prefix)).map((key) => ({ key }));
+    }
+    if (text.includes('WHERE key >=') && text.includes('AND key <')) {
+      const lo = String(args[0]);
+      const hi = String(args[1]);
+      return [...this.map.keys()].filter((key) => key >= lo && key < hi).map((key) => ({ key }));
     }
     if (text.startsWith('SELECT')) {
       const value = this.map.get(args[0]);
@@ -2459,6 +2466,189 @@ describe('terrain route', { concurrency: 1 }, () => {
     } finally {
       fake.restore();
     }
+  });
+
+  test('the sample sweep is an indexed range and runs at most once an hour', async () => {
+    function assertSweepSkipped(elapsedMs) {
+      assert.equal(elapsedMs < 60 * 60 * 1000, true);
+    }
+    assert.throws(() => assertSweepSkipped(60 * 60 * 1000));
+    assert.throws(() => assertSweepSkipped(60 * 60 * 1000 + 1));
+    assert.doesNotThrow(() => assertSweepSkipped(0));
+    assert.doesNotThrow(() => assertSweepSkipped(60 * 60 * 1000 - 1));
+
+    const fake = installFakes();
+    try {
+      const t0 = Date.parse('2026-10-24T12:00:00.000Z');
+      const oldKey = 'terrain:samples:id_hour:2026-10-22';
+      const again = 'terrain:samples:id_hour2:2026-10-22';
+      const edgeKey = 'terrain:samples;';
+      const sweepKey = 'golfapi:terrain-sample-sweep';
+      const usage = (now) => counterOp(fake, {
+        op: 'readUsage',
+        now,
+        dayKey: 'golfapi:credit:day:unused',
+        monthKey: 'golfapi:credit:month:unused',
+      });
+      fake.counter.sql.map.set(oldKey, '4');
+      fake.counter.sql.map.set(edgeKey, 'nope');
+      fake.counter.sql.map.set('golfapi:known:keep', 'stay');
+      fake.counter.sql.queries.length = 0;
+
+      await usage(t0);
+      assert.equal(fake.counter.sql.map.has(oldKey), false);
+      assert.equal(fake.counter.sql.map.get(edgeKey), 'nope');
+      assert.equal(fake.counter.sql.map.get('golfapi:known:keep'), 'stay');
+      assert.equal(fake.counter.sql.map.get(sweepKey), String(t0));
+      const ranges = fake.counter.sql.queries.filter((query) => query.text.includes('key >='));
+      assert.equal(ranges.length, 1);
+      assert.match(ranges[0].text, /SELECT key FROM state WHERE key >= \? AND key < \?/);
+      assert.doesNotMatch(ranges[0].text, /LIKE|key <=/);
+      assert.deepEqual(ranges[0].args, ['terrain:samples:', 'terrain:samples;']);
+
+      fake.counter.sql.map.set(again, '5');
+      fake.counter.sql.queries.length = 0;
+      await usage(t0 + 60 * 60 * 1000 - 1);
+      assert.equal(fake.counter.sql.map.get(again), '5');
+      assert.equal(fake.counter.sql.queries.some((query) => query.text.includes('key >=')), false);
+
+      fake.counter.sql.map.delete(sweepKey);
+      await usage(t0 + 30 * 60 * 1000);
+      assert.equal(fake.counter.sql.map.get(again), '5');
+
+      fake.counter.sql.map.set(sweepKey, String(t0));
+      const second = new GolfapiCounter({
+        storage: { sql: fake.counter.sql },
+        blockConcurrencyWhile(fn) {
+          return fn();
+        },
+      });
+      const skipped = await second.fetch(new Request('https://golfapi-counter.internal/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          op: 'readUsage',
+          now: t0 + 30 * 60 * 1000,
+          dayKey: 'golfapi:credit:day:unused',
+          monthKey: 'golfapi:credit:month:unused',
+        }),
+      }));
+      assert.equal((await skipped.json()).ok, true);
+      assert.equal(fake.counter.sql.map.get(again), '5');
+
+      await usage(t0 + 60 * 60 * 1000);
+      assert.equal(fake.counter.sql.map.has(again), false);
+      assert.equal(fake.counter.sql.map.get(sweepKey), String(t0 + 60 * 60 * 1000));
+      assert.equal(fake.counter.sql.map.get(edgeKey), 'nope');
+      assert.equal(fake.counter.sql.map.get('golfapi:known:keep'), 'stay');
+    } finally {
+      fake.restore();
+    }
+  });
+
+  test('a sample write sets a 49h alarm that sweeps with no further requests', async () => {
+    function assertAlarmDelay(ms) {
+      assert.equal(ms, 49 * 60 * 60 * 1000);
+    }
+    assert.throws(() => assertAlarmDelay(48 * 60 * 60 * 1000));
+    assert.throws(() => assertAlarmDelay(48 * 60 * 60 * 1000 + 1));
+    assert.throws(() => assertAlarmDelay(0));
+    assert.throws(() => assertAlarmDelay(49 * 60 * 60 * 1000 - 1));
+    assert.throws(() => assertAlarmDelay(50 * 60 * 60 * 1000));
+    assert.doesNotThrow(() => assertAlarmDelay(49 * 60 * 60 * 1000));
+
+    const source = readFileSync(new URL('./golf-proxy.js', import.meta.url), 'utf8');
+    const handlers = source.match(/^\s*(?:async\s+)?alarm\s*\(/gm) || [];
+    assert.equal(handlers.length, 1);
+
+    const sql = new MemorySql();
+    const storage = {
+      sql,
+      alarmAt: 12345,
+      setAlarmCalls: 0,
+      async getAlarm() {
+        return this.alarmAt;
+      },
+      async setAlarm(at) {
+        this.setAlarmCalls += 1;
+        this.alarmAt = at;
+      },
+    };
+    const ctx = {
+      storage,
+      blockConcurrencyWhile(fn) {
+        return fn();
+      },
+    };
+    const counter = new GolfapiCounter(ctx);
+    const hour = 60 * 60 * 1000;
+    const delay = 49 * hour;
+
+    await counter.writeSample('terrain:samples:id_alarm:2026-10-24', 2);
+    assert.equal(storage.setAlarmCalls, 0);
+    assert.equal(storage.alarmAt, 12345);
+    assert.equal(sql.map.get('terrain:samples:id_alarm:2026-10-24'), '2');
+
+    storage.alarmAt = null;
+    const before = Date.now();
+    await counter.writeSample('terrain:samples:id_alarm:2026-10-24', 3);
+    const after = Date.now();
+    assert.equal(storage.setAlarmCalls, 1);
+    assert.equal(sql.map.get('terrain:samples:id_alarm:2026-10-24'), '3');
+    assert.equal(storage.alarmAt >= before + delay, true);
+    assert.equal(storage.alarmAt <= after + delay, true);
+    assertAlarmDelay(delay);
+
+    const kv = new FakeKV();
+    const kvCounter = new GolfapiCounter(ctx, { TERRAIN_KV: kv });
+    storage.alarmAt = 12345;
+    storage.setAlarmCalls = 0;
+    await kvCounter.writeSample('terrain:samples:id_kv:2026-10-24', 1);
+    assert.equal(storage.setAlarmCalls, 0);
+    assert.equal(storage.alarmAt, 12345);
+    assert.deepEqual(kv.puts[0].options, { expirationTtl: 172800 });
+    storage.alarmAt = null;
+    const kvBefore = Date.now();
+    await kvCounter.writeSample('terrain:samples:id_kv:2026-10-24', 4);
+    const kvAfter = Date.now();
+    assert.equal(storage.setAlarmCalls, 1);
+    assert.equal(storage.alarmAt >= kvBefore + delay, true);
+    assert.equal(storage.alarmAt <= kvAfter + delay, true);
+
+    const now = Date.now();
+    const today = new Date(now).toISOString().slice(0, 10);
+    const old = new Date(now - 3 * 24 * hour).toISOString().slice(0, 10);
+    const oldKey = `terrain:samples:id_alarm:${old}`;
+    const todayKey = `terrain:samples:id_alarm:${today}`;
+    sql.map.set(oldKey, '9');
+    sql.map.set(todayKey, '2');
+    sql.map.set('golfapi:known:keep', 'stay');
+    storage.alarmAt = null;
+    storage.setAlarmCalls = 0;
+    await counter.alarm();
+    assert.equal(sql.map.has(oldKey), false);
+    assert.equal(sql.map.get(todayKey), '2');
+    assert.equal(sql.map.get('golfapi:known:keep'), 'stay');
+    assert.equal(storage.setAlarmCalls, 1);
+    assert.equal(storage.alarmAt >= now + delay, true);
+    assert.equal(storage.alarmAt < now + delay + 5000, true);
+
+    sql.map.clear();
+    sql.map.set(oldKey, '9');
+    storage.alarmAt = null;
+    storage.setAlarmCalls = 0;
+    await counter.alarm();
+    assert.equal(sql.map.has(oldKey), false);
+    assert.equal(storage.setAlarmCalls, 0);
+    assert.equal(storage.alarmAt, null);
+
+    sql.map.clear();
+    sql.map.set('terrain:samples:id_alarm:not-a-day', '1');
+    storage.alarmAt = null;
+    storage.setAlarmCalls = 0;
+    await counter.alarm();
+    assert.equal(sql.map.get('terrain:samples:id_alarm:not-a-day'), '1');
+    assert.equal(storage.setAlarmCalls, 1);
   });
 
   test('cleanup drops stored sample counters whose day is more than 48h old', async () => {
