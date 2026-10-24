@@ -705,6 +705,19 @@ describe("live rounds for friends", () => {
     expect(seen.holes.map((h) => h.clubs)).toEqual([["3w", "9i", "Putt"], ["8i"]]);
   });
 
+  // Brian's rule: live sharing is on by default; the phone's PUT is the opt-in.
+  // The server keeps no share flag, so a PUT with no setting fields is stored
+  // and served in full. Made-up course and data.
+  it("live rules: a PUT with no share or setting fields is stored and served in full", async () => {
+    const golfer = await mint("rule-default");
+    const pal = await mint("rule-default-pal");
+    await befriend(pal, golfer);
+    const hole = { hole: 1, score: 5, par: 4, fir: true, gir: false, putts: 2, clubs: ["Dr", "8i"], shots: [{ n: 1, club: "Dr", yd: 230, s: [12.1, 22.1], e: [12.2, 22.2], res: "fairway" }] };
+    expect((await putLive(golfer, { courseName: "Mock Pines GC", hole: 2, holes: [hole] })).json).toEqual({ ok: true });
+    const seen = (await getLive(pal)).json.live[0];
+    expect(seen.holes[0]).toEqual(hole);
+  });
+
   // Skipped holes (Brian Baird OK 2026-10-23 11:55 PM CT). Made-up course and scores only.
   it("skipped holes: stored and returned to accepted friends only, merged and sorted", async () => {
     const golfer = await mint("skip-golfer");
