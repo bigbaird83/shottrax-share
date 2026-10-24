@@ -68,14 +68,14 @@ class MemorySql {
 }
 
 class FakeCounterNamespace {
-  constructor() {
+  constructor(env) {
     this.sql = new MemorySql();
     this.stub = new GolfapiCounter({
       storage: { sql: this.sql },
       blockConcurrencyWhile(fn) {
         return fn();
       },
-    });
+    }, env);
     this.chain = Promise.resolve();
   }
   idFromName() {
@@ -2296,6 +2296,71 @@ describe('terrain route', { concurrency: 1 }, () => {
       assert.equal((await pending).status, 200);
     } finally {
       release?.();
+      fake.restore();
+    }
+  });
+
+  test('the per-install terrain sample counter put uses a 48h expirationTtl', async () => {
+    function assertSampleTtl(options) {
+      assert.deepEqual(options, { expirationTtl: 172800 });
+    }
+    // A missing TTL, a wrong TTL, or any extra option must fail. 172800 is the only pass.
+    for (const bad of [
+      undefined,
+      null,
+      {},
+      { expirationTtl: 86400 },
+      { expirationTtl: 172801 },
+      { expirationTtl: 172800, expiration: 1 },
+    ]) {
+      assert.throws(() => assertSampleTtl(bad));
+    }
+    assert.doesNotThrow(() => assertSampleTtl({ expirationTtl: 172800 }));
+
+    const fake = installFakes();
+    fake.counter = new FakeCounterNamespace({ TERRAIN_KV: fake.terrain });
+    try {
+      usgsMock(fake);
+      const env = baseEnv(fake, { TERRAIN_INSTALL_DAILY_CAP: '1' });
+      const day = new Date().toISOString().slice(0, 10);
+      const sampleKey = `terrain:samples:id_ttl:${day}`;
+      const first = await proxy(`/terrain/v1/pebble/1?${terrainQuery()}`, env, usHeaders('id_ttl'));
+      assert.equal(first.status, 200);
+      const samplePuts = () => fake.terrain.puts.filter((put) => put.key.startsWith('terrain:samples:'));
+      const written = samplePuts();
+      assert.equal(written.length, 1);
+      assert.equal(written[0].key, sampleKey);
+      assert.equal(written[0].value, '1');
+      assertSampleTtl(written[0].options);
+      const blobs = fake.terrain.puts.filter((put) => put.key.startsWith('terrain:v1:'));
+      assert.equal(blobs.length, 1);
+      assert.equal(blobs[0].options, null);
+
+      const blocked = await proxy(`/terrain/v1/pebble/2?${terrainQuery()}`, env, usHeaders('id_ttl'));
+      assert.equal(blocked.status, 429);
+      assert.equal((await bodyOf(blocked)).error, 'terrain_limited');
+      assert.equal(samplePuts().length, 1);
+
+      const kvKey = `terrain:samples:id_kv:${day}`;
+      fake.terrain.store.set(kvKey, { value: '1', options: { expirationTtl: 172800 } });
+      fake.counter.sql.map.set(kvKey, '0');
+      const preferKv = await proxy(`/terrain/v1/pebble/8?${terrainQuery()}`, env, usHeaders('id_kv'));
+      assert.equal(preferKv.status, 429);
+
+      fake.terrain.puts.length = 0;
+      globalThis.fetch = async () => {
+        throw new Error('usgs down');
+      };
+      const failed = await proxy(`/terrain/v1/pebble/3?${terrainQuery()}`, env, usHeaders('id_abort'));
+      assert.equal(failed.status, 502);
+      const abortPuts = samplePuts();
+      assert.deepEqual(abortPuts.map((put) => put.value), ['1', '0']);
+      for (const put of abortPuts) {
+        assert.equal(put.key, `terrain:samples:id_abort:${day}`);
+        assertSampleTtl(put.options);
+      }
+      assert.equal(fake.terrain.puts.some((put) => put.key.startsWith('terrain:v1:')), false);
+    } finally {
       fake.restore();
     }
   });
