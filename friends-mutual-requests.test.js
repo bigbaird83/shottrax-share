@@ -196,8 +196,11 @@ describe("build 169: mutual requests and shared rounds", () => {
     const pal = await mint("mu-pal5");
     await send(owner, pal);
     kv.set(`fr:req:${owner.ownerId}:${pal.ownerId}`, { value: "pending" });
+    kv.set(`fr:ridx:in:${owner.ownerId}:${pal.ownerId}`, { value: "1" });
+    kv.set(`fr:ridx:out:${pal.ownerId}:${owner.ownerId}`, { value: "1" });
     await accept(pal, owner);
     expect([...kv.keys()].filter((k) => k.startsWith("fr:req:"))).toEqual([]);
+    expect([...kv.keys()].filter((k) => k.startsWith("fr:ridx:in:") || k.startsWith("fr:ridx:out:"))).toEqual([]);
   });
 
   const snapshot = () => JSON.stringify([...kv.entries()].sort(([a], [b]) => (a < b ? -1 : 1)));
