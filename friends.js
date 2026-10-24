@@ -851,8 +851,8 @@ async function fetchRounds(request, env, cors) {
 
 /**
  * Your live round for friends. Body { courseName, hole, holes, shots? }.
- * Per-shot club, yards, and s/e lat/lon are kept for followers even when
- * clubAverages is false. fir, gir, and putts are omitted when roundStats is
+ * Per-shot club, yards, s/e lat/lon, and the hole clubs list are kept for
+ * followers even when clubAverages is false. fir, gir, and putts are omitted when roundStats is
  * false. roundKind practice or test is refused and stores nothing. finished
  * true deletes the row, including every shot location. Replaced on every
  * update. The phone sends this only while "Share live rounds with friends"
@@ -1374,7 +1374,7 @@ function isPracticeOrTest(body) {
   return typeof body.roundKind === "string" && /^(practice|test)$/i.test(body.roundKind.trim());
 }
 
-/** Drop round-stats or the hole clubs array when that follower setting is off. Shots stay. */
+/** Drop round-stats when that follower setting is off. Shots and the hole clubs array stay. */
 function holeForFollowers(hole, settings) {
   const next = { ...hole };
   if (settings.roundStats === false) {
@@ -1382,7 +1382,6 @@ function holeForFollowers(hole, settings) {
     delete next.gir;
     delete next.putts;
   }
-  if (settings.clubAverages === false) delete next.clubs;
   return next;
 }
 

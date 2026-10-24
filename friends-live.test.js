@@ -472,7 +472,7 @@ describe("live rounds for friends", () => {
     const seen = (await getLive(pal)).json.live[0];
     expect(seen.holes[0].shots).toEqual([RULE_SHOT]);
     expect(seen.holes[0].shots[0]).toMatchObject({ club: "Dr", yd: 248, s: [10.12345, 20.12345], e: [10.12545, 20.12445] });
-    expect(seen.holes[0].clubs).toBeUndefined();
+    expect(seen.holes[0].clubs).toEqual(["Dr", "7i"]);
     expect(JSON.stringify(seen.holes[0].shots)).toMatch(/"club":"Dr"/);
   });
 
@@ -686,6 +686,23 @@ describe("live rounds for friends", () => {
     expect(seen.holes[0]).not.toHaveProperty("putts");
     expect(seen.holes[0]).not.toHaveProperty("fir");
     expect(seen.holes[0].shots[0]).toMatchObject({ club: "Dr", yd: 240, s: [11.1, 21.1] });
+  });
+
+  // Brian decided Oct 24, 2026: live rounds show the hole clubs list even with
+  // club averages off. Made-up course and clubs.
+  it("live rules: serves the hole clubs list when club averages are off", async () => {
+    const golfer = await mint("rule-holeclubs");
+    const pal = await mint("rule-holeclubs-pal");
+    await befriend(pal, golfer);
+    expect((await putLive(golfer, {
+      courseName: "Mock Pines GC",
+      hole: 3,
+      clubAverages: false,
+      holes: [{ hole: 1, score: 4, par: 4, clubs: ["3w", "9i", "Putt"] }, { hole: 2, score: 3, par: 3, clubs: ["8i"] }],
+    })).status).toBe(200);
+    expect(JSON.parse(kv.get(`fr:live:${golfer.ownerId}`).value).holes.map((h) => h.clubs)).toEqual([["3w", "9i", "Putt"], ["8i"]]);
+    const seen = (await getLive(pal)).json.live[0];
+    expect(seen.holes.map((h) => h.clubs)).toEqual([["3w", "9i", "Putt"], ["8i"]]);
   });
 
   // Skipped holes (Brian Baird OK 2026-10-23 11:55 PM CT). Made-up course and scores only.
