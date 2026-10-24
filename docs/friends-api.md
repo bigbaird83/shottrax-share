@@ -28,11 +28,11 @@ Eight characters from the same unambiguous alphabet as live board codes: `ABCDEF
 
 `getCode` mints a code the first time a friend key is seen and returns the same code after that. `resetCode` replaces it. The old code stops resolving on that request, before the response is sent. There is no grace period.
 
-A code from `getCode` or `resetCode` is single-use and expires 7 days after it is minted. `fr:invat:<CODE>` stores that instant. Opening the link does not spend the code, so someone can install the app and send later, while the code is still inside the 7 days. The first successful `accept` spends it. The spend is one compare-and-set in `FriendGuessLimiter` (object name `inv:<CODE>`), because KV cannot make two phones accept at once and have only one win. The other pending accepts of that code are `409` `{ "error": "not_friends" }`. They add no friend row.
+A code from `getCode` or `resetCode` is single-use and expires 7 days after it is minted. `fr:invat:<CODE>` stores that instant. Opening the link does not spend the code, so someone can install the app and tap Accept later, while the code is still inside the 7 days. The first successful accept spends it. That is either `POST /v1/friends/codes/accept` (the person who opened the link) or, for an older build, the code owner accepting a pending request. The spend is one compare-and-set in `FriendGuessLimiter` (object name `inv:<CODE>`), because KV cannot make two phones accept at once and have only one win. A later link accept of that code is `404` `{ "error": "code_not_found" }` and adds no friend row. A later owner-accept of another pending request is `409` `{ "error": "not_friends" }` and adds no friend row.
 
 A code already stored as a plain `ownerId`, with no `fr:invat:` row, is a legacy code. It stays reusable. It stops resolving 7 days after the deploy clock `FRIEND_INVITE_LEGACY_CUTOVER_MS` (`2026-10-24T19:49:00.000Z`). No row is rewritten. When this Worker is released, set that constant to the deploy instant. A shared old link works until that instant plus 7 days, then the app shows the same "this invite isn't available" screen as a code that never existed.
 
-On lookup and on send, a used code, an expired code, a legacy code past that clock, and a code that was never issued are the same response: `404` `{ "error": "code_not_found" }`. Each spends one guess, under the same 8-per-key limit. Send of the caller's own code is still `400` `{ "error": "invalid_body" }` and does not spend a guess. Lookup of the caller's own code still returns that `ownerId`. Already friends is still `200` `{ "status": "friends", "ownerId", "already": "friends" }`, including after the code is used or past its clock.
+On lookup, on send, and on link accept, a used code, an expired code, a legacy code past that clock, and a code that was never issued are the same response: `404` `{ "error": "code_not_found" }`. Each spends one guess, under the same 8-per-key limit. Send of the caller's own code, and link accept of the caller's own code, are still `400` `{ "error": "invalid_body" }` and do not spend a guess. Lookup of the caller's own code still returns that `ownerId`. Already friends is still `200` `{ "status": "friends", "ownerId", "already": "friends" }`, including after the code is used or past its clock.
 
 The public id in round payloads is `ownerId`, 128 random bits encoded as 22 unpadded base64url characters (`A–Z`, `a–z`, `0–9`, `-`, `_`), not the friend key. `resetCode` keeps `ownerId`.
 
@@ -141,7 +141,7 @@ Each side picks only for its own rounds. No call returns a choice or an audience
 
 Performs the code lookup below, including the guess limit. A limited caller gets `rate_limited` and is not told whether the code exists.
 
-A real code that is not the caller, and no block in either direction, stores a pending request. No duplicates: when the two are already friends the answer is `{ "status": "friends", "ownerId", "already": "friends" }`; when the caller already asked, `{ "status": "pending", "ownerId", "already": "outgoing" }`; when the other person already asked the caller, `{ "status": "pending", "ownerId", "already": "incoming" }` and nothing is written (accept theirs). Access does not start here. The other person must accept.
+A real code that is not the caller, and no block in either direction, stores a pending request. No duplicates: when the two are already friends the answer is `{ "status": "friends", "ownerId", "already": "friends" }`; when the caller already asked, `{ "status": "pending", "ownerId", "already": "outgoing" }`; when the other person already asked the caller, `{ "status": "pending", "ownerId", "already": "incoming" }` and nothing is written (accept theirs). Access does not start here. An older build waits for the code owner to accept. A current build uses link accept instead of this pending request.
 
 `200` `{ "status": "pending", "ownerId": "<their ownerId>" }`
 
@@ -196,7 +196,7 @@ The note has that same lifetime from the sender's side. The rule is: delete the 
 - Remove does not delete the note. Remove does not delete `fr:req:` either. A quiet note exists only after the recipient has blocked the sender, so remove is `not_friends` and writes nothing, same as a pending request that was never accepted.
 - A successful block does not delete the note. Block requires a friendship. While the note is the sender's only outgoing row, the two people are not friends, so block is `not_friends` and writes nothing. A real `fr:req:` row is also left in place when block refuses. Deleting the note on the blocker's later unblock or remove would change the sender's outgoing list. A real pending request does not change on those calls.
 - `resetCode` does not delete the note. It does not delete `fr:req:` either, because `ownerId` is unchanged. Deleting only the note would make a quiet outgoing entry disappear on reset while a real one stayed.
-- The note is deleted, without being read, when a later real send to that same person stores or finds `fr:req:<recipient>:<sender>`, including the already-friends response. Accept deletes the note key without reading it, and only after a real `fr:req:` row has already been confirmed, immediately before that row is deleted. A failed accept, including accept after unblock with no fresh send, does not delete the note and does not create a friendship. Accept never treats the note as a request.
+- The note is deleted, without being read, when a later real send to that same person stores or finds `fr:req:<recipient>:<sender>`, including the already-friends response. Accept deletes the note key without reading it, and only after a real `fr:req:` row has already been confirmed, immediately before that row is deleted. A failed accept, including accept after unblock with no fresh send, does not delete the note and does not create a friendship. Accept never treats the note as a request. When either accept path writes the friendship, it also deletes the other direction's `fr:out:` note for that pair. A link accept that stops for a block, a hold, a closed code, or a lost redeem deletes nothing.
 - One note per pair, the same cardinality as one request per pair. No new cap was added. A note-only cap would reject a quiet send that a real send would store. The existing guess limits (8 per friend key and 24 per IP hash per 60 minutes) already bound how fast new notes are written. The 50-friend cap and the 100-round cap do not apply to sends. Notes are not given a separate KV bound, because real `fr:req:` rows do not have one either. A new friend key resets the 8-guess limit and can write more notes, the same way it can write more real requests.
 
 ### accept
@@ -213,7 +213,33 @@ Only the recipient of a pending request can accept. That creates the friendship.
 
 `200` `{ "status": "friends", "ownerId": "<the requester>" }`
 
-No pending request: `409` `{ "error": "not_friends" }`. The caller already blocked that person: `409` `{ "error": "blocked" }`. The caller is the one who was blocked: the same `not_friends` response as when there was never a request. No `blocked` signal. A pending request stays until the recipient accepts, declines, or blocks, or the sender cancels. The first accept of a single-use code wins. A later accept of another pending request on that code is `409` `{ "error": "not_friends" }` and writes no friend row.
+No pending request: `409` `{ "error": "not_friends" }`. The caller already blocked that person: `409` `{ "error": "blocked" }`. The caller is the one who was blocked: the same `not_friends` response as when there was never a request. No `blocked` signal. A pending request stays until the recipient accepts, declines, or blocks, or the sender cancels, or the same pair becomes friends through link accept. The first accept of a single-use code wins. A later accept of another pending request on that code is `409` `{ "error": "not_friends" }` and writes no friend row. This route is unchanged for older builds: it still requires the pending row, and it still does not accept a code.
+
+### link accept
+
+`POST /v1/friends/codes/accept`
+
+```json
+{ "code": "AB3K7NP2" }
+```
+
+The person who was sent the invite link calls this. Brian, Oct 24, 2026, 3:26 PM CT: both people are added to each other's friends lists in this one call. The code owner does not approve a second time. There is no push.
+
+`200` `{ "status": "friends", "ownerId": "<the code owner>" }`
+
+The code owner's next `GET /v1/friends/list` includes the new friend. Their next `GET /v1/friends/requests` does not grow a pending row for this pair. Nothing in either response names a push or a notice.
+
+The call spends the code the same way as the owner's accept: one compare-and-set in `FriendGuessLimiter`, after the friend cap, and only when both friend rows will be written. Two phones accepting the same new code at once produce one success and one pair of `fr:friend:` rows. The other call is `404` `{ "error": "code_not_found" }`. A legacy code, with no `fr:invat:` row, is not redeemed, so more than one person can still accept it until the deploy clock.
+
+The caller's own code is `400` `{ "error": "invalid_body" }`. That check is made before the guess limiter and does not consume a guess. Already friends is `200` `{ "status": "friends", "ownerId", "already": "friends" }`, including after the code is used or past its clock. A used code, an expired code, a legacy code past the clock, and a code that was never issued are `404` `{ "error": "code_not_found" }`. Each of those spends one guess.
+
+If the caller has blocked the code owner, and the code is still open and unused, the response is `409` `{ "error": "blocked" }` and no friend row is written. If the code owner has blocked the caller, the response is the same `404` `{ "error": "code_not_found" }` as a missing code. The body does not say `blocked`. No friend row is written and the code is not spent. That is the Oct 17 rule: a blocked pair does not become friends, and the person who was blocked is not told that a block is why.
+
+A sender held by Decline gets that same `404` on this route. The code is not spent, so someone else can still accept it. The body does not say declined.
+
+On success the Worker writes both `fr:friend:` rows and both `fr:friends:` lists, then deletes leftover `fr:req:` rows, `fr:rcode:` rows, and `fr:out:` notes in either direction for this pair. A request that was already stored is not left behind for the code owner to accept or decline.
+
+Either person already at 50 friends: `409` `{ "error": "friend_limit" }`. The code is not spent and no friend row is written.
 
 ### decline
 
@@ -488,7 +514,8 @@ ShotTraxx PR #533 `src/domain/friendsApi.ts` returns `FriendsApiResult` on every
 | `sendRequest({ code, name })` | `POST /v1/friends/requests` with `{ code }` only |
 | `listRequests()` | `GET /v1/friends/requests` → `{ incoming, outgoing }`. Not in the cited phone draft. The client should add it. |
 | `listFriends()` | `GET /v1/friends/list` → `{ friends }`. Not in the cited phone draft. The client should add it. |
-| `accept({ id, name })` | `POST /v1/friends/requests/accept` with `{ ownerId }` only |
+| `accept({ id, name })` | `POST /v1/friends/requests/accept` with `{ ownerId }` only. Older builds. The code owner accepts a pending request. |
+| link accept | `POST /v1/friends/codes/accept` with `{ code }` only. Not in the phone draft. The invited person taps Accept. `200` `{ "status": "friends", "ownerId" }`. |
 | decline | `POST /v1/friends/requests/decline` with `{ ownerId }` only. Not in the phone draft. |
 | `remove(id)` | `POST /v1/friends/remove` with `{ ownerId }` |
 | `block(id)` | `POST /v1/friends/block` with `{ ownerId }` |
@@ -498,4 +525,4 @@ ShotTraxx PR #533 `src/domain/friendsApi.ts` returns `FriendsApiResult` on every
 
 `off` is the phone switch. No request is sent. `todo` is a call the phone has not finished, or a server that is not ready: `unknown_route`, `boards_not_configured`, `guess_limiter_not_configured`. `refused` is every other error: `friend_key_required`, `invalid_body`, `payload_too_large`, `method_not_allowed`, `code_not_found`, `not_friends`, `friend_limit`, `round_limit`, `rate_limited`, `blocked`, and `practice_or_test`.
 
-`blocked` is returned only to the person who blocked, and the phone maps it to `refused`, the same reason it uses for `code_not_found` and `not_friends`. The blocked person never receives `blocked`. Their `sendRequest` is the normal `200` pending body, and their `accept` is `not_friends`. That is a success or a `refused`, not a block.
+`blocked` is returned only to the person who blocked, and the phone maps it to `refused`, the same reason it uses for `code_not_found` and `not_friends`. The blocked person never receives `blocked`. Their `sendRequest` is the normal `200` pending body, and their `accept` is `not_friends`. Their link accept is the same `404` `{ "error": "code_not_found" }` as a missing code. That is a success or a `refused`, not a block.

@@ -688,6 +688,27 @@ describe("single-use invites", () => {
     expect(kv.has(`fr:friend:${owner.ownerId}:${carol.ownerId}`)).toBe(true);
   });
 
+  it("counts a used, expired, or unknown link accept toward the 8-guess limit", async () => {
+    env.FRIEND_NOW_MS = 1_800_000_000_000;
+    const owner = await mint("guess-link-owner");
+    const pal = await mint("guess-link-pal");
+    const usedKey = await mint("guess-link-used");
+    const missKey = await mint("guess-link-miss");
+    expect((await acceptLink(pal, owner)).status).toBe(200);
+    env.FRIEND_NOW_MS = 1_800_000_000_000 + 60_000;
+    const used = await acceptLink(usedKey, owner);
+    const miss = await acceptLink(missKey, "23456789");
+    expect(used.status).toBe(miss.status);
+    expect(used.text).toBe(miss.text);
+    expect(used.json).toEqual(NOT_AVAILABLE);
+    for (let i = 1; i < FRIEND_CODE_GUESS_LIMIT; i += 1) {
+      expect((await acceptLink(missKey, "23456789")).status).toBe(404);
+    }
+    const limited = await acceptLink(missKey, "23456789");
+    expect(limited.status).toBe(429);
+    expect(limited.json).toEqual({ error: "rate_limited" });
+  });
+
   it("rejects the caller's own code before spending a guess", async () => {
     const owner = await mint("own-link-owner");
     for (let i = 0; i < FRIEND_CODE_GUESS_LIMIT; i += 1) {

@@ -6,8 +6,9 @@
  * listFriends use that same class, with their own per-key and per-IP names,
  * and they do not write KV.
  *
- * Served here: getCode, resetCode, code lookup, sendRequest, accept, decline,
- * block, unblock, remove, publishRound, fetchRounds, listRequests, and listFriends.
+ * Served here: getCode, resetCode, code lookup, sendRequest, accept, link accept,
+ * decline, block, unblock, remove, publishRound, fetchRounds, listRequests,
+ * and listFriends.
  * Block is quiet for the blocked person. Unblock deletes only the caller's
  * block. Block requires a friendship and stores the block row before it
  * deletes that friendship. Remove and block delete only the caller's shared
@@ -297,6 +298,7 @@ const FRIEND_ROUTES = {
   "/v1/friends/live": { PUT: putLive, GET: fetchLive },
   "/v1/friends/live/stop": { POST: stopLive },
   "/v1/friends/codes/lookup": { POST: lookupCode },
+  "/v1/friends/codes/accept": { POST: acceptInvite },
   "/v1/friends/requests": { POST: sendRequest, GET: listRequests },
   "/v1/friends/list": { GET: listFriends },
   "/v1/friends/requests/accept": { POST: acceptRequest },
@@ -716,22 +718,89 @@ async function acceptRequest(request, env, cors) {
       if (!won) return friendJson(409, { error: "not_friends" }, cors);
     }
   }
-  await friendPut(boards, friendKvKey("friend", `${caller.ownerId}:${ownerId}`), "1");
-  await friendPut(boards, friendKvKey("friend", `${ownerId}:${caller.ownerId}`), "1");
-  await saveFriendIds(boards, caller.ownerId, addFriendId(callerIds, ownerId));
-  await saveFriendIds(boards, ownerId, addFriendId(otherIds, caller.ownerId));
-  // Drop a leftover sender note before the request row. A retry can still
-  // see fr:req: if this delete fails. The note is not read and not accepted.
-  await deleteOutgoingNote(boards, ownerId, caller.ownerId);
-  // Both people may have sent a request (each opened the other's link). Drop the
-  // caller's own request to the other side too, so the new friend never sees a
-  // stale incoming row whose Decline (remove) would end the friendship and delete
-  // their shared rounds.
-  await deleteIfPresent(boards, requestKey(ownerId, caller.ownerId));
-  await deleteIfPresent(boards, rcodeKey(caller.ownerId, ownerId));
-  await deleteIfPresent(boards, rcodeKey(ownerId, caller.ownerId));
-  await friendDelete(boards, reqKey);
+  await commitFriendship(boards, caller.ownerId, ownerId, callerIds, otherIds);
   return friendJson(200, { status: "friends", ownerId }, cors);
+}
+
+/**
+ * The person who opened the invite link becomes friends with the code owner
+ * in this call. No pending request and no second approval. The code is spent
+ * here, once, for a new code. Old apps still use sendRequest plus acceptRequest.
+ */
+async function acceptInvite(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const parsed = await readJsonObject(request, FRIEND_BODY_LIMIT, false);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (unknownFields(parsed.value, ["code"])) return friendJson(400, { error: "invalid_body" }, cors);
+  const code = normalizeFriendCode(parsed.value.code);
+  if (!code) return friendJson(400, { error: "invalid_body" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  // Own code is rejected before the limiter and does not consume a guess.
+  if (caller.code === code) return friendJson(400, { error: "invalid_body" }, cors);
+  if (!guessNamespace(env)) return friendJson(503, { error: "guess_limiter_not_configured" }, cors);
+  const limited = await consumeGuess(request, env, friendKey, cors);
+  if (limited) return limited;
+  const ownerId = await friendGet(boards, friendKvKey("code", code));
+  if (typeof ownerId !== "string" || ownerId.length === 0) {
+    return friendJson(404, { error: "code_not_found" }, cors);
+  }
+  const now = friendNow(env);
+  const createdAt = await readCreatedAt(boards, code);
+  const open = inviteOpen(createdAt, now);
+  const state = await inviteState(env, code, caller.ownerId, now);
+  if (!state) return friendJson(503, { error: "guess_limiter_not_configured" }, cors);
+  const used = createdAt != null && state.used === true;
+  const held = declineHoldsSender(env) && state.held === true;
+  if (await hasBlock(boards, caller.ownerId, ownerId)) {
+    // They already blocked the code owner. They know. A closed code matches a miss.
+    if (open && !used) return friendJson(409, { error: "blocked" }, cors);
+  } else if (await hasBlock(boards, ownerId, caller.ownerId)) {
+    // The code owner blocked them. Same public answer as a missing code.
+    // Do not redeem, and do not write a friend row.
+    return friendJson(404, { error: "code_not_found" }, cors);
+  }
+  if (await areFriends(boards, caller.ownerId, ownerId)) {
+    await deleteOutgoingNote(boards, caller.ownerId, ownerId);
+    return friendJson(200, { status: "friends", ownerId, already: "friends" }, cors);
+  }
+  // A decline hold, a closed clock, and an already-used code are one answer.
+  if (held || !open || used) return friendJson(404, { error: "code_not_found" }, cors);
+  const callerIds = await loadFriendIds(boards, caller.ownerId);
+  const ownerIds = await loadFriendIds(boards, ownerId);
+  if (friendListWouldExceed(callerIds, ownerId) || friendListWouldExceed(ownerIds, caller.ownerId)) {
+    return friendJson(409, { error: "friend_limit" }, cors);
+  }
+  // Legacy codes (no fr:invat) stay reusable until the deploy clock. New codes redeem once.
+  if (createdAt != null) {
+    const won = await redeemInvite(env, code);
+    if (!won) return friendJson(404, { error: "code_not_found" }, cors);
+  }
+  await commitFriendship(boards, ownerId, caller.ownerId, ownerIds, callerIds);
+  return friendJson(200, { status: "friends", ownerId }, cors);
+}
+
+/**
+ * Both friend rows, both friend lists, and any leftover request between this pair.
+ * recipientId is the code owner on a link accept, and the person who had the
+ * pending request on the old accept path. requesterId is the other person.
+ */
+async function commitFriendship(boards, recipientId, requesterId, recipientIds, requesterIds) {
+  await friendPut(boards, friendKvKey("friend", `${recipientId}:${requesterId}`), "1");
+  await friendPut(boards, friendKvKey("friend", `${requesterId}:${recipientId}`), "1");
+  await saveFriendIds(boards, recipientId, addFriendId(recipientIds, requesterId));
+  await saveFriendIds(boards, requesterId, addFriendId(requesterIds, recipientId));
+  // Drop leftover sender notes before the request rows. A retry can still
+  // see fr:req: if a delete fails. The notes are not read and not accepted.
+  await deleteOutgoingNote(boards, requesterId, recipientId);
+  await deleteOutgoingNote(boards, recipientId, requesterId);
+  await deleteIfPresent(boards, requestKey(requesterId, recipientId));
+  await deleteIfPresent(boards, rcodeKey(recipientId, requesterId));
+  await deleteIfPresent(boards, rcodeKey(requesterId, recipientId));
+  await friendDelete(boards, requestKey(recipientId, requesterId));
 }
 
 /**

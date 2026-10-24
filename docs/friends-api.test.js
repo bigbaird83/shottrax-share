@@ -14,6 +14,7 @@ const FRIEND_CODE_CALLS = [
   ["POST", "/v1/friends/code"],
   ["POST", "/v1/friends/code/reset"],
   ["POST", "/v1/friends/codes/lookup"],
+  ["POST", "/v1/friends/codes/accept"],
   ["POST", "/v1/friends/requests"],
   ["POST", "/v1/friends/requests/accept"],
   ["POST", "/v1/friends/requests/decline"],
