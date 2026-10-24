@@ -1692,11 +1692,12 @@ describe('golf proxy worker', { concurrency: 1 }, () => {
       }
       const blobs = fake.terrain.puts.filter((put) => put.key.startsWith('terrain:v1:'));
       const samples = fake.terrain.puts.filter((put) => put.key.startsWith('terrain:samples:'));
+      const day = new Date().toISOString().slice(0, 10);
       assert.equal(blobs.length, 54);
       for (const put of blobs) assertForever(put);
-      assert.equal(samples.length, 54);
-      for (const put of samples) assert.deepEqual(put.options, { expirationTtl: 172800 });
-      assert.equal(fake.terrain.puts.length, blobs.length + samples.length);
+      assert.equal(samples.length, 0);
+      assert.equal(fake.counter.sql.map.get(`terrain:samples:id_terrain:${day}`), '54');
+      assert.equal(fake.terrain.puts.length, blobs.length);
       assert.equal(fake.kv.puts.filter((put) => put.key.startsWith('terrain:')).length, 0);
       assert.ok(golfWrites + fake.terrain.puts.length < 1000);
       const blocked = await proxy(`/terrain/v1/extra/1?${terrainQuery()}`, env, usHeaders('id_terrain'));
@@ -2316,25 +2317,9 @@ describe('terrain route', { concurrency: 1 }, () => {
     }
   });
 
-  test('the per-install terrain sample counter put uses a 48h expirationTtl', async () => {
-    function assertSampleTtl(options) {
-      assert.deepEqual(options, { expirationTtl: 172800 });
-    }
-    // A missing TTL, a wrong TTL, or any extra option must fail. 172800 is the only pass.
-    for (const bad of [
-      undefined,
-      null,
-      {},
-      { expirationTtl: 86400 },
-      { expirationTtl: 172801 },
-      { expirationTtl: 172800, expiration: 1 },
-    ]) {
-      assert.throws(() => assertSampleTtl(bad));
-    }
-    assert.doesNotThrow(() => assertSampleTtl({ expirationTtl: 172800 }));
-
+  test('a bound TERRAIN_KV stores the grid blob and not the sample count', async () => {
     const fake = installFakes();
-    fake.counter = new FakeCounterNamespace({ TERRAIN_KV: fake.terrain });
+    fake.counter = new FakeCounterNamespace({ TERRAIN_KV: fake.terrain, GOLFAPI_KV: fake.kv });
     try {
       usgsMock(fake);
       const env = baseEnv(fake, { TERRAIN_INSTALL_DAILY_CAP: '1' });
@@ -2342,26 +2327,22 @@ describe('terrain route', { concurrency: 1 }, () => {
       const sampleKey = `terrain:samples:id_ttl:${day}`;
       const first = await proxy(`/terrain/v1/pebble/1?${terrainQuery()}`, env, usHeaders('id_ttl'));
       assert.equal(first.status, 200);
-      const samplePuts = () => fake.terrain.puts.filter((put) => put.key.startsWith('terrain:samples:'));
-      const written = samplePuts();
-      assert.equal(written.length, 1);
-      assert.equal(written[0].key, sampleKey);
-      assert.equal(written[0].value, '1');
-      assertSampleTtl(written[0].options);
+      assert.equal(fake.counter.sql.map.get(sampleKey), '1');
+      assert.equal(fake.terrain.puts.some((put) => put.key.startsWith('terrain:samples:')), false);
+      assert.equal(fake.kv.puts.some((put) => put.key.startsWith('terrain:samples:')), false);
       const blobs = fake.terrain.puts.filter((put) => put.key.startsWith('terrain:v1:'));
       assert.equal(blobs.length, 1);
       assert.equal(blobs[0].options, null);
+      assert.equal(fake.kv.puts.some((put) => put.key.startsWith('terrain:v1:')), false);
 
       const blocked = await proxy(`/terrain/v1/pebble/2?${terrainQuery()}`, env, usHeaders('id_ttl'));
       assert.equal(blocked.status, 429);
-      assert.equal((await bodyOf(blocked)).error, 'terrain_limited');
-      assert.equal(samplePuts().length, 1);
+      assert.equal(fake.counter.sql.map.get(sampleKey), '1');
 
-      const kvKey = `terrain:samples:id_kv:${day}`;
-      fake.terrain.store.set(kvKey, { value: '1', options: { expirationTtl: 172800 } });
-      fake.counter.sql.map.set(kvKey, '0');
-      const preferKv = await proxy(`/terrain/v1/pebble/8?${terrainQuery()}`, env, usHeaders('id_kv'));
-      assert.equal(preferKv.status, 429);
+      fake.terrain.store.set(sampleKey, { value: '0', options: null });
+      const stillBlocked = await proxy(`/terrain/v1/pebble/8?${terrainQuery()}`, env, usHeaders('id_ttl'));
+      assert.equal(stillBlocked.status, 429);
+      assert.equal(fake.counter.sql.map.get(sampleKey), '1');
 
       fake.terrain.puts.length = 0;
       globalThis.fetch = async () => {
@@ -2369,12 +2350,8 @@ describe('terrain route', { concurrency: 1 }, () => {
       };
       const failed = await proxy(`/terrain/v1/pebble/3?${terrainQuery()}`, env, usHeaders('id_abort'));
       assert.equal(failed.status, 502);
-      const abortPuts = samplePuts();
-      assert.deepEqual(abortPuts.map((put) => put.value), ['1', '0']);
-      for (const put of abortPuts) {
-        assert.equal(put.key, `terrain:samples:id_abort:${day}`);
-        assertSampleTtl(put.options);
-      }
+      assert.equal(fake.counter.sql.map.get(`terrain:samples:id_abort:${day}`), '0');
+      assert.equal(fake.terrain.puts.some((put) => put.key.startsWith('terrain:samples:')), false);
       assert.equal(fake.terrain.puts.some((put) => put.key.startsWith('terrain:v1:')), false);
     } finally {
       fake.restore();
@@ -2572,7 +2549,7 @@ describe('terrain route', { concurrency: 1 }, () => {
     assertDeletionAlarm(storage.alarmAt, dayStart);
   });
 
-  test('sample counters use GOLFAPI_KV when TERRAIN_KV is unset', async () => {
+  test('GOLFAPI_KV stores the grid blob and not the sample count', async () => {
     const fake = installFakes();
     fake.counter = new FakeCounterNamespace({ GOLFAPI_KV: fake.kv });
     try {
@@ -2581,11 +2558,10 @@ describe('terrain route', { concurrency: 1 }, () => {
       const day = new Date().toISOString().slice(0, 10);
       const response = await proxy(`/terrain/v1/pebble/1?${terrainQuery()}`, env, usHeaders('id_fallback'));
       assert.equal(response.status, 200);
+      assert.equal(fake.counter.sql.map.get(`terrain:samples:id_fallback:${day}`), '1');
       const samples = fake.kv.puts.filter((put) => put.key.startsWith('terrain:samples:'));
       const blobs = fake.kv.puts.filter((put) => put.key.startsWith('terrain:v1:'));
-      assert.equal(samples.length, 1);
-      assert.equal(samples[0].key, `terrain:samples:id_fallback:${day}`);
-      assert.deepEqual(samples[0].options, { expirationTtl: 172800 });
+      assert.equal(samples.length, 0);
       assert.equal(blobs.length, 1);
       assert.equal(blobs[0].options, null);
       assert.equal(fake.terrain.puts.length, 0);
@@ -2716,22 +2692,19 @@ describe('terrain route', { concurrency: 1 }, () => {
     }
   });
 
-  test('a sample write sets a 49h alarm that sweeps with no further requests', async () => {
-    function assertAlarmDelay(ms) {
-      assert.equal(ms, 49 * 60 * 60 * 1000);
-    }
-    assert.throws(() => assertAlarmDelay(48 * 60 * 60 * 1000));
-    assert.throws(() => assertAlarmDelay(48 * 60 * 60 * 1000 + 1));
-    assert.throws(() => assertAlarmDelay(0));
-    assert.throws(() => assertAlarmDelay(49 * 60 * 60 * 1000 - 1));
-    assert.throws(() => assertAlarmDelay(50 * 60 * 60 * 1000));
-    assert.doesNotThrow(() => assertAlarmDelay(49 * 60 * 60 * 1000));
-
+  test('a sample alarm deletes a row past 48h with no further requests', async () => {
     const source = readFileSync(new URL('./golf-proxy.js', import.meta.url), 'utf8');
     const handlers = source.match(/^\s*(?:async\s+)?alarm\s*\(/gm) || [];
     assert.equal(handlers.length, 1);
+    const begin = source.slice(source.indexOf('terrainBegin(body)'), source.indexOf('terrainFinish(body)'));
+    assert.match(begin, /this\.num\(body\.sampleKey\)/);
+    assert.match(begin, /this\.add\(body\.sampleKey, 1\)/);
+    assert.equal(begin.includes('kv.put'), false);
+    assert.equal(begin.includes('readSample'), false);
+    assert.equal(begin.includes('writeSample'), false);
 
     const sql = new MemorySql();
+    const kv = new FakeKV();
     const storage = {
       sql,
       alarmAt: 12345,
@@ -2744,52 +2717,35 @@ describe('terrain route', { concurrency: 1 }, () => {
         this.alarmAt = at;
       },
     };
-    const ctx = {
+    const counter = new GolfapiCounter({
       storage,
       blockConcurrencyWhile(fn) {
         return fn();
       },
-    };
-    const counter = new GolfapiCounter(ctx);
+    }, { GOLFAPI_KV: kv, TERRAIN_KV: kv });
     const hour = 60 * 60 * 1000;
-    const delay = 49 * hour;
-
-    await counter.writeSample('terrain:samples:id_alarm:2026-10-24', 2);
+    const keptKey = 'terrain:samples:id_alarm:2026-10-24';
+    const begun = await counter.terrainBegin({
+      lockKey: 'lock-keep',
+      now: Date.parse('2026-10-24T12:00:00.000Z'),
+      ttlSec: 120,
+      sampleKey: keptKey,
+      cap: 54,
+      exempt: false,
+    });
+    assert.equal(begun.counted, true);
     assert.equal(storage.setAlarmCalls, 0);
     assert.equal(storage.alarmAt, 12345);
-    assert.equal(sql.map.get('terrain:samples:id_alarm:2026-10-24'), '2');
-
-    storage.alarmAt = null;
-    const before = Date.now();
-    await counter.writeSample('terrain:samples:id_alarm:2026-10-24', 3);
-    const after = Date.now();
-    assert.equal(storage.setAlarmCalls, 1);
-    assert.equal(sql.map.get('terrain:samples:id_alarm:2026-10-24'), '3');
-    assert.equal(storage.alarmAt >= before + delay, true);
-    assert.equal(storage.alarmAt <= after + delay, true);
-    assertAlarmDelay(delay);
-
-    const kv = new FakeKV();
-    const kvCounter = new GolfapiCounter(ctx, { TERRAIN_KV: kv });
-    storage.alarmAt = 12345;
-    storage.setAlarmCalls = 0;
-    await kvCounter.writeSample('terrain:samples:id_kv:2026-10-24', 1);
-    assert.equal(storage.setAlarmCalls, 0);
-    assert.equal(storage.alarmAt, 12345);
-    assert.deepEqual(kv.puts[0].options, { expirationTtl: 172800 });
-    storage.alarmAt = null;
-    const kvBefore = Date.now();
-    await kvCounter.writeSample('terrain:samples:id_kv:2026-10-24', 4);
-    const kvAfter = Date.now();
-    assert.equal(storage.setAlarmCalls, 1);
-    assert.equal(storage.alarmAt >= kvBefore + delay, true);
-    assert.equal(storage.alarmAt <= kvAfter + delay, true);
+    assert.equal(sql.map.get(keptKey), '1');
+    assert.equal(kv.puts.length, 0);
 
     const now = Date.now();
     const today = new Date(now).toISOString().slice(0, 10);
     const old = new Date(now - 3 * 24 * hour).toISOString().slice(0, 10);
-    const oldKey = `terrain:samples:id_alarm:${old}`;
-    const todayKey = `terrain:samples:id_alarm:${today}`;
+    const oldKey = `terrain:samples:id_fired:${old}`;
+    const todayKey = `terrain:samples:id_fired:${today}`;
+    const due = Date.parse(`${today}T00:00:00.000Z`) + 172800 * 1000 + 1;
+    sql.map.delete(keptKey);
     sql.map.set(oldKey, '9');
     sql.map.set(todayKey, '2');
     sql.map.set('golfapi:known:keep', 'stay');
@@ -2800,8 +2756,7 @@ describe('terrain route', { concurrency: 1 }, () => {
     assert.equal(sql.map.get(todayKey), '2');
     assert.equal(sql.map.get('golfapi:known:keep'), 'stay');
     assert.equal(storage.setAlarmCalls, 1);
-    assert.equal(storage.alarmAt >= now + delay, true);
-    assert.equal(storage.alarmAt < now + delay + 5000, true);
+    assert.equal(storage.alarmAt, due);
 
     sql.map.clear();
     sql.map.set(oldKey, '9');
@@ -2811,14 +2766,6 @@ describe('terrain route', { concurrency: 1 }, () => {
     assert.equal(sql.map.has(oldKey), false);
     assert.equal(storage.setAlarmCalls, 0);
     assert.equal(storage.alarmAt, null);
-
-    sql.map.clear();
-    sql.map.set('terrain:samples:id_alarm:not-a-day', '1');
-    storage.alarmAt = null;
-    storage.setAlarmCalls = 0;
-    await counter.alarm();
-    assert.equal(sql.map.get('terrain:samples:id_alarm:not-a-day'), '1');
-    assert.equal(storage.setAlarmCalls, 1);
   });
 
   test('cleanup drops stored sample counters whose day is more than 48h old', async () => {
