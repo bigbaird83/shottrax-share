@@ -95,10 +95,21 @@
  * Durable Object `GolfapiCounter` (binding GOLFAPI_COUNTER) is SQLite-backed
  * so it runs on the Workers Paid plan. It holds the per-phone pull count,
  * the per-phone search count, the per-phone credit backstop, the app-daily
- * and app-monthly counters, the per-call open charge, the terrain per-phone
- * sample count, the terrain sampler lock, the billing-cycle start balance,
- * the usage-alert sent flags, the last 200 US course ids per field-build
- * phone, and the demand log. Those do not write KV.
+ * and app-monthly counters, the per-call open charge, the terrain sampler
+ * lock, the billing-cycle start balance, the usage-alert sent flags, the
+ * last 200 US course ids per field-build phone, and the demand log. Those
+ * do not write KV.
+ * The terrain per-phone sample count stays in that SQLite table, key
+ * `terrain:samples:{install}:{utc-day}`, updated with num/add/put. The
+ * 54/day cap is unchanged. The count is not written to KV. An indexed range
+ * deletes rows whose UTC day started more than 48 hours ago, including rows
+ * already stored and rows whose day cannot be parsed. A request runs that
+ * sweep at most once an hour, and the first request after deploy still
+ * sweeps. Writing a sample sets a Durable Object alarm for the earliest
+ * row's UTC midnight plus 48 hours plus 1ms, the first instant that row is
+ * older than 48 hours. An alarm already set at or before that time is left
+ * alone. A later alarm is moved up. The alarm re-arms to the next dated
+ * row while one remains.
  * The monthly counter uses the golfapi billing cycle (GOLFAPI_CYCLE_DAY,
  * default the 5th, through the 4th), the same cycle as the alert flags.
  * golfapi bills 0.1 for a name search and 1 for a course or coordinates pull.
@@ -123,8 +134,9 @@
  * from ctx.waitUntil and never fails the golfer's request.
  *
  * KV: GOLFAPI_KV (permanent bodies, an opened course id, gq:balance).
- * TERRAIN_KV (finished terrain blobs only).
- * TERRAIN_KV falls back to GOLFAPI_KV.
+ * TERRAIN_KV (finished terrain blobs with no TTL). TERRAIN_KV falls back
+ * to GOLFAPI_KV for those blobs. Terrain blobs are put with no expirationTtl.
+ * The per-install sample count is not a KV key.
  */
 
 import { handleStockpileAdmin, usStateCode } from './golf-stockpile.js';
@@ -178,6 +190,17 @@ const PHONE_US_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEMAND_LIMIT = 500;
 const DEMAND_REASONS = new Set(['non_us', 'phone_limit', 'app_cap', 'no_data']);
 const DEFAULT_TERRAIN_DAILY = 54;
+/** Per-install terrain sample counter. 48 hours, in seconds. */
+export const TERRAIN_SAMPLE_TTL_SEC = 172800;
+export const TERRAIN_SAMPLE_PREFIX = 'terrain:samples:';
+/** Exclusive end of the `terrain:samples:` primary-key range. `;` is the code point after `:`. */
+const TERRAIN_SAMPLE_RANGE_END = 'terrain:samples;';
+/** Request-path backup. The alarm is what deletes rows when traffic stops. */
+const TERRAIN_SAMPLE_SWEEP_MS = 60 * 60 * 1000;
+/** First millisecond at which `now - dayStart > 48h` is true. */
+const TERRAIN_SAMPLE_ALARM_SLACK_MS = 1;
+/** Outside the sample range, so the sweep does not delete its own stamp. */
+const TERRAIN_SAMPLE_SWEEP_KEY = 'golfapi:terrain-sample-sweep';
 /** Same key the live Worker uses for the last-seen golfapi balance. */
 const GOLFAPI_BALANCE_KEY = 'gq:balance';
 const DEFAULT_LOCK_TTL_SEC = 120;
@@ -1605,7 +1628,7 @@ async function handleTerrain(request, url, env) {
 
   const exempt = installIsExempt(request, env);
   const day = utcDay(new Date());
-  const sampleKey = `terrain:samples:${install}:${day}`;
+  const sampleKey = `${TERRAIN_SAMPLE_PREFIX}${install}:${day}`;
   const waitMs = intEnv(env, 'TERRAIN_LOCK_WAIT_MS', DEFAULT_LOCK_WAIT_MS);
   if (terrainInflight.has(lockKey)) {
     const ready = await waitForTerrainBlob(kv, blobKey, waitMs);
@@ -1745,15 +1768,112 @@ function sqlRows(result) {
   return [];
 }
 
+const TERRAIN_SAMPLE_DAY = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+/** UTC midnight for the day stamped on a terrain sample counter, or null. */
+export function terrainSampleDayStart(key) {
+  if (typeof key !== 'string' || !key.startsWith(TERRAIN_SAMPLE_PREFIX)) return null;
+  const day = key.slice(key.lastIndexOf(':') + 1);
+  const match = TERRAIN_SAMPLE_DAY.exec(day);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const date = Number(match[3]);
+  const start = Date.UTC(year, month - 1, date);
+  const check = new Date(start);
+  if (check.getUTCFullYear() !== year || check.getUTCMonth() !== month - 1 || check.getUTCDate() !== date) {
+    return null;
+  }
+  return start;
+}
+
+/**
+ * Lists `terrain:samples:` keys and deletes those whose UTC day started
+ * more than 48 hours ago. `apply` false (the default) deletes nothing.
+ * The result is counts only. It does not include key values.
+ *
+ * @param {{ list(query: { prefix: string, cursor?: string }): Promise<{ keys?: Array<{ name?: string, key?: string } | string>, list_complete?: boolean, cursor?: string }>, delete(key: string): Promise<unknown> }} store
+ * @param {{ now?: number, apply?: boolean }} [options]
+ */
+export async function cleanupTerrainSampleStore(store, options = {}) {
+  const now = typeof options.now === 'number' ? options.now : Date.now();
+  const apply = options.apply === true;
+  const names = [];
+  let cursor;
+  const seen = new Set();
+  for (;;) {
+    const page = await store.list({ prefix: TERRAIN_SAMPLE_PREFIX, cursor });
+    const keys = page && Array.isArray(page.keys) ? page.keys : [];
+    for (const entry of keys) {
+      const name = typeof entry === 'string' ? entry : entry && (entry.name || entry.key);
+      if (typeof name === 'string' && name.startsWith(TERRAIN_SAMPLE_PREFIX)) names.push(name);
+    }
+    const next = page && page.list_complete === false && page.cursor ? page.cursor : undefined;
+    if (!next || seen.has(next)) break;
+    seen.add(next);
+    cursor = next;
+  }
+  let expired = 0;
+  let kept = 0;
+  let unparsed = 0;
+  const doomed = [];
+  for (const name of names) {
+    const start = terrainSampleDayStart(name);
+    if (start == null) {
+      unparsed += 1;
+      continue;
+    }
+    if (now - start > TERRAIN_SAMPLE_TTL_SEC * 1000) {
+      expired += 1;
+      doomed.push(name);
+    } else kept += 1;
+  }
+  let deleted = 0;
+  if (apply) {
+    for (const name of doomed) {
+      await store.delete(name);
+      deleted += 1;
+    }
+  }
+  return {
+    prefix: TERRAIN_SAMPLE_PREFIX,
+    listed: names.length,
+    expired,
+    kept,
+    unparsed,
+    deleted,
+    dryRun: !apply,
+  };
+}
+
+/** Counts and the key prefix only. Never a full key. */
+export function formatTerrainSampleCleanup(summary) {
+  return [
+    `prefix=${summary.prefix}`,
+    `listed=${summary.listed}`,
+    `expired=${summary.expired}`,
+    `kept=${summary.kept}`,
+    `unparsed=${summary.unparsed}`,
+    `deleted=${summary.deleted}`,
+    `dryRun=${summary.dryRun}`,
+  ].join(' ');
+}
+
 /**
  * SQLite-backed counter for the Workers Paid plan. One global instance
  * serializes golfapi opens, terrain sampling, and usage-alert claims so
  * caps cannot overshoot and a threshold cannot send twice.
- * Nothing in this class writes KV.
+ * The terrain sample count is a SQLite key,
+ * `terrain:samples:{install}:{utc-day}`, via num/add/put. This class does
+ * not write that count to KV. Rows whose UTC day started more than 48 hours
+ * ago, and rows whose day cannot be parsed, are deleted by an indexed range
+ * at most once an hour from a request, and from the alarm set when a sample
+ * row is written.
  */
 export class GolfapiCounter {
-  constructor(ctx) {
+  constructor(ctx, env) {
     this.ctx = ctx;
+    this.env = env ?? null;
     this.sql = ctx.storage.sql;
     const setup = () => {
       this.sql.exec('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
@@ -2199,7 +2319,48 @@ export class GolfapiCounter {
     return { refunded: false };
   }
 
-  terrainBegin(body) {
+  listTerrainSampleKeys() {
+    const rows = sqlRows(this.sql.exec(
+      'SELECT key FROM state WHERE key >= ? AND key < ?',
+      TERRAIN_SAMPLE_PREFIX,
+      TERRAIN_SAMPLE_RANGE_END,
+    ));
+    const names = [];
+    for (const row of rows) {
+      if (row && typeof row.key === 'string') names.push(row.key);
+    }
+    return names;
+  }
+
+  /** UTC midnight + 48h + 1ms for the earliest dated sample row, or null. */
+  terrainSampleAlarmAt(keys) {
+    let earliest = null;
+    for (const key of keys) {
+      const start = terrainSampleDayStart(key);
+      if (start == null) continue;
+      const due = start + TERRAIN_SAMPLE_TTL_SEC * 1000 + TERRAIN_SAMPLE_ALARM_SLACK_MS;
+      if (earliest == null || due < earliest) earliest = due;
+    }
+    return earliest;
+  }
+
+  /**
+   * Schedules deletion of the earliest sample row.
+   * An alarm already at or before that time is left alone. A later alarm
+   * moves up. Nothing is scheduled from the constructor, and an unparsed
+   * row does not keep an alarm alive.
+   */
+  async armTerrainSampleAlarm() {
+    const storage = this.ctx && this.ctx.storage;
+    if (!storage || typeof storage.getAlarm !== 'function' || typeof storage.setAlarm !== 'function') return;
+    const due = this.terrainSampleAlarmAt(this.listTerrainSampleKeys());
+    if (due == null) return;
+    const pending = await storage.getAlarm();
+    if (pending != null && pending <= due) return;
+    await storage.setAlarm(due);
+  }
+
+  async terrainBegin(body) {
     const raw = this.get(`terrain:lock:${body.lockKey}`);
     const existing = raw ? JSON.parse(raw) : null;
     if (existing && typeof existing.at === 'number' && body.now - existing.at < existing.ttl * 1000) {
@@ -2211,6 +2372,7 @@ export class GolfapiCounter {
       if (this.num(body.sampleKey) >= body.cap) return { ok: false, limited: true };
       this.add(body.sampleKey, 1);
       counted = true;
+      await this.armTerrainSampleAlarm();
     }
     this.put(`terrain:lock:${body.lockKey}`, JSON.stringify({ at: body.now, ttl: body.ttlSec }));
     return { ok: true, counted };
@@ -2221,10 +2383,73 @@ export class GolfapiCounter {
     return { ok: true };
   }
 
-  terrainAbort(body) {
+  async terrainAbort(body) {
     this.del(`terrain:lock:${body.lockKey}`);
-    if (body.counted) this.add(body.sampleKey, -1);
+    if (body.counted) {
+      this.add(body.sampleKey, -1);
+      await this.armTerrainSampleAlarm();
+    }
     return { ok: true };
+  }
+
+  /**
+   * Deletes SQLite sample counters whose UTC day started more than 48h ago.
+   * The primary key is `key`, so the range `terrain:samples:` inclusive to
+   * `terrain:samples;` exclusive is an index scan. fetch() runs this at most
+   * once an hour. alarm() runs it with no further requests. The manual op
+   * still honors apply:false and is not throttled. Returns counts only.
+   */
+  async cleanupTerrainSamples(body) {
+    const now = body && typeof body.now === 'number' ? body.now : Date.now();
+    const apply = Boolean(body && body.apply === true);
+    const names = this.listTerrainSampleKeys();
+    const store = {
+      async list() {
+        return { keys: names.map((name) => ({ name })), list_complete: true };
+      },
+      delete: async (key) => {
+        this.del(key);
+      },
+    };
+    const summary = await cleanupTerrainSampleStore(store, { now, apply });
+    if (apply) {
+      for (const name of names) {
+        if (terrainSampleDayStart(name) != null) continue;
+        this.del(name);
+        summary.deleted += 1;
+      }
+    }
+    return summary;
+  }
+
+  /**
+   * Request-path backup for the alarm. Skips when this isolate or SQLite
+   * already swept within the hour. No stamp yet means sweep, including the
+   * first request after deploy.
+   */
+  async maybeSweepTerrainSamples(now) {
+    if (this.terrainSampleSweepAt != null && now - this.terrainSampleSweepAt < TERRAIN_SAMPLE_SWEEP_MS) return;
+    const stored = Number(this.get(TERRAIN_SAMPLE_SWEEP_KEY));
+    if (Number.isFinite(stored) && stored > 0 && now - stored < TERRAIN_SAMPLE_SWEEP_MS) {
+      this.terrainSampleSweepAt = stored;
+      return;
+    }
+    await this.cleanupTerrainSamples({ now, apply: true });
+    this.terrainSampleSweepAt = now;
+    this.put(TERRAIN_SAMPLE_SWEEP_KEY, String(now));
+  }
+
+  /**
+   * GolfapiCounter had no alarm handler. This is that handler: sweep sample
+   * rows, then arm the next alarm only while sample rows remain. The runtime
+   * clears a due alarm before calling this, so arming does not replace it.
+   */
+  async alarm() {
+    const now = Date.now();
+    await this.cleanupTerrainSamples({ now, apply: true });
+    this.terrainSampleSweepAt = now;
+    this.put(TERRAIN_SAMPLE_SWEEP_KEY, String(now));
+    await this.armTerrainSampleAlarm();
   }
 
   stockpileLock(body) {
@@ -2311,6 +2536,10 @@ export class GolfapiCounter {
 
   async fetch(request) {
     const body = await request.json();
+    if (body.op !== 'cleanupTerrainSamples') {
+      const now = Number.isFinite(body.now) ? body.now : Date.now();
+      await this.maybeSweepTerrainSamples(now);
+    }
     let result;
     if (body.op === 'reserve') result = this.reserve(body);
     else if (body.op === 'settle') result = this.settle(body);
@@ -2325,9 +2554,10 @@ export class GolfapiCounter {
     else if (body.op === 'noteCourses') result = this.noteCourses(body);
     else if (body.op === 'noteDemand') result = this.noteDemand(body);
     else if (body.op === 'readDemand') result = this.readDemand(body);
-    else if (body.op === 'terrainBegin') result = this.terrainBegin(body);
-    else if (body.op === 'terrainFinish') result = this.terrainFinish(body);
-    else if (body.op === 'terrainAbort') result = this.terrainAbort(body);
+    else if (body.op === 'terrainBegin') result = await this.terrainBegin(body);
+    else if (body.op === 'terrainFinish') result = await this.terrainFinish(body);
+    else if (body.op === 'terrainAbort') result = await this.terrainAbort(body);
+    else if (body.op === 'cleanupTerrainSamples') result = await this.cleanupTerrainSamples(body);
     else if (body.op === 'stockpileLock') result = this.stockpileLock(body);
     else if (body.op === 'stockpileUnlock') result = this.stockpileUnlock();
     else if (body.op === 'stockpileCharge') result = this.stockpileCharge(body);
