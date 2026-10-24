@@ -51,6 +51,10 @@ class MemorySql {
   exec(query, ...args) {
     const text = query.replace(/\s+/g, ' ').trim();
     if (text.startsWith('CREATE')) return [];
+    if (text.startsWith('SELECT key FROM state WHERE key LIKE')) {
+      const prefix = String(args[0] ?? '').replace(/%+$/, '');
+      return [...this.map.keys()].filter((key) => key.startsWith(prefix)).map((key) => ({ key }));
+    }
     if (text.startsWith('SELECT')) {
       const value = this.map.get(args[0]);
       return value == null ? [] : [{ value }];
@@ -1619,6 +1623,7 @@ describe('golf proxy worker', { concurrency: 1 }, () => {
 
   test('a 150-credit day plus 54 terrain samples stays under 1000 KV writes', async () => {
     const fake = installFakes();
+    fake.counter = new FakeCounterNamespace({ TERRAIN_KV: fake.terrain });
     try {
       globalThis.fetch = async (input) => {
         const url = String(input);
@@ -1679,10 +1684,14 @@ describe('golf proxy worker', { concurrency: 1 }, () => {
         assert.equal(response.status, 200, `sample ${n}`);
       }
       const blobs = fake.terrain.puts.filter((put) => put.key.startsWith('terrain:v1:'));
+      const samples = fake.terrain.puts.filter((put) => put.key.startsWith('terrain:samples:'));
       assert.equal(blobs.length, 54);
-      assert.equal(fake.terrain.puts.length, 54);
+      for (const put of blobs) assertForever(put);
+      assert.equal(samples.length, 54);
+      for (const put of samples) assert.deepEqual(put.options, { expirationTtl: 172800 });
+      assert.equal(fake.terrain.puts.length, blobs.length + samples.length);
       assert.equal(fake.kv.puts.filter((put) => put.key.startsWith('terrain:')).length, 0);
-      assert.ok(golfWrites + blobs.length < 1000);
+      assert.ok(golfWrites + fake.terrain.puts.length < 1000);
       const blocked = await proxy(`/terrain/v1/extra/1?${terrainQuery()}`, env, usHeaders('id_terrain'));
       assert.equal(blocked.status, 429);
     } finally {
@@ -2360,6 +2369,81 @@ describe('terrain route', { concurrency: 1 }, () => {
         assertSampleTtl(put.options);
       }
       assert.equal(fake.terrain.puts.some((put) => put.key.startsWith('terrain:v1:')), false);
+    } finally {
+      fake.restore();
+    }
+  });
+
+  test('a same-day SQLite sample count still enforces the cap when KV has no copy', async () => {
+    const fake = installFakes();
+    fake.counter = new FakeCounterNamespace({ TERRAIN_KV: fake.terrain });
+    try {
+      const day = new Date().toISOString().slice(0, 10);
+      const key = `terrain:samples:id_sql:${day}`;
+      fake.counter.sql.map.set(key, '1');
+      globalThis.fetch = async () => {
+        throw new Error('must not sample');
+      };
+      const env = baseEnv(fake, { TERRAIN_INSTALL_DAILY_CAP: '1' });
+      const blocked = await proxy(`/terrain/v1/pebble/9?${terrainQuery()}`, env, usHeaders('id_sql'));
+      assert.equal(blocked.status, 429);
+      assert.equal((await bodyOf(blocked)).error, 'terrain_limited');
+      assert.equal(fake.terrain.puts.some((put) => put.key.startsWith('terrain:samples:')), false);
+      assert.equal(fake.counter.sql.map.get(key), '1');
+    } finally {
+      fake.restore();
+    }
+  });
+
+  test('sample counters use GOLFAPI_KV when TERRAIN_KV is unset', async () => {
+    const fake = installFakes();
+    fake.counter = new FakeCounterNamespace({ GOLFAPI_KV: fake.kv });
+    try {
+      usgsMock(fake);
+      const env = baseEnv(fake, { TERRAIN_KV: undefined });
+      const day = new Date().toISOString().slice(0, 10);
+      const response = await proxy(`/terrain/v1/pebble/1?${terrainQuery()}`, env, usHeaders('id_fallback'));
+      assert.equal(response.status, 200);
+      const samples = fake.kv.puts.filter((put) => put.key.startsWith('terrain:samples:'));
+      const blobs = fake.kv.puts.filter((put) => put.key.startsWith('terrain:v1:'));
+      assert.equal(samples.length, 1);
+      assert.equal(samples[0].key, `terrain:samples:id_fallback:${day}`);
+      assert.deepEqual(samples[0].options, { expirationTtl: 172800 });
+      assert.equal(blobs.length, 1);
+      assert.equal(blobs[0].options, null);
+      assert.equal(fake.terrain.puts.length, 0);
+    } finally {
+      fake.restore();
+    }
+  });
+
+  test('cleanup drops stored sample counters whose day is more than 48h old', async () => {
+    const fake = installFakes();
+    try {
+      const now = Date.parse('2026-10-24T12:00:00.000Z');
+      const oldKey = 'terrain:samples:id_old:2026-10-22';
+      const todayKey = 'terrain:samples:id_today:2026-10-24';
+      const yesterdayKey = 'terrain:samples:id_y:2026-10-23';
+      const blob = 'terrain:v1:pebble:1:abc';
+      fake.counter.sql.map.set(oldKey, '4');
+      fake.counter.sql.map.set(todayKey, '2');
+      fake.counter.sql.map.set(yesterdayKey, '1');
+      fake.counter.sql.map.set(blob, '{}');
+      const dry = await counterOp(fake, { op: 'cleanupTerrainSamples', now, apply: false });
+      assert.equal(dry.dryRun, true);
+      assert.equal(dry.deleted, 0);
+      assert.equal(dry.expired, 1);
+      assert.equal(dry.listed, 3);
+      assert.equal(fake.counter.sql.map.has(oldKey), true);
+      assert.equal(JSON.stringify(dry).includes('id_old'), false);
+      const applied = await counterOp(fake, { op: 'cleanupTerrainSamples', now, apply: true });
+      assert.equal(applied.deleted, 1);
+      assert.equal(applied.dryRun, false);
+      assert.equal(fake.counter.sql.map.has(oldKey), false);
+      assert.equal(fake.counter.sql.map.get(todayKey), '2');
+      assert.equal(fake.counter.sql.map.get(yesterdayKey), '1');
+      assert.equal(fake.counter.sql.map.get(blob), '{}');
+      assert.equal(JSON.stringify(applied).includes('id_'), false);
     } finally {
       fake.restore();
     }

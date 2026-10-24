@@ -95,10 +95,15 @@
  * Durable Object `GolfapiCounter` (binding GOLFAPI_COUNTER) is SQLite-backed
  * so it runs on the Workers Paid plan. It holds the per-phone pull count,
  * the per-phone search count, the per-phone credit backstop, the app-daily
- * and app-monthly counters, the per-call open charge, the terrain per-phone
- * sample count, the terrain sampler lock, the billing-cycle start balance,
- * the usage-alert sent flags, the last 200 US course ids per field-build
- * phone, and the demand log. Those do not write KV.
+ * and app-monthly counters, the per-call open charge, the terrain sampler
+ * lock, the billing-cycle start balance, the usage-alert sent flags, the
+ * last 200 US course ids per field-build phone, and the demand log. Those
+ * do not write KV.
+ * The terrain per-phone sample count is the KV key
+ * `terrain:samples:{install}:{utc-day}`. Every write sets expirationTtl
+ * 172800 (48 hours). The 54/day cap is unchanged. A count already stored in
+ * SQLite with no expiry is still read for that same UTC day. Older days are
+ * removed only by the one-time cleanup, not by deploy.
  * The monthly counter uses the golfapi billing cycle (GOLFAPI_CYCLE_DAY,
  * default the 5th, through the 4th), the same cycle as the alert flags.
  * golfapi bills 0.1 for a name search and 1 for a course or coordinates pull.
@@ -122,9 +127,11 @@
  * Each threshold sends once per cycle. The send uses the ALERT_EMAIL binding
  * from ctx.waitUntil and never fails the golfer's request.
  *
- * KV: GOLFAPI_KV (permanent bodies, an opened course id, gq:balance).
- * TERRAIN_KV (finished terrain blobs only).
- * TERRAIN_KV falls back to GOLFAPI_KV.
+ * KV: GOLFAPI_KV (permanent bodies, an opened course id, gq:balance,
+ * and terrain sample counters when TERRAIN_KV is unset).
+ * TERRAIN_KV (finished terrain blobs with no TTL, and sample counters when
+ * that binding is set). TERRAIN_KV falls back to GOLFAPI_KV.
+ * Terrain blobs are put with no expirationTtl.
  */
 
 import { handleStockpileAdmin, usStateCode } from './golf-stockpile.js';
@@ -178,6 +185,9 @@ const PHONE_US_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEMAND_LIMIT = 500;
 const DEMAND_REASONS = new Set(['non_us', 'phone_limit', 'app_cap', 'no_data']);
 const DEFAULT_TERRAIN_DAILY = 54;
+/** Per-install terrain sample counter. 48 hours, in seconds. */
+export const TERRAIN_SAMPLE_TTL_SEC = 172800;
+export const TERRAIN_SAMPLE_PREFIX = 'terrain:samples:';
 /** Same key the live Worker uses for the last-seen golfapi balance. */
 const GOLFAPI_BALANCE_KEY = 'gq:balance';
 const DEFAULT_LOCK_TTL_SEC = 120;
@@ -1605,7 +1615,7 @@ async function handleTerrain(request, url, env) {
 
   const exempt = installIsExempt(request, env);
   const day = utcDay(new Date());
-  const sampleKey = `terrain:samples:${install}:${day}`;
+  const sampleKey = `${TERRAIN_SAMPLE_PREFIX}${install}:${day}`;
   const waitMs = intEnv(env, 'TERRAIN_LOCK_WAIT_MS', DEFAULT_LOCK_WAIT_MS);
   if (terrainInflight.has(lockKey)) {
     const ready = await waitForTerrainBlob(kv, blobKey, waitMs);
@@ -1745,15 +1755,109 @@ function sqlRows(result) {
   return [];
 }
 
+const TERRAIN_SAMPLE_DAY = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+/** UTC midnight for the day stamped on a terrain sample counter, or null. */
+export function terrainSampleDayStart(key) {
+  if (typeof key !== 'string' || !key.startsWith(TERRAIN_SAMPLE_PREFIX)) return null;
+  const day = key.slice(key.lastIndexOf(':') + 1);
+  const match = TERRAIN_SAMPLE_DAY.exec(day);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const date = Number(match[3]);
+  const start = Date.UTC(year, month - 1, date);
+  const check = new Date(start);
+  if (check.getUTCFullYear() !== year || check.getUTCMonth() !== month - 1 || check.getUTCDate() !== date) {
+    return null;
+  }
+  return start;
+}
+
+/**
+ * Lists `terrain:samples:` keys and deletes those whose UTC day started
+ * more than 48 hours ago. `apply` false (the default) deletes nothing.
+ * The result is counts only. It does not include key values.
+ *
+ * @param {{ list(query: { prefix: string, cursor?: string }): Promise<{ keys?: Array<{ name?: string, key?: string } | string>, list_complete?: boolean, cursor?: string }>, delete(key: string): Promise<unknown> }} store
+ * @param {{ now?: number, apply?: boolean }} [options]
+ */
+export async function cleanupTerrainSampleStore(store, options = {}) {
+  const now = typeof options.now === 'number' ? options.now : Date.now();
+  const apply = options.apply === true;
+  const names = [];
+  let cursor;
+  const seen = new Set();
+  for (;;) {
+    const page = await store.list({ prefix: TERRAIN_SAMPLE_PREFIX, cursor });
+    const keys = page && Array.isArray(page.keys) ? page.keys : [];
+    for (const entry of keys) {
+      const name = typeof entry === 'string' ? entry : entry && (entry.name || entry.key);
+      if (typeof name === 'string' && name.startsWith(TERRAIN_SAMPLE_PREFIX)) names.push(name);
+    }
+    const next = page && page.list_complete === false && page.cursor ? page.cursor : undefined;
+    if (!next || seen.has(next)) break;
+    seen.add(next);
+    cursor = next;
+  }
+  let expired = 0;
+  let kept = 0;
+  let unparsed = 0;
+  const doomed = [];
+  for (const name of names) {
+    const start = terrainSampleDayStart(name);
+    if (start == null) {
+      unparsed += 1;
+      continue;
+    }
+    if (now - start > TERRAIN_SAMPLE_TTL_SEC * 1000) {
+      expired += 1;
+      doomed.push(name);
+    } else kept += 1;
+  }
+  let deleted = 0;
+  if (apply) {
+    for (const name of doomed) {
+      await store.delete(name);
+      deleted += 1;
+    }
+  }
+  return {
+    prefix: TERRAIN_SAMPLE_PREFIX,
+    listed: names.length,
+    expired,
+    kept,
+    unparsed,
+    deleted,
+    dryRun: !apply,
+  };
+}
+
+/** Counts and the key prefix only. Never a full key. */
+export function formatTerrainSampleCleanup(summary) {
+  return [
+    `prefix=${summary.prefix}`,
+    `listed=${summary.listed}`,
+    `expired=${summary.expired}`,
+    `kept=${summary.kept}`,
+    `unparsed=${summary.unparsed}`,
+    `deleted=${summary.deleted}`,
+    `dryRun=${summary.dryRun}`,
+  ].join(' ');
+}
+
 /**
  * SQLite-backed counter for the Workers Paid plan. One global instance
  * serializes golfapi opens, terrain sampling, and usage-alert claims so
  * caps cannot overshoot and a threshold cannot send twice.
- * Nothing in this class writes KV.
+ * The terrain sample counter is the one KV write from this class:
+ * `terrain:samples:{install}:{utc-day}` with expirationTtl 172800.
+ * Every other key stays in SQLite.
  */
 export class GolfapiCounter {
-  constructor(ctx) {
+  constructor(ctx, env) {
     this.ctx = ctx;
+    this.env = env ?? null;
     this.sql = ctx.storage.sql;
     const setup = () => {
       this.sql.exec('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
@@ -2199,7 +2303,35 @@ export class GolfapiCounter {
     return { refunded: false };
   }
 
-  terrainBegin(body) {
+  sampleKv() {
+    return terrainKv(this.env);
+  }
+
+  async readSample(key) {
+    const kv = this.sampleKv();
+    if (kv && typeof kv.get === 'function') {
+      const raw = await kv.get(key);
+      if (raw != null && raw !== '') {
+        const n = Number(raw);
+        return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+      }
+    }
+    return this.num(key);
+  }
+
+  async writeSample(key, value) {
+    const next = Math.max(0, Math.floor(Number(value)) || 0);
+    const text = String(next);
+    const kv = this.sampleKv();
+    if (kv && typeof kv.put === 'function') {
+      await kv.put(key, text, { expirationTtl: TERRAIN_SAMPLE_TTL_SEC });
+      if (this.get(key) != null) this.del(key);
+      return;
+    }
+    this.put(key, text);
+  }
+
+  async terrainBegin(body) {
     const raw = this.get(`terrain:lock:${body.lockKey}`);
     const existing = raw ? JSON.parse(raw) : null;
     if (existing && typeof existing.at === 'number' && body.now - existing.at < existing.ttl * 1000) {
@@ -2208,8 +2340,9 @@ export class GolfapiCounter {
     }
     let counted = false;
     if (!body.exempt) {
-      if (this.num(body.sampleKey) >= body.cap) return { ok: false, limited: true };
-      this.add(body.sampleKey, 1);
+      const current = await this.readSample(body.sampleKey);
+      if (current >= body.cap) return { ok: false, limited: true };
+      await this.writeSample(body.sampleKey, current + 1);
       counted = true;
     }
     this.put(`terrain:lock:${body.lockKey}`, JSON.stringify({ at: body.now, ttl: body.ttlSec }));
@@ -2221,10 +2354,37 @@ export class GolfapiCounter {
     return { ok: true };
   }
 
-  terrainAbort(body) {
+  async terrainAbort(body) {
     this.del(`terrain:lock:${body.lockKey}`);
-    if (body.counted) this.add(body.sampleKey, -1);
+    if (body.counted) {
+      const current = await this.readSample(body.sampleKey);
+      await this.writeSample(body.sampleKey, current - 1);
+    }
     return { ok: true };
+  }
+
+  /**
+   * One-time delete of SQLite sample counters whose day is more than 48h old.
+   * Not called from a route, cron, or deploy. Dry-run unless body.apply is true.
+   * Returns counts only.
+   */
+  async cleanupTerrainSamples(body) {
+    const now = body && typeof body.now === 'number' ? body.now : Date.now();
+    const apply = Boolean(body && body.apply === true);
+    const rows = sqlRows(this.sql.exec('SELECT key FROM state WHERE key LIKE ?', `${TERRAIN_SAMPLE_PREFIX}%`));
+    const names = [];
+    for (const row of rows) {
+      if (row && typeof row.key === 'string') names.push(row.key);
+    }
+    const store = {
+      async list() {
+        return { keys: names.map((name) => ({ name })), list_complete: true };
+      },
+      delete: async (key) => {
+        this.del(key);
+      },
+    };
+    return cleanupTerrainSampleStore(store, { now, apply });
   }
 
   stockpileLock(body) {
@@ -2325,9 +2485,10 @@ export class GolfapiCounter {
     else if (body.op === 'noteCourses') result = this.noteCourses(body);
     else if (body.op === 'noteDemand') result = this.noteDemand(body);
     else if (body.op === 'readDemand') result = this.readDemand(body);
-    else if (body.op === 'terrainBegin') result = this.terrainBegin(body);
-    else if (body.op === 'terrainFinish') result = this.terrainFinish(body);
-    else if (body.op === 'terrainAbort') result = this.terrainAbort(body);
+    else if (body.op === 'terrainBegin') result = await this.terrainBegin(body);
+    else if (body.op === 'terrainFinish') result = await this.terrainFinish(body);
+    else if (body.op === 'terrainAbort') result = await this.terrainAbort(body);
+    else if (body.op === 'cleanupTerrainSamples') result = await this.cleanupTerrainSamples(body);
     else if (body.op === 'stockpileLock') result = this.stockpileLock(body);
     else if (body.op === 'stockpileUnlock') result = this.stockpileUnlock();
     else if (body.op === 'stockpileCharge') result = this.stockpileCharge(body);
