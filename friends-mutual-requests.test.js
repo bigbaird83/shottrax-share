@@ -159,6 +159,12 @@ describe("build 169: mutual requests and shared rounds", () => {
     expect(accepted.json).toEqual({ status: "friends", ownerId: from.ownerId });
   }
 
+  async function renew(person) {
+    const reset = await invoke("/v1/friends/code/reset", { friend: person.key, body: {} });
+    expect(reset.status).toBe(200);
+    person.code = reset.json.code;
+  }
+
   const setName = (who, name) => invoke("/v1/friends/code/name", { friend: who.key, body: { name } });
   const list = async (who) => (await invoke("/v1/friends/list", { method: "GET", friend: who.key })).json;
   const requests = async (who) => (await invoke("/v1/friends/requests", { method: "GET", friend: who.key })).json;
@@ -226,6 +232,7 @@ describe("build 169: mutual requests and shared rounds", () => {
     const target = await mint("qb-target");
     await befriend(sender, target);
     expect((await invoke("/v1/friends/block", { friend: target.key, body: { ownerId: sender.ownerId } })).status).toBe(200);
+    await renew(target);
     const quiet = await send(sender, target);
     expect(quiet.json).toEqual({ status: "pending", ownerId: target.ownerId });
     expect(kv.has(`fr:out:${sender.ownerId}:${target.ownerId}`)).toBe(true);
@@ -242,6 +249,7 @@ describe("build 169: mutual requests and shared rounds", () => {
       const old = await mint(`mu-k-${action}`);
       const dup = await mint(`mu-d-${action}`);
       await befriend(old, owner);
+      await renew(owner);
       await befriend(dup, owner);
       for (const id of ["mock_r1", "mock_r2", "mock_r3"]) {
         await invoke("/v1/friends/rounds", { method: "PUT", friend: owner.key, body: { share: true, round: round(id) } });
@@ -264,6 +272,7 @@ describe("build 169: mutual requests and shared rounds", () => {
     for (const id of ["mock_a", "mock_b"]) {
       await invoke("/v1/friends/rounds", { method: "PUT", friend: owner.key, body: { share: true, round: round(id) } });
     }
+    await renew(owner);
     await befriend(pal, owner);
     for (const choice of ["none", "10"]) {
       expect((await invoke("/v1/friends/past", { method: "PUT", friend: owner.key, body: { ownerId: pal.ownerId, choice, rounds: [] } })).status).toBe(200);

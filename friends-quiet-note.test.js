@@ -177,6 +177,13 @@ describe("quiet-block sender note", () => {
     expect(accepted.json).toEqual({ status: "friends", ownerId: from.ownerId });
   }
 
+  // Accept spends the code. A later invite from the same person is a new code.
+  async function renew(person) {
+    const reset = await viaEntry("/v1/friends/code/reset", { method: "POST", friend: person.key, body: {} });
+    expect(reset.status).toBe(200);
+    person.code = reset.json.code;
+  }
+
   function noteKey(sender, recipient) {
     return `fr:out:${sender.ownerId}:${recipient.ownerId}`;
   }
@@ -229,6 +236,7 @@ describe("quiet-block sender note", () => {
       friend: recipient.key,
       body: { ownerId: quietSender.ownerId },
     })).json).toEqual({ ok: true });
+    await renew(recipient);
 
     const realSend = await send(realSender, recipient);
     const quietSend = await send(quietSender, recipient);
@@ -272,12 +280,14 @@ describe("quiet-block sender note", () => {
     const kept = await mint("same-kept");
     const otherRequester = await mint("same-other");
     await befriend(kept, recipient);
+    await renew(recipient);
     await befriend(quietSender, recipient);
     expect((await viaEntry("/v1/friends/block", {
       method: "POST",
       friend: recipient.key,
       body: { ownerId: quietSender.ownerId },
     })).json).toEqual({ ok: true });
+    await renew(recipient);
     expect((await send(otherRequester, recipient)).json.status).toBe("pending");
 
     const beforeRequests = await viaEntry("/v1/friends/requests", { friend: recipient.key });
@@ -305,12 +315,14 @@ describe("quiet-block sender note", () => {
     const quietSender = await mint("nope-quiet");
     const kept = await mint("nope-kept");
     await befriend(kept, recipient);
+    await renew(recipient);
     await befriend(quietSender, recipient);
     expect((await viaEntry("/v1/friends/block", {
       method: "POST",
       friend: recipient.key,
       body: { ownerId: quietSender.ownerId },
     })).json).toEqual({ ok: true });
+    await renew(recipient);
     expect((await send(quietSender, recipient)).json.status).toBe("pending");
     const note = noteKey(quietSender, recipient);
     expect(kv.get(note).value).toBe("pending");
@@ -547,6 +559,7 @@ describe("quiet-block sender note", () => {
       friend: recipient.key,
       body: { ownerId: quietSender.ownerId },
     })).json).toEqual({ ok: true });
+    await renew(recipient);
 
     const puts = [];
     const boards = env.BOARDS;
@@ -657,6 +670,7 @@ describe("quiet-block sender note", () => {
       friend: recipient.key,
       body: { ownerId: quietSender.ownerId },
     })).json).toEqual({ ok: true });
+    await renew(recipient);
     const quiet = await send(quietSender, recipient);
     expect(quiet.text).toBe(`{"status":"pending","ownerId":"${recipient.ownerId}"}`);
     const listed = await viaEntry("/v1/friends/requests", { friend: quietSender.key });
@@ -719,6 +733,7 @@ describe("quiet-block sender note", () => {
       friend: recipient.key,
       body: { ownerId: quietSender.ownerId },
     })).json).toEqual({ ok: true });
+    await renew(recipient);
     kv.set(noteKey(quietSender, recipient), { value: `pending ${quietSender.key} fr:k:secret` });
     const quiet = await send(quietSender, recipient);
     const listed = await viaEntry("/v1/friends/requests", { friend: quietSender.key });
@@ -778,7 +793,7 @@ describe("quiet-block sender note", () => {
     const sent = await send(quietSender, recipient);
     first.restore();
     expect(sent.json).toEqual({ status: "pending", ownerId: recipient.ownerId });
-    expect(first.seen.get).toHaveLength(5);
+    expect(first.seen.get).toHaveLength(6);
     expect(first.seen.put).toHaveLength(1);
     expect(first.seen.put[0].key).toBe(noteKey(quietSender, recipient));
     expect(first.seen.put[0].value).toBe("pending");
@@ -793,7 +808,7 @@ describe("quiet-block sender note", () => {
     const again = await send(quietSender, recipient);
     second.restore();
     expect(again.text).toBe(sent.text);
-    expect(second.seen.get).toHaveLength(5);
+    expect(second.seen.get).toHaveLength(6);
     expect(second.seen.put).toEqual([]);
     expect(second.seen.delete).toEqual([]);
     expect(second.seen.list).toEqual([]);
@@ -822,7 +837,7 @@ describe("quiet-block sender note", () => {
       outgoing: [{ ownerId: noted }, { ownerId: outgoing }].sort((left, right) => (left.ownerId < right.ownerId ? -1 : 1)),
     });
     // + one fr:ownname: read per returned entry (1 incoming, 2 outgoing).
-    expect(counts.seen.get).toHaveLength(1 + 1 + 1 + 1 + 2 + 3);
+    expect(counts.seen.get).toHaveLength(1 + 1 + 1 + 1 + 2 + 3 + 2);
     expect(counts.seen.get).not.toContain(`fr:out:${caller.ownerId}:bad`);
     expect(counts.seen.get).not.toContain(`fr:out:${strangerA}:${noted}`);
     expect(counts.seen.get).toContain(`fr:out:${caller.ownerId}:${emptyNote}`);
@@ -878,8 +893,8 @@ describe("quiet-block sender note", () => {
     const contract = readFileSync(new URL("./docs/friends-api.md", import.meta.url), "utf8");
     const readme = readFileSync(new URL("./README.md", import.meta.url), "utf8");
     expect(contract).toContain("`fr:out:<sender>:<recipient>` = `pending`");
-    expect(contract).toContain("5 gets and 1 put");
-    expect(contract).toContain("`1 + I + B + O + Q` gets and `P + S` lists");
+    expect(contract).toContain("6 gets and 1 put");
+    expect(contract).toContain("`1 + I + B + O + Q + C` gets and `P + S` lists");
     expect(contract).toContain("No `expirationTtl`");
     expect(contract).toContain("Unblock does not delete the note and does not copy it to `fr:req:`");
     expect(contract).toContain("A fresh `sendRequest` is required");

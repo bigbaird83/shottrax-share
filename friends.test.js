@@ -555,6 +555,7 @@ describe("friend codes", () => {
     const blocked = await invoke("/v1/friends/block", { friend: inviter.key, body: { ownerId: opener.ownerId } });
     expect(blocked.status).toBe(200);
     expect(blocked.json).toEqual({ ok: true });
+    await renew(inviter);
 
     const real = await invoke("/v1/friends/requests", { friend: controlFrom.key, body: { code: controlTo.code } });
     const quiet = await invoke("/v1/friends/requests", {
@@ -692,6 +693,7 @@ describe("friend codes", () => {
     expect(quiet.json).toEqual({ status: "pending", ownerId: other.ownerId });
     expect(quiet.text).not.toContain("blocked");
     expect(kv.has(`fr:req:${other.ownerId}:${caller.ownerId}`)).toBe(false);
+    await renew(caller);
 
     const refused = await invoke("/v1/friends/requests", { friend: other.key, body: { code: caller.code } });
     expect(refused.status).toBe(409);
@@ -703,6 +705,7 @@ describe("friend codes", () => {
     const other = await mint("again-other");
     await befriend(other, caller);
     expect((await invoke("/v1/friends/block", { friend: caller.key, body: { ownerId: other.ownerId } })).status).toBe(200);
+    await renew(caller);
     const hidden = await invoke("/v1/friends/requests", { friend: other.key, body: { code: caller.code } });
     expect(hidden.status).toBe(200);
     expect(hidden.json).toEqual({ status: "pending", ownerId: caller.ownerId });
@@ -828,6 +831,7 @@ describe("friend codes", () => {
     const inviter = await mint("hide-inviter");
     const blockedPerson = await mint("hide-quiet");
     await befriend(inviter, opener);
+    await renew(opener);
     await befriend(blockedPerson, opener);
     await invoke("/v1/friends/block", { friend: opener.key, body: { ownerId: inviter.ownerId } });
     await invoke("/v1/friends/block", { friend: opener.key, body: { ownerId: blockedPerson.ownerId } });
@@ -964,6 +968,13 @@ describe("friend codes", () => {
     expect(sent.json).toEqual({ status: "pending", ownerId: to.ownerId });
     const accepted = await invoke("/v1/friends/requests/accept", { friend: to.key, body: { ownerId: from.ownerId } });
     expect(accepted.json).toEqual({ status: "friends", ownerId: from.ownerId });
+  }
+
+  // Accept spends the code. A later invite from the same person is a new code.
+  async function renew(person) {
+    const reset = await invoke("/v1/friends/code/reset", { friend: person.key, body: {} });
+    expect(reset.status).toBe(200);
+    person.code = reset.json.code;
   }
 
   function roundsKey(ownerId) {
@@ -1130,6 +1141,7 @@ describe("friend codes", () => {
     const bystander = await mint("rm-watch");
     await befriend(left, right);
     await befriend(left, third);
+    await renew(third);
     await befriend(right, third);
     expect((await putRound(left.key, baseRound({ id: "round_left", playedOn: "2026-10-02" }))).status).toBe(200);
     expect((await putRound(right.key, baseRound({ id: "round_right", playedOn: "2026-10-03" }))).status).toBe(200);
@@ -1557,7 +1569,7 @@ describe("friend codes", () => {
     const row = kv.get(roundsKey(caller.ownerId));
     expect(row.expirationTtl).toBe(365 * 24 * 60 * 60);
     expect(row.value).not.toContain(caller.key);
-    expect([...kv.keys()].filter((name) => !name.startsWith("fr:k:") && !name.startsWith("fr:code:") && !name.startsWith("fr:rounds:"))).toEqual([]);
+    expect([...kv.keys()].filter((name) => !name.startsWith("fr:k:") && !name.startsWith("fr:code:") && !name.startsWith("fr:invat:") && !name.startsWith("fr:rounds:"))).toEqual([]);
   });
 
   it("duplicate hole numbers are invalid", async () => {
@@ -1966,6 +1978,7 @@ describe("friend codes", () => {
     const first = await mint("ops-a");
     const second = await mint("ops-b");
     await befriend(first, caller);
+    await renew(caller);
     await befriend(second, caller);
     expect((await putRound(caller.key, baseRound({ id: "round_me", playedOn: "2026-10-03" }))).status).toBe(200);
     expect((await putRound(first.key, baseRound({ id: "round_a", playedOn: "2026-10-01" }))).status).toBe(200);

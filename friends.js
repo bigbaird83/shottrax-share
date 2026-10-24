@@ -6,8 +6,8 @@
  * listFriends use that same class, with their own per-key and per-IP names,
  * and they do not write KV.
  *
- * Served here: getCode, resetCode, code lookup, sendRequest, accept, block,
- * unblock, remove, publishRound, fetchRounds, listRequests, and listFriends.
+ * Served here: getCode, resetCode, code lookup, sendRequest, accept, decline,
+ * block, unblock, remove, publishRound, fetchRounds, listRequests, and listFriends.
  * Block is quiet for the blocked person. Unblock deletes only the caller's
  * block. Block requires a friendship and stores the block row before it
  * deletes that friendship. Remove and block delete only the caller's shared
@@ -26,6 +26,15 @@
 
 export const FRIEND_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 export const FRIEND_CODE_GUESS_LIMIT = 8;
+// New invites expire 7 days after mint. The open interval is now < createdAt + this.
+export const FRIEND_INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+// Legacy fr:code rows have no fr:invat. They stay reusable and expire at this
+// deploy instant plus 7 days. Not a migration: nothing rewrites old rows.
+// Set this to the release deploy instant when the Worker is shipped.
+export const FRIEND_INVITE_LEGACY_CUTOVER_MS = Date.parse("2026-10-24T19:49:00.000Z");
+// Brian, Oct 24, 2026, 2:47 PM CT: Decline holds that sender on that code.
+// The one-line switch. false lets that sender request again with the same code.
+export const FRIEND_DECLINE_HOLDS_SENDER = true;
 export const FRIEND_IP_GUESS_LIMIT = 24;
 export const FRIEND_GETCODE_IP_LIMIT = 30;
 export const FRIEND_PUBLISH_IP_LIMIT = 60;
@@ -84,6 +93,14 @@ const GUESS_SCHEMA = `CREATE TABLE IF NOT EXISTS guess_limit (
   attempts INTEGER NOT NULL,
   window_start INTEGER NOT NULL,
   blocked INTEGER NOT NULL
+)`;
+const REDEEM_SCHEMA = `CREATE TABLE IF NOT EXISTS invite_redeem (
+  id INTEGER PRIMARY KEY,
+  used INTEGER NOT NULL
+)`;
+const HOLD_SCHEMA = `CREATE TABLE IF NOT EXISTS invite_hold (
+  sender TEXT PRIMARY KEY,
+  expires_at INTEGER NOT NULL
 )`;
 
 export function isFriendPath(pathname) {
@@ -145,11 +162,34 @@ export class FriendGuessLimiter {
       this.ctx.storage.transactionSync(() => this.#blockSync(now));
       return doJson({ ok: true });
     }
+    // One object per invite code (name inv:<CODE>). KV cannot make single-use atomic.
+    if (body && body.op === "redeem") {
+      const result = this.ctx.storage.transactionSync(() => this.#redeemSync());
+      return doJson(result);
+    }
+    if (body && body.op === "state") {
+      const sender = typeof body.sender === "string" ? body.sender : "";
+      const result = this.ctx.storage.transactionSync(() => this.#stateSync(sender, now));
+      return doJson(result);
+    }
+    if (body && body.op === "hold") {
+      const sender = typeof body.sender === "string" ? body.sender : "";
+      const expiresAt = Number(body.expiresAt);
+      if (!OWNER_ID_RE.test(sender) || !Number.isFinite(expiresAt)) return doJson({ error: "invalid_body" }, 400);
+      this.ctx.storage.transactionSync(() => this.#holdSync(sender, expiresAt));
+      return doJson({ ok: true });
+    }
     return doJson({ error: "invalid_body" }, 400);
   }
 
   #ensure() {
     this.ctx.storage.sql.exec(GUESS_SCHEMA);
+    this.#ensureInvite();
+  }
+
+  #ensureInvite() {
+    this.ctx.storage.sql.exec(REDEEM_SCHEMA);
+    this.ctx.storage.sql.exec(HOLD_SCHEMA);
   }
 
   #attemptSync(now) {
@@ -202,6 +242,42 @@ export class FriendGuessLimiter {
     }
     this.ctx.storage.sql.exec("UPDATE guess_limit SET blocked = 1 WHERE id = 1");
   }
+
+  #redeemSync() {
+    this.#ensureInvite();
+    const rows = this.ctx.storage.sql.exec("SELECT used FROM invite_redeem WHERE id = 1").toArray();
+    if (rows.length > 0 && Number(rows[0].used) === 1) return { ok: false };
+    if (rows.length === 0) {
+      this.ctx.storage.sql.exec("INSERT INTO invite_redeem (id, used) VALUES (1, 1)");
+    } else {
+      this.ctx.storage.sql.exec("UPDATE invite_redeem SET used = 1 WHERE id = 1");
+    }
+    return { ok: true };
+  }
+
+  #stateSync(sender, now) {
+    this.#ensureInvite();
+    const usedRows = this.ctx.storage.sql.exec("SELECT used FROM invite_redeem WHERE id = 1").toArray();
+    const used = usedRows.length > 0 && Number(usedRows[0].used) === 1;
+    let held = false;
+    if (sender) {
+      const holds = this.ctx.storage.sql
+        .exec("SELECT expires_at FROM invite_hold WHERE sender = ?", sender)
+        .toArray();
+      if (holds.length > 0 && now < Number(holds[0].expires_at)) held = true;
+    }
+    return { used, held };
+  }
+
+  #holdSync(sender, expiresAt) {
+    this.#ensureInvite();
+    const rows = this.ctx.storage.sql.exec("SELECT sender FROM invite_hold WHERE sender = ?", sender).toArray();
+    if (rows.length === 0) {
+      this.ctx.storage.sql.exec("INSERT INTO invite_hold (sender, expires_at) VALUES (?, ?)", sender, expiresAt);
+      return;
+    }
+    this.ctx.storage.sql.exec("UPDATE invite_hold SET expires_at = ? WHERE sender = ?", expiresAt, sender);
+  }
 }
 
 export async function handleFriends(request, url, env, cors) {
@@ -224,6 +300,7 @@ const FRIEND_ROUTES = {
   "/v1/friends/requests": { POST: sendRequest, GET: listRequests },
   "/v1/friends/list": { GET: listFriends },
   "/v1/friends/requests/accept": { POST: acceptRequest },
+  "/v1/friends/requests/decline": { POST: declineRequest },
   "/v1/friends/requests/cancel": { POST: cancelRequest },
   "/v1/friends/block": { POST: blockPerson },
   "/v1/friends/unblock": { POST: unblockPerson },
@@ -250,6 +327,7 @@ async function getCode(request, env, cors) {
   const ownerId = randomOwnerId();
   const code = await unusedCode(boards, null);
   await friendPut(boards, friendKvKey("code", code), ownerId);
+  await friendPut(boards, friendKvKey("invat", code), String(friendNow(env)));
   await friendPut(boards, authKey, storedAuth(ownerId, code));
   return friendJson(200, { code, ownerId }, cors);
 }
@@ -269,9 +347,11 @@ async function resetCode(request, env, cors) {
   const previous = existing.code;
   const code = await unusedCode(boards, previous);
   await friendPut(boards, friendKvKey("code", code), existing.ownerId);
+  await friendPut(boards, friendKvKey("invat", code), String(friendNow(env)));
   await friendPut(boards, authKey, storedAuth(existing.ownerId, code));
   // The old code is deleted before the response, so a later lookup misses.
   await friendDelete(boards, friendKvKey("code", previous));
+  await deleteIfPresent(boards, friendKvKey("invat", previous));
   // The invite name lives with the code. A reset deletes it; it does not move to the new code.
   await deleteIfPresent(boards, friendKvKey("invname", previous));
   await deleteIfPresent(boards, friendKvKey("ownname", existing.ownerId));
@@ -298,6 +378,18 @@ async function lookupCode(request, env, cors) {
   if (typeof ownerId !== "string" || ownerId.length === 0) {
     return friendJson(404, { error: "code_not_found" }, cors);
   }
+  // The owner's own link stays distinct, including after the clock or a redeem.
+  if (caller.code === code) return lookupFound(boards, code, ownerId, cors);
+  const now = friendNow(env);
+  const createdAt = await readCreatedAt(boards, code);
+  if (!inviteOpen(createdAt, now)) return friendJson(404, { error: "code_not_found" }, cors);
+  const state = await inviteState(env, code, caller.ownerId, now);
+  if (!state) return friendJson(503, { error: "guess_limiter_not_configured" }, cors);
+  if (createdAt != null && state.used) return friendJson(404, { error: "code_not_found" }, cors);
+  return lookupFound(boards, code, ownerId, cors);
+}
+
+async function lookupFound(boards, code, ownerId, cors) {
   // The invite name is returned only here, when the code (or its link) is opened.
   const name = readInviteName(await friendGet(boards, friendKvKey("invname", code)));
   const photo = readInvitePhoto(await friendGet(boards, friendKvKey("invphoto", code)));
@@ -539,21 +631,32 @@ async function sendRequest(request, env, cors) {
   if (typeof ownerId !== "string" || ownerId.length === 0) {
     return friendJson(404, { error: "code_not_found" }, cors);
   }
+  const now = friendNow(env);
+  const createdAt = await readCreatedAt(boards, code);
+  const open = inviteOpen(createdAt, now);
+  const state = await inviteState(env, code, caller.ownerId, now);
+  if (!state) return friendJson(503, { error: "guess_limiter_not_configured" }, cors);
+  const used = createdAt != null && state.used === true;
+  // Hold is checked before the clock so a permanent marker cannot pass as a closed code.
+  const held = declineHoldsSender(env) && state.held === true;
   if (await hasBlock(boards, caller.ownerId, ownerId)) {
-    return friendJson(409, { error: "blocked" }, cors);
+    if (open && !used) return friendJson(409, { error: "blocked" }, cors);
+  } else if (await hasBlock(boards, ownerId, caller.ownerId)) {
+    // Quiet block only while the invite is still open. A closed code matches a miss.
+    if (open && !used) {
+      await storeOutgoingNote(boards, caller.ownerId, ownerId);
+      return friendJson(200, { status: "pending", ownerId }, cors);
+    }
   }
-  // Quiet block: same pending body as a real request. The note is the
-  // sender's outgoing row only. The recipient has no fr:req: to accept.
-  if (await hasBlock(boards, ownerId, caller.ownerId)) {
-    await storeOutgoingNote(boards, caller.ownerId, ownerId);
-    return friendJson(200, { status: "pending", ownerId }, cors);
-  }
-  // No duplicates: an existing friend or a pending request in either direction
-  // is reported with `already` and nothing new is written.
+  // Already friends stays distinct for this caller, including after use or expiry.
   if (await areFriends(boards, caller.ownerId, ownerId)) {
     await deleteOutgoingNote(boards, caller.ownerId, ownerId);
     return friendJson(200, { status: "friends", ownerId, already: "friends" }, cors);
   }
+  if (held) return friendJson(200, { status: "pending", ownerId }, cors);
+  if (!open || used) return friendJson(404, { error: "code_not_found" }, cors);
+  // No duplicates: an existing friend or a pending request in either direction
+  // is reported with `already` and nothing new is written.
   const reqKey = requestKey(ownerId, caller.ownerId);
   const pending = await friendGet(boards, reqKey);
   if (typeof pending === "string" && pending.length > 0) {
@@ -566,6 +669,7 @@ async function sendRequest(request, env, cors) {
     return friendJson(200, { status: "pending", ownerId, already: "incoming" }, cors);
   }
   await friendPut(boards, reqKey, "pending");
+  await friendPut(boards, rcodeKey(ownerId, caller.ownerId), formatRcode(code, inviteExpiresAt(createdAt)));
   await deleteOutgoingNote(boards, caller.ownerId, ownerId);
   return friendJson(200, { status: "pending", ownerId }, cors);
 }
@@ -600,6 +704,18 @@ async function acceptRequest(request, env, cors) {
   if (friendListWouldExceed(callerIds, ownerId) || friendListWouldExceed(otherIds, caller.ownerId)) {
     return friendJson(409, { error: "friend_limit" }, cors);
   }
+  const sent = parseRcode(await friendGet(boards, rcodeKey(caller.ownerId, ownerId)));
+  if (sent) {
+    const now = friendNow(env);
+    if (!clockOpen(sent.expiresAt, now)) return friendJson(409, { error: "not_friends" }, cors);
+    const still = await friendGet(boards, friendKvKey("code", sent.code));
+    if (typeof still !== "string" || still.length === 0) return friendJson(409, { error: "not_friends" }, cors);
+    // Legacy codes (no fr:invat) stay reusable until the deploy clock. New codes redeem once.
+    if ((await readCreatedAt(boards, sent.code)) != null) {
+      const won = await redeemInvite(env, sent.code);
+      if (!won) return friendJson(409, { error: "not_friends" }, cors);
+    }
+  }
   await friendPut(boards, friendKvKey("friend", `${caller.ownerId}:${ownerId}`), "1");
   await friendPut(boards, friendKvKey("friend", `${ownerId}:${caller.ownerId}`), "1");
   await saveFriendIds(boards, caller.ownerId, addFriendId(callerIds, ownerId));
@@ -612,8 +728,37 @@ async function acceptRequest(request, env, cors) {
   // stale incoming row whose Decline (remove) would end the friendship and delete
   // their shared rounds.
   await deleteIfPresent(boards, requestKey(ownerId, caller.ownerId));
+  await deleteIfPresent(boards, rcodeKey(caller.ownerId, ownerId));
+  await deleteIfPresent(boards, rcodeKey(ownerId, caller.ownerId));
   await friendDelete(boards, reqKey);
   return friendJson(200, { status: "friends", ownerId }, cors);
+}
+
+/**
+ * The recipient turns down one incoming request. Deletes that row and the
+ * sender's outgoing note. Adds no friend row and writes no notice.
+ * With FRIEND_DECLINE_HOLDS_SENDER, that sender cannot open another request
+ * on this code; everyone else still can. The code is used only at accept.
+ */
+async function declineRequest(request, env, cors) {
+  const ready = await readyOwnerCall(request, env, cors);
+  if (ready.error) return ready.error;
+  const { boards, caller, ownerId } = ready;
+  const key = requestKey(caller.ownerId, ownerId);
+  const pending = await friendGet(boards, key);
+  if (typeof pending !== "string" || pending.length === 0) {
+    return friendJson(409, { error: "not_friends" }, cors);
+  }
+  const sent = parseRcode(await friendGet(boards, rcodeKey(caller.ownerId, ownerId)));
+  await deleteIfPresent(boards, key);
+  await deleteOutgoingNote(boards, ownerId, caller.ownerId);
+  await deleteIfPresent(boards, rcodeKey(caller.ownerId, ownerId));
+  if (declineHoldsSender(env)) {
+    const code = sent ? sent.code : caller.code;
+    const expiresAt = sent ? sent.expiresAt : inviteExpiresAt(await readCreatedAt(boards, code));
+    await writeHold(env, code, ownerId, expiresAt);
+  }
+  return friendJson(200, { ok: true }, cors);
 }
 
 /**
@@ -627,6 +772,7 @@ async function cancelRequest(request, env, cors) {
   const { boards, caller, ownerId } = ready;
   await deleteIfPresent(boards, requestKey(ownerId, caller.ownerId));
   await deleteOutgoingNote(boards, caller.ownerId, ownerId);
+  await deleteIfPresent(boards, rcodeKey(ownerId, caller.ownerId));
   return friendJson(200, { ok: true }, cors);
 }
 
@@ -645,6 +791,8 @@ async function blockPerson(request, env, cors) {
   await saveFriendIds(boards, ownerId, removeFriendId(await loadFriendIds(boards, ownerId), caller.ownerId));
   await deleteIfPresent(boards, requestKey(ownerId, caller.ownerId));
   await deleteIfPresent(boards, requestKey(caller.ownerId, ownerId));
+  await deleteIfPresent(boards, rcodeKey(ownerId, caller.ownerId));
+  await deleteIfPresent(boards, rcodeKey(caller.ownerId, ownerId));
   // Only this friend loses access. Normal shared rounds reach friends through the
   // friend list, so ending the friendship already ends access; the caller's rounds
   // stay for everyone else. Past picks given to this one person are taken back both ways.
@@ -774,10 +922,12 @@ async function listRequests(request, env, cors) {
       const raw = await friendGet(boards, name);
       if (typeof raw !== "string" || raw.length === 0) continue;
       if (await hasBlock(boards, caller.ownerId, parsed.requester)) continue;
+      if (!(await requestVisible(boards, env, parsed.recipient, parsed.requester))) continue;
       incoming.push({ ownerId: parsed.requester });
     } else if (parsed.requester === caller.ownerId) {
       const raw = await friendGet(boards, name);
       if (typeof raw !== "string" || raw.length === 0) continue;
+      if (!(await requestVisible(boards, env, parsed.recipient, parsed.requester))) continue;
       outgoing.push({ ownerId: parsed.recipient });
     }
   }
@@ -1547,6 +1697,85 @@ async function guessAttempt(env, name, now) {
   return { ok: false, retryAfterSec };
 }
 
+function friendNow(env) {
+  const raw = env && env.FRIEND_NOW_MS;
+  return Number.isFinite(raw) ? raw : Date.now();
+}
+
+function declineHoldsSender(env) {
+  if (env && typeof env.FRIEND_DECLINE_HOLDS_SENDER === "boolean") return env.FRIEND_DECLINE_HOLDS_SENDER;
+  return FRIEND_DECLINE_HOLDS_SENDER;
+}
+
+function inviteExpiresAt(createdAt) {
+  if (createdAt == null) return FRIEND_INVITE_LEGACY_CUTOVER_MS + FRIEND_INVITE_TTL_MS;
+  return createdAt + FRIEND_INVITE_TTL_MS;
+}
+
+/** Open while now is strictly before expiresAt. At the exact instant the invite is closed. */
+function clockOpen(expiresAt, now) {
+  return now < expiresAt;
+}
+
+function inviteOpen(createdAt, now) {
+  return clockOpen(inviteExpiresAt(createdAt), now);
+}
+
+async function readCreatedAt(boards, code) {
+  const raw = await friendGet(boards, friendKvKey("invat", code));
+  if (typeof raw !== "string" || !/^[0-9]+$/.test(raw)) return null;
+  return Number(raw);
+}
+
+function rcodeKey(recipientOwnerId, requesterOwnerId) {
+  return friendKvKey("rcode", `${recipientOwnerId}:${requesterOwnerId}`);
+}
+
+function formatRcode(code, expiresAt) {
+  return `${code}:${expiresAt}`;
+}
+
+function parseRcode(raw) {
+  if (typeof raw !== "string" || raw.charAt(8) !== ":") return null;
+  const code = raw.slice(0, 8);
+  const expiresAt = Number(raw.slice(9));
+  if (!CODE_RE.test(code) || !Number.isFinite(expiresAt)) return null;
+  return { code, expiresAt };
+}
+
+async function requestVisible(boards, env, recipient, requester) {
+  const parsed = parseRcode(await friendGet(boards, rcodeKey(recipient, requester)));
+  if (!parsed) return true;
+  return clockOpen(parsed.expiresAt, friendNow(env));
+}
+
+async function postInvite(env, code, body) {
+  const ns = guessNamespace(env);
+  if (!ns) return null;
+  const stub = ns.get(ns.idFromName(`inv:${code}`));
+  const response = await stub.fetch("https://friend-guess.internal/limit", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  return response.json();
+}
+
+async function inviteState(env, code, sender, now) {
+  const body = await postInvite(env, code, { op: "state", sender, now });
+  if (!body || typeof body.used !== "boolean" || typeof body.held !== "boolean") return null;
+  return body;
+}
+
+async function redeemInvite(env, code) {
+  const body = await postInvite(env, code, { op: "redeem" });
+  return !!(body && body.ok === true);
+}
+
+async function writeHold(env, code, sender, expiresAt) {
+  const body = await postInvite(env, code, { op: "hold", sender, expiresAt });
+  return !!(body && body.ok === true);
+}
+
 function friendKvKey(kind, id) {
   if (
     kind !== "k" &&
@@ -1561,7 +1790,9 @@ function friendKvKey(kind, id) {
     kind !== "invname" &&
     kind !== "invphoto" &&
     kind !== "ownname" &&
-    kind !== "live"
+    kind !== "live" &&
+    kind !== "invat" &&
+    kind !== "rcode"
   ) {
     throw new Error("friend_namespace");
   }

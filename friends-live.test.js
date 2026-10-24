@@ -209,8 +209,8 @@ describe("live rounds for friends", () => {
     const pal = await mint("live-pal");
     const stranger = await mint("live-stranger");
     const pending = await mint("live-pending");
-    await befriend(pal, golfer);
     const asked = await invoke("/v1/friends/requests", { friend: pending.key, body: { code: golfer.code } });
+    await befriend(pal, golfer);
     expect(asked.status).toBe(200);
     expect((await putLive(golfer)).json).toEqual({ ok: true });
     const seen = await getLive(pal);

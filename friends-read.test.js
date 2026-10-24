@@ -162,6 +162,12 @@ describe("friend read routes", () => {
     expect(accepted.json).toEqual({ status: "friends", ownerId: from.ownerId });
   }
 
+  async function renew(person) {
+    const reset = await viaEntry("/v1/friends/code/reset", { method: "POST", friend: person.key, body: {} });
+    expect(reset.status).toBe(200);
+    person.code = reset.json.code;
+  }
+
   function putMutual(left, right) {
     kv.set(`fr:friend:${left}:${right}`, { value: "1" });
     kv.set(`fr:friend:${right}:${left}`, { value: "1" });
@@ -320,6 +326,7 @@ describe("friend read routes", () => {
       friend: recipient.key,
       body: { ownerId: sender.ownerId },
     })).json).toEqual({ ok: true });
+    await renew(recipient);
     const beforeSend = await viaEntry("/v1/friends/requests", { friend: sender.key });
     expect(beforeSend.json).toEqual({ incoming: [], outgoing: [] });
     expect(kv.has(`fr:out:${sender.ownerId}:${recipient.ownerId}`)).toBe(false);
@@ -541,8 +548,8 @@ describe("friend read routes", () => {
       incoming: [{ ownerId: incoming }],
       outgoing: [{ ownerId: outgoing }],
     });
-    // 4 base reads + one fr:ownname: read per returned entry.
-    expect(requestCounts).toEqual({ get: 6, put: 0, delete: 0, list: 2 });
+    // 4 base reads + one fr:rcode: read per caller request row + one fr:ownname: read per returned entry.
+    expect(requestCounts).toEqual({ get: 8, put: 0, delete: 0, list: 2 });
 
     const first = "h".repeat(22);
     const second = "j".repeat(22);
