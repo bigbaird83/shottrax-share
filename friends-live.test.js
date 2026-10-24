@@ -665,4 +665,88 @@ describe("live rounds for friends", () => {
     expect(kv.has(`fr:live:${golfer.ownerId}`)).toBe(false);
     expect(JSON.stringify([...kv.values()])).not.toMatch(/14\.14141|14\.14142/);
   });
+
+  // Made-up data. #47 rules and #49 skippedHoles together after the main merge.
+  it("live rules: skippedHoles is kept with round stats off, and a practice round with skippedHoles stores nothing", async () => {
+    const golfer = await mint("rule-skip");
+    const pal = await mint("rule-skip-pal");
+    await befriend(pal, golfer);
+    const body = {
+      courseName: "Mock Pines GC",
+      hole: 4,
+      roundStats: false,
+      skippedHoles: [3, 2],
+      holes: [{ hole: 1, score: 5, par: 4, fir: true, gir: false, putts: 2, shots: [{ n: 1, club: "Dr", yd: 240, s: [11.1, 21.1], e: [11.2, 21.2], res: "fairway" }] }],
+    };
+    expect((await putLive(golfer, { ...body, roundKind: "practice" })).json).toEqual({ error: "practice_or_test" });
+    expect(kv.has(`fr:live:${golfer.ownerId}`)).toBe(false);
+    expect((await putLive(golfer, body)).status).toBe(200);
+    const seen = (await getLive(pal)).json.live[0];
+    expect(seen.skippedHoles).toEqual([2, 3]);
+    expect(seen.holes[0]).not.toHaveProperty("putts");
+    expect(seen.holes[0]).not.toHaveProperty("fir");
+    expect(seen.holes[0].shots[0]).toMatchObject({ club: "Dr", yd: 240, s: [11.1, 21.1] });
+  });
+
+  // Skipped holes (Brian Baird OK 2026-10-23 11:55 PM CT). Made-up course and scores only.
+  it("skipped holes: stored and returned to accepted friends only, merged and sorted", async () => {
+    const golfer = await mint("skip-golfer");
+    const pal = await mint("skip-pal");
+    const stranger = await mint("skip-stranger");
+    await befriend(pal, golfer);
+    expect((await putLive(golfer, { ...LIVE, hole: 6, skippedHoles: [5, 3, 5, 4] })).json).toEqual({ ok: true });
+    expect(JSON.parse(kv.get(`fr:live:${golfer.ownerId}`).value).skippedHoles).toEqual([3, 4, 5]);
+    const seen = (await getLive(pal)).json.live[0];
+    expect(seen.skippedHoles).toEqual([3, 4, 5]);
+    expect(seen.toPar).toBe(1);
+    expect((await getLive(stranger)).json).toEqual({ live: [] });
+  });
+
+  it("skipped holes: older apps that leave it out get no skippedHoles field back", async () => {
+    const golfer = await mint("skip-old");
+    const pal = await mint("skip-old-pal");
+    await befriend(pal, golfer);
+    expect((await putLive(golfer)).status).toBe(200);
+    const seen = (await getLive(pal)).json.live[0];
+    expect(Object.hasOwn(seen, "skippedHoles")).toBe(false);
+    expect(Object.hasOwn(JSON.parse(kv.get(`fr:live:${golfer.ownerId}`).value), "skippedHoles")).toBe(false);
+    expect((await putLive(golfer, { ...LIVE, skippedHoles: [] })).status).toBe(200);
+    expect(Object.hasOwn((await getLive(pal)).json.live[0], "skippedHoles")).toBe(false);
+  });
+
+  for (const [name, skippedHoles] of [
+    ["hole 0", [0]],
+    ["hole 19", [19]],
+    ["a fraction", [3.5]],
+    ["a string", ["3"]],
+    ["null entry", [null]],
+    ["a non-array", 3],
+    ["an object", { 3: true }],
+    ["more than 18 entries", Array.from({ length: 19 }, () => 4)],
+  ]) {
+    it(`skipped holes: rejects ${name}`, async () => {
+      const golfer = await mint(`skip-bad-${name.replace(/\W/g, "")}`);
+      expect((await putLive(golfer, { ...LIVE, skippedHoles })).status).toBe(400);
+    });
+  }
+
+  it("skipped holes: a hole cannot be both scored and skipped, and current-hole shots cannot sit on a skipped hole", async () => {
+    const golfer = await mint("skip-clash");
+    expect((await putLive(golfer, { ...LIVE, skippedHoles: [2] })).status).toBe(400);
+    expect((await putLive(golfer, { ...LIVE, hole: 3, skippedHoles: [3], shots: [{ n: 1, club: "3w", yd: 220 }] })).status).toBe(400);
+    expect((await putLive(golfer, { ...LIVE, hole: 3, skippedHoles: [3] })).status).toBe(200);
+  });
+
+  it("skipped holes: a stored row with bad or scored skipped entries returns only the clean, unscored ones", async () => {
+    const golfer = await mint("skip-stored");
+    const pal = await mint("skip-stored-pal");
+    await befriend(pal, golfer);
+    const base = { courseName: "Pine Hollow GC", hole: 4, holes: LIVE.holes, updatedAt: Date.now() };
+    kv.set(`fr:live:${golfer.ownerId}`, { value: JSON.stringify({ ...base, skippedHoles: [2, 3] }) });
+    expect((await getLive(pal)).json.live[0].skippedHoles).toEqual([3]);
+    kv.set(`fr:live:${golfer.ownerId}`, { value: JSON.stringify({ ...base, skippedHoles: [3, 99] }) });
+    const bad = (await getLive(pal)).json.live[0];
+    expect(Object.hasOwn(bad, "skippedHoles")).toBe(false);
+    expect(bad.holes).toEqual(LIVE.holes);
+  });
 });

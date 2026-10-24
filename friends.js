@@ -63,7 +63,7 @@ export const LIVE_SHOT_RESULTS = ["fairway", "rough", "sand", "green", "holed", 
 /** Shot lat/lon are stored and served at 5 decimal places (about 1 m). */
 export const LIVE_COORD_DECIMALS = 5;
 const LIVE_COORD_SCALE = 10 ** LIVE_COORD_DECIMALS;
-const LIVE_ROUND_FIELDS = ["courseName", "hole", "holes", "shots", "roundStats", "clubAverages", "roundKind", "finished"];
+const LIVE_ROUND_FIELDS = ["courseName", "hole", "holes", "shots", "skippedHoles", "roundStats", "clubAverages", "roundKind", "finished"];
 const LIVE_PUTT_CLUB = "Putt";
 // 100 ids of 64 characters plus quotes and commas.
 const DELETE_ROUNDS_BODY_LIMIT = 8192;
@@ -548,15 +548,22 @@ async function sendRequest(request, env, cors) {
     await storeOutgoingNote(boards, caller.ownerId, ownerId);
     return friendJson(200, { status: "pending", ownerId }, cors);
   }
+  // No duplicates: an existing friend or a pending request in either direction
+  // is reported with `already` and nothing new is written.
   if (await areFriends(boards, caller.ownerId, ownerId)) {
     await deleteOutgoingNote(boards, caller.ownerId, ownerId);
-    return friendJson(200, { status: "friends", ownerId }, cors);
+    return friendJson(200, { status: "friends", ownerId, already: "friends" }, cors);
   }
   const reqKey = requestKey(ownerId, caller.ownerId);
   const pending = await friendGet(boards, reqKey);
   if (typeof pending === "string" && pending.length > 0) {
     await deleteOutgoingNote(boards, caller.ownerId, ownerId);
-    return friendJson(200, { status: "pending", ownerId }, cors);
+    return friendJson(200, { status: "pending", ownerId, already: "outgoing" }, cors);
+  }
+  const reverse = await friendGet(boards, requestKey(caller.ownerId, ownerId));
+  if (typeof reverse === "string" && reverse.length > 0) {
+    // They already asked you: no second request. Accept theirs instead.
+    return friendJson(200, { status: "pending", ownerId, already: "incoming" }, cors);
   }
   await friendPut(boards, reqKey, "pending");
   await deleteOutgoingNote(boards, caller.ownerId, ownerId);
@@ -600,6 +607,11 @@ async function acceptRequest(request, env, cors) {
   // Drop a leftover sender note before the request row. A retry can still
   // see fr:req: if this delete fails. The note is not read and not accepted.
   await deleteOutgoingNote(boards, ownerId, caller.ownerId);
+  // Both people may have sent a request (each opened the other's link). Drop the
+  // caller's own request to the other side too, so the new friend never sees a
+  // stale incoming row whose Decline (remove) would end the friendship and delete
+  // their shared rounds.
+  await deleteIfPresent(boards, requestKey(ownerId, caller.ownerId));
   await friendDelete(boards, reqKey);
   return friendJson(200, { status: "friends", ownerId }, cors);
 }
@@ -633,7 +645,10 @@ async function blockPerson(request, env, cors) {
   await saveFriendIds(boards, ownerId, removeFriendId(await loadFriendIds(boards, ownerId), caller.ownerId));
   await deleteIfPresent(boards, requestKey(ownerId, caller.ownerId));
   await deleteIfPresent(boards, requestKey(caller.ownerId, ownerId));
-  await deleteOwnedRounds(boards, caller.ownerId);
+  // Only this friend loses access. Normal shared rounds reach friends through the
+  // friend list, so ending the friendship already ends access; the caller's rounds
+  // stay for everyone else. Past picks given to this one person are taken back both ways.
+  await deletePastRoundsFor(boards, caller.ownerId, ownerId);
   await deletePastRoundsFor(boards, ownerId, caller.ownerId);
   return friendJson(200, { ok: true }, cors);
 }
@@ -660,7 +675,10 @@ async function removeFriend(request, env, cors) {
   await friendDelete(boards, friendKvKey("friend", `${ownerId}:${caller.ownerId}`));
   await saveFriendIds(boards, caller.ownerId, removeFriendId(await loadFriendIds(boards, caller.ownerId), ownerId));
   await saveFriendIds(boards, ownerId, removeFriendId(await loadFriendIds(boards, ownerId), caller.ownerId));
-  await deleteOwnedRounds(boards, caller.ownerId);
+  // Only this friend loses access. Normal shared rounds reach friends through the
+  // friend list, so ending the friendship already ends access; the caller's rounds
+  // stay for everyone else. Past picks given to this one person are taken back both ways.
+  await deletePastRoundsFor(boards, caller.ownerId, ownerId);
   await deletePastRoundsFor(boards, ownerId, caller.ownerId);
   return friendJson(200, { ok: true }, cors);
 }
@@ -839,6 +857,10 @@ async function fetchRounds(request, env, cors) {
  * true deletes the row, including every shot location. Replaced on every
  * update. The phone sends this only while "Share live rounds with friends"
  * is on and the round is shared.
+ * Optional skippedHoles (Brian Baird OK 2026-10-23 11:55 PM CT): hole numbers
+ * 1-18 the golfer skipped, so friends see "Skipped" instead of unscored. Repeats
+ * are merged, at most 18, and a skipped hole may not also be scored. Older apps
+ * leave it out, and the row then carries no skippedHoles at all.
  */
 async function putLive(request, env, cors) {
   const friendKey = readFriendKey(request);
@@ -862,11 +884,16 @@ async function putLive(request, env, cors) {
     holes.push(holeForFollowers(clean, body));
   }
   holes.sort((a, b) => a.hole - b.hole);
+  let skippedHoles = null;
+  if (Object.hasOwn(body, "skippedHoles")) {
+    skippedHoles = sanitizeSkippedHoles(body.skippedHoles);
+    if (!skippedHoles || skippedHoles.some((n) => seen.has(n))) return friendJson(400, { error: "invalid_body" }, cors);
+  }
   // Top-level shots are the current hole's, so only while that hole has no score.
   let currentShots = null;
   if (Object.hasOwn(body, "shots")) {
     currentShots = sanitizeShots(body.shots, false);
-    if (!currentShots || seen.has(body.hole)) return friendJson(400, { error: "invalid_body" }, cors);
+    if (!currentShots || seen.has(body.hole) || (skippedHoles && skippedHoles.includes(body.hole))) return friendJson(400, { error: "invalid_body" }, cors);
   }
   const boards = boardsBinding(env);
   if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
@@ -878,6 +905,7 @@ async function putLive(request, env, cors) {
   if (currentShots) row.shots = currentShots;
   if (typeof body.roundStats === "boolean") row.roundStats = body.roundStats;
   if (typeof body.clubAverages === "boolean") row.clubAverages = body.clubAverages;
+  if (skippedHoles && skippedHoles.length > 0) row.skippedHoles = skippedHoles;
   await friendPut(boards, friendKvKey("live", caller.ownerId), JSON.stringify(row), {
     expirationTtl: Math.ceil(FRIEND_LIVE_TTL_MS / 1000),
   });
@@ -961,7 +989,26 @@ function readLiveRow(raw, now) {
   };
   const shots = Object.hasOwn(value, "shots") ? sanitizeShots(value.shots, false) : null;
   if (shots) out.shots = shots;
+  if (Object.hasOwn(value, "skippedHoles")) {
+    const scored = new Set(holes.map((hole) => hole.hole));
+    const skipped = sanitizeSkippedHoles(value.skippedHoles);
+    if (skipped) {
+      const unscored = skipped.filter((n) => !scored.has(n));
+      if (unscored.length > 0) out.skippedHoles = unscored;
+    }
+  }
   return out;
+}
+
+/** Skipped hole numbers: an array of at most 18 integers 1-18. Repeats merge, sorted. Null on anything else. */
+function sanitizeSkippedHoles(list) {
+  if (!Array.isArray(list) || list.length > 18) return null;
+  const out = new Set();
+  for (const n of list) {
+    if (!Number.isInteger(n) || n < 1 || n > 18) return null;
+    out.add(n);
+  }
+  return [...out].sort((a, b) => a - b);
 }
 
 async function readyReadCall(request, env, cors) {

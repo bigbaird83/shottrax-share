@@ -385,7 +385,8 @@ describe("friend read routes", () => {
     await viaEntry("/v1/friends/requests", { method: "POST", friend: caller.key, body: { code: other.code } });
     kv.set(`fr:req:${other.ownerId}:${caller.ownerId}`, { value: `${caller.code} fr:k:secret ${caller.key}` });
     const requests = await viaEntry("/v1/friends/requests", { friend: caller.key });
-    await befriend(caller, other);
+    // The caller already sent; a second send is a duplicate, so the other side accepts the first one.
+    await viaEntry("/v1/friends/requests/accept", { method: "POST", friend: other.key, body: { ownerId: caller.ownerId } });
     const friends = await viaEntry("/v1/friends/list", { friend: caller.key });
     for (const result of [requests, friends]) {
       expect(result.text).not.toContain(caller.key);
@@ -474,13 +475,14 @@ describe("friend read routes", () => {
     const caller = await mint("nowrite");
     const other = await mint("nowrite-other");
     await viaEntry("/v1/friends/requests", { method: "POST", friend: caller.key, body: { code: other.code } });
-    await befriend(other, caller);
+    await viaEntry("/v1/friends/requests/accept", { method: "POST", friend: other.key, body: { ownerId: caller.ownerId } });
     const counts = countKv();
     const requests = await viaEntry("/v1/friends/requests", { friend: caller.key });
     const friends = await viaEntry("/v1/friends/list", { friend: caller.key });
     expect(requests.status).toBe(200);
     expect(friends.status).toBe(200);
-    expect(requests.json.outgoing).toEqual([{ ownerId: other.ownerId }]);
+    // Accept removed the caller's own earlier request too (build 169: no stale row after mutual sends).
+    expect(requests.json.outgoing).toEqual([]);
     expect(friends.json.friends).toEqual([{ ownerId: other.ownerId }]);
     expect(counts.put).toBe(0);
     expect(counts.delete).toBe(0);
