@@ -14,8 +14,10 @@ const FRIEND_CODE_CALLS = [
   ["POST", "/v1/friends/code"],
   ["POST", "/v1/friends/code/reset"],
   ["POST", "/v1/friends/codes/lookup"],
+  ["POST", "/v1/friends/codes/accept"],
   ["POST", "/v1/friends/requests"],
   ["POST", "/v1/friends/requests/accept"],
+  ["POST", "/v1/friends/requests/decline"],
   ["POST", "/v1/friends/block"],
   ["POST", "/v1/friends/unblock"],
   ["POST", "/v1/friends/remove"],
@@ -127,8 +129,10 @@ describe("friends API contract", () => {
     expect(doc).toContain("22 unpadded base64url characters");
   });
 
-  it("has no decline call", () => {
-    expect(doc).toContain("There is no decline call");
+  it("decline is the recipient route and the old path stays unlisted", () => {
+    expect(doc).toContain("`POST /v1/friends/requests/decline`");
+    expect(doc).toContain("`POST /v1/friends/decline` stays `404`");
+    expect(doc).not.toContain("There is no decline call");
   });
 
   it("returns the full round list with no cursor", () => {

@@ -159,6 +159,12 @@ describe("invite name and past rounds", () => {
     expect(accepted.json).toEqual({ status: "friends", ownerId: from.ownerId });
   }
 
+  async function renew(person) {
+    const reset = await invoke("/v1/friends/code/reset", { friend: person.key, body: {} });
+    expect(reset.status).toBe(200);
+    person.code = reset.json.code;
+  }
+
   function round(id, playedOn, extra = {}) {
     return {
       id,
@@ -281,6 +287,7 @@ describe("invite name and past rounds", () => {
     const jamie = await mint("aud-jamie");
     const riley = await mint("aud-riley");
     await befriend(jamie, owner);
+    await renew(owner);
     await befriend(riley, owner);
     const shared = round("shared_1", "2026-10-12");
     expect((await invoke("/v1/friends/rounds", { method: "PUT", friend: owner.key, body: { share: true, round: shared } })).status).toBe(200);
@@ -332,6 +339,7 @@ describe("invite name and past rounds", () => {
     const friend = await mint("rm-friend");
     const other = await mint("rm-other");
     await befriend(friend, owner);
+    await renew(owner);
     await befriend(other, owner);
     await setPast(owner, friend, "10", [round("o_1", "2025-01-01")]);
     await setPast(owner, other, "10", [round("o_2", "2025-01-02")]);
