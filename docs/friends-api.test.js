@@ -111,7 +111,8 @@ describe("friends API contract", () => {
   });
 
   it("deletes a league round on unshare", () => {
-    expect(doc).toContain("until `remove`, `block`, or unshare (`share: false` with `round: null`) deletes it");
+    expect(doc).toContain("or until unshare (`share: false` with `round: null`) deletes it");
+    expect(doc).not.toContain("until `remove`, `block`, or unshare");
   });
 
   it("does not spend a guess on the caller's own code", () => {

@@ -120,7 +120,7 @@ Each side picks only for its own rounds. No call returns a choice or an audience
 
 Performs the code lookup below, including the guess limit. A limited caller gets `rate_limited` and is not told whether the code exists.
 
-A real code that is not the caller, and no block in either direction, stores a pending request. Access does not start here. The other person must accept.
+A real code that is not the caller, and no block in either direction, stores a pending request. No duplicates: when the two are already friends the answer is `{ "status": "friends", "ownerId", "already": "friends" }`; when the caller already asked, `{ "status": "pending", "ownerId", "already": "outgoing" }`; when the other person already asked the caller, `{ "status": "pending", "ownerId", "already": "incoming" }` and nothing is written (accept theirs). Access does not start here. The other person must accept.
 
 `200` `{ "status": "pending", "ownerId": "<their ownerId>" }`
 
@@ -165,7 +165,7 @@ If `BOARDS` is missing, or it has no `list`, the call is `503` `{ "error": "boar
 
 ### Sender-only note lifetime
 
-A real pending request has no `expirationTtl`. It stays until the recipient accepts, or until a successful block deletes both `fr:req:` directions. There is no decline or withdraw call. Unblock, remove, and `resetCode` do not delete it. There is no cap on outstanding requests. Each send spends one code guess before the block check.
+A real pending request has no `expirationTtl`. It stays until the recipient accepts, or until a successful block deletes both `fr:req:` directions. Accept deletes both directions too: when each person sent a request, the accepter's own request to the other side goes with it. There is no decline or withdraw call. Unblock, remove, and `resetCode` do not delete it. There is no cap on outstanding requests. Each send spends one code guess before the block check.
 
 The note has that same lifetime from the sender's side. The rule is: delete the note only when a real pending request would also leave the sender's outgoing list, and only as a result of the sender's own later send or of the recipient accepting a real request.
 
@@ -206,9 +206,9 @@ Accept reads `fr:req:` only. A sender-only `fr:out:` note is not a request and c
 
 The phone's `id` is this `ownerId`.
 
-Deletes the friendship (both `fr:friend:` rows and both `fr:friends:` lists) and deletes only the caller's shared rounds. The other person's rounds stay for their remaining friends. Fetch no longer returns the caller's rounds to anyone.
+Deletes the friendship (both `fr:friend:` rows and both `fr:friends:` lists) and takes each side off the other's past-round audiences. No shared round is deleted: both people's rounds stay for their other friends, and the removed person no longer fetches the caller's rounds.
 
-This is Brian's approved behavior as of Oct 17, 2026, 5:37 PM CT. It replaces his earlier answer that remove and block wipe both people's shared rounds for every friend. There is no per-friend share list.
+This is Brian's approved behavior as of Oct 23, 2026, 5:50 PM CT: removing or blocking one friend only stops sharing with that friend. It replaces the Oct 17 answer that deleted the caller's shared rounds for every friend.
 
 `200` `{ "ok": true }`
 
@@ -226,7 +226,7 @@ The phone's `id` is this `ownerId`.
 
 Requires an accepted friendship (both `fr:friend:` rows). Otherwise `409` `{ "error": "not_friends" }` and nothing is written: no block row and no round delete. A key that only learned an `ownerId` from lookup cannot block that person.
 
-The block row is stored first. Then the friendship rows and both friend lists are deleted, then pending request rows, then only the caller's round list. A failure after the block row is stored must not leave the pair with the friendship already gone and no block. The other person's rounds stay for their remaining friends. Access ends immediately. The block is stored for the caller. Same as remove: caller-only round deletion is Brian's approved behavior as of Oct 17, 2026, 5:37 PM CT, replacing the earlier both-people answer.
+The block row is stored first. Then the friendship rows and both friend lists are deleted, then pending request rows, then each side's past-round audience entry for the other. No round list is deleted. A failure after the block row is stored must not leave the pair with the friendship already gone and no block. The other person's rounds stay for their remaining friends. Access ends immediately. The block is stored for the caller. Same as remove: no shared round is deleted (Brian, Oct 23, 2026, 5:50 PM CT).
 
 `200` `{ "ok": true }`
 
@@ -316,7 +316,7 @@ No body.
 
 `200` `{ "rounds": [ ] }`
 
-Each entry is a stored round from an accepted friend, plus the caller's own published rounds. A friend's past round (see setPastRounds) is included only when it was given to the caller, and the `to` audience is never returned. Rounds the caller removed, blocked, or unshared are already gone. The other person's rounds are not deleted by remove or block, so that person's other friends still fetch them. Omitted stat fields stay omitted. A stored round that fails the allowlist, including one that carries GPS, is omitted on read. The response is the full list. There is no cursor. Rounds are sorted by `playedOn`, then `ownerId`, then `id`, ascending.
+Each entry is a stored round from an accepted friend, plus the caller's own published rounds. A friend's past round (see setPastRounds) is included only when it was given to the caller, and the `to` audience is never returned. Rounds the caller unshared are already gone. Remove and block delete no rounds; they only end access between those two people. Omitted stat fields stay omitted. A stored round that fails the allowlist, including one that carries GPS, is omitted on read. The response is the full list. There is no cursor. Rounds are sorted by `playedOn`, then `ownerId`, then `id`, ascending.
 
 Fetch reads `3 + 2N + F` KV values and does not list. `N` is the caller's friend-list length. `F` is how many of those friends are unblocked in both directions (`F` ≤ `N`). The reads are 1 auth row, 1 `fr:friends:` list, 1 own `fr:rounds:` value, 2 block checks per friend, and 1 round-list read per unblocked friend. When nobody is blocked, that is `3 + 3N` gets.
 
@@ -414,7 +414,7 @@ Example with FIR and putts on, and GIR and clubs off:
 }
 ```
 
-League scores are these shared rounds. The Worker keeps one owner's rounds in one KV value for up to 1 year (`expirationTtl` of 365 days) or until `remove`, `block`, or unshare (`share: false` with `round: null`) deletes it, whichever comes first. Replacing a round refreshes that TTL. Text filtering for league titles and report notes is not part of this contract. Those fields are unknown today. Filtering comes later.
+League scores are these shared rounds. The Worker keeps one owner's rounds in one KV value for up to 1 year (`expirationTtl` of 365 days) or until unshare (`share: false` with `round: null`) deletes it, whichever comes first. Replacing a round refreshes that TTL. Text filtering for league titles and report notes is not part of this contract. Those fields are unknown today. Filtering comes later.
 
 An accepted friendship is capped at 50 friends per owner. `accept` checks both `fr:friends:` lists before it writes. If either person would go past 50, the call is `409` `{ "error": "friend_limit" }`, the pending request stays, and no friendship row is written.
 
