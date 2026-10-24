@@ -10,19 +10,27 @@
  * unblock, remove, publishRound, fetchRounds, listRequests, and listFriends.
  * Block is quiet for the blocked person. Unblock deletes only the caller's
  * block. Block requires a friendship and stores the block row before it
- * deletes that friendship. Remove and block delete only the caller's shared
- * rounds. One fr:rounds: value holds an owner's rounds. One fr:friends:
- * value is that owner's list. A pending request row is the string "pending"
- * and has no display name or created time. A quiet-block send writes
- * fr:out:<sender>:<recipient> = pending for that sender's outgoing list
- * only. It is not a request, it has no TTL, and unblock does not promote it.
+ * deletes that friendship. Remove and block stop sharing with only that
+ * friend. They do not delete the round list. One fr:rounds: value holds an
+ * owner's rounds. One fr:friends: value is that owner's list. A pending
+ * request row is the string "pending" and has no display name or created
+ * time. A quiet-block send writes fr:out:<sender>:<recipient> = pending
+ * for that sender's outgoing list only. It is not a request, it has no TTL,
+ * and unblock does not promote it.
  * Pending requests are indexed one key per pair: fr:ridx:in:<owner>:<other>
  * and fr:ridx:out:<owner>:<other>. Those keys are put and deleted. They are
  * not read-modify-written. fr:ridx:ready:<owner> is written last, after a
  * backfill scan for that owner. listRequests lists the caller's pair-key
  * prefixes when the marker is present, and otherwise scans fr:req:. The
- * read does not write. Decline and cancel are not routes: block declines
- * an incoming pending row and cancels an outgoing one.
+ * read does not write. Block declines an incoming pending row and cancels
+ * an outgoing one by deleting those pair keys. POST /v1/friends/requests/cancel
+ * withdraws a sent request the same way. There is no decline route.
+ * setInvitePhoto stores the sharer's invite photo (JPEG, 64 KB cap) at fr:invphoto:<code>,
+ * the same way as the name: never in a URL, returned only by lookup, deleted by reset.
+ * setInviteName stores the sharer's invite name at fr:invname:<code>; only
+ * code lookup returns it and resetCode deletes it. setPastRounds gives one
+ * friend a pick of the caller's past rounds (private "to" audience inside
+ * fr:rounds:); fetchRounds never returns a choice or an audience.
  */
 
 export const FRIEND_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -37,12 +45,35 @@ export const FRIEND_READ_IP_LIMIT = 60;
 export const FRIEND_GUESS_WINDOW_MS = 60 * 60 * 1000;
 export const FRIEND_CAP = 50;
 export const ROUND_CAP = 100;
+// Live rounds for friends (approved 2026-10-21 11:10 CT). A row is gone 30 minutes after its last update.
+export const FRIEND_LIVE_TTL_MS = 30 * 60 * 1000;
+// One update per hole plus a Friends-screen poll about once a minute.
+export const FRIEND_LIVE_IP_LIMIT = 240;
+// Invite name: the sharer's own name for this invite, stored with the code.
+// It is never in the URL. lookup returns it; reset deletes it with the old code.
+export const INVITE_NAME_MAX = 24;
+// Invite photo cap: JPEG only, at most 64 KB decoded, sent as base64. The app sends a 256 px square.
+export const INVITE_PHOTO_MAX_BYTES = 64 * 1024;
+export const INVITE_PHOTO_TYPE = "image/jpeg";
+// Past rounds: per friend, the owner's pick of rounds finished before the
+// friendship. "all" is still capped at ROUND_CAP.
+export const PAST_ROUND_CHOICES = Object.freeze(["none", "10", "25", "all"]);
 
 const FRIEND_KEY_PREFIX = "fr:";
 const FRIEND_KEY_HASH_PREFIX = "shottrax-friend-key-v1:";
 const FRIEND_IP_HASH_PREFIX = "shottrax-friend-guess-ip-v1:";
 const FRIEND_BODY_LIMIT = 2048;
 const PUBLISH_BODY_LIMIT = 8192;
+/** Live rounds carry each shot (club, yards, result): up to 15 per hole. */
+export const LIVE_BODY_LIMIT = 24 * 1024;
+export const LIVE_SHOT_LIMIT = 15;
+export const LIVE_SHOT_MAX_YARDS = 700;
+export const LIVE_SHOT_RESULTS = ["fairway", "rough", "sand", "green", "holed", "missed"];
+const LIVE_PUTT_CLUB = "Putt";
+// 100 ids of 64 characters plus quotes and commas.
+const DELETE_ROUNDS_BODY_LIMIT = 8192;
+const PAST_BODY_LIMIT = 256 * 1024;
+const PHOTO_BODY_LIMIT = 96 * 1024;
 const ROUND_TTL_SECONDS = 365 * 24 * 60 * 60;
 const ROUND_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const PLAYED_ON_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
@@ -74,6 +105,7 @@ function limitForDurableObjectName(name) {
   // "keyreq:" and "keylist:" must not inherit the 8-guess default.
   if (name.startsWith("ipget:")) return FRIEND_GETCODE_IP_LIMIT;
   if (name.startsWith("ippub:")) return FRIEND_PUBLISH_IP_LIMIT;
+  if (name.startsWith("iplive:")) return FRIEND_LIVE_IP_LIMIT;
   if (name.startsWith("ipreq:")) return FRIEND_READ_IP_LIMIT;
   if (name.startsWith("iplist:")) return FRIEND_READ_IP_LIMIT;
   if (name.startsWith("ip:")) return FRIEND_IP_GUESS_LIMIT;
@@ -189,14 +221,21 @@ export async function handleFriends(request, url, env, cors) {
 const FRIEND_ROUTES = {
   "/v1/friends/code": { POST: getCode },
   "/v1/friends/code/reset": { POST: resetCode },
+  "/v1/friends/code/name": { POST: setInviteName },
+  "/v1/friends/code/photo": { POST: setInvitePhoto },
+  "/v1/friends/live": { PUT: putLive, GET: fetchLive },
+  "/v1/friends/live/stop": { POST: stopLive },
   "/v1/friends/codes/lookup": { POST: lookupCode },
   "/v1/friends/requests": { POST: sendRequest, GET: listRequests },
   "/v1/friends/list": { GET: listFriends },
   "/v1/friends/requests/accept": { POST: acceptRequest },
+  "/v1/friends/requests/cancel": { POST: cancelRequest },
   "/v1/friends/block": { POST: blockPerson },
   "/v1/friends/unblock": { POST: unblockPerson },
   "/v1/friends/remove": { POST: removeFriend },
   "/v1/friends/rounds": { PUT: publishRound, GET: fetchRounds },
+  "/v1/friends/rounds/delete": { POST: deleteRounds },
+  "/v1/friends/past": { PUT: setPastRounds },
 };
 
 async function getCode(request, env, cors) {
@@ -238,6 +277,10 @@ async function resetCode(request, env, cors) {
   await friendPut(boards, authKey, storedAuth(existing.ownerId, code));
   // The old code is deleted before the response, so a later lookup misses.
   await friendDelete(boards, friendKvKey("code", previous));
+  // The invite name lives with the code. A reset deletes it; it does not move to the new code.
+  await deleteIfPresent(boards, friendKvKey("invname", previous));
+  await deleteIfPresent(boards, friendKvKey("ownname", existing.ownerId));
+  await deleteIfPresent(boards, friendKvKey("invphoto", previous));
   return friendJson(200, { code, ownerId: existing.ownerId }, cors);
 }
 
@@ -260,7 +303,224 @@ async function lookupCode(request, env, cors) {
   if (typeof ownerId !== "string" || ownerId.length === 0) {
     return friendJson(404, { error: "code_not_found" }, cors);
   }
-  return friendJson(200, { ownerId }, cors);
+  // The invite name is returned only here, when the code (or its link) is opened.
+  const name = readInviteName(await friendGet(boards, friendKvKey("invname", code)));
+  const photo = readInvitePhoto(await friendGet(boards, friendKvKey("invphoto", code)));
+  const found = { ownerId };
+  if (name) found.name = name;
+  if (photo) found.photo = photo;
+  return friendJson(200, found, cors);
+}
+
+/**
+ * Store or clear the caller's invite name. Body { name: string | null }.
+ * 1-24 characters after trimming, no control characters. "" or null deletes it.
+ */
+async function setInviteName(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const parsed = await readJsonObject(request, FRIEND_BODY_LIMIT, false);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (unknownFields(parsed.value, ["name"]) || !Object.hasOwn(parsed.value, "name")) {
+    return friendJson(400, { error: "invalid_body" }, cors);
+  }
+  const raw = parsed.value.name;
+  let name = null;
+  if (raw !== null) {
+    if (typeof raw !== "string") return friendJson(400, { error: "invalid_body" }, cors);
+    const trimmed = raw.replace(/\s+/g, " ").trim();
+    if (trimmed.length > 0) {
+      name = readInviteName(trimmed);
+      if (!name) return friendJson(400, { error: "invalid_body" }, cors);
+    }
+  }
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const key = friendKvKey("invname", caller.code);
+  // The same name is kept by ownerId so friend and request lists can show it.
+  const ownKey = friendKvKey("ownname", caller.ownerId);
+  if (name) {
+    await friendPut(boards, key, name);
+    await friendPut(boards, ownKey, name);
+  } else {
+    await deleteIfPresent(boards, key);
+    await deleteIfPresent(boards, ownKey);
+  }
+  return friendJson(200, { ok: true }, cors);
+}
+
+/**
+ * Store or clear the caller's invite photo. Body { photo: { type: "image/jpeg", data: base64 } | null }.
+ * JPEG only, at most INVITE_PHOTO_MAX_BYTES decoded. null deletes it. Stored at fr:invphoto:<code>.
+ */
+async function setInvitePhoto(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const parsed = await readJsonObject(request, PHOTO_BODY_LIMIT, false);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (unknownFields(parsed.value, ["photo"]) || !Object.hasOwn(parsed.value, "photo")) {
+    return friendJson(400, { error: "invalid_body" }, cors);
+  }
+  const raw = parsed.value.photo;
+  let photo = null;
+  if (raw !== null) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return friendJson(400, { error: "invalid_body" }, cors);
+    if (unknownFields(raw, ["type", "data"])) return friendJson(400, { error: "invalid_body" }, cors);
+    if (raw.type !== INVITE_PHOTO_TYPE) return friendJson(415, { error: "photo_type" }, cors);
+    photo = readInvitePhoto(JSON.stringify({ type: raw.type, data: raw.data }));
+    if (!photo) {
+      const tooBig = typeof raw.data === "string" && raw.data.length > Math.ceil(INVITE_PHOTO_MAX_BYTES / 3) * 4;
+      return friendJson(tooBig ? 413 : 400, { error: tooBig ? "photo_too_large" : "invalid_body" }, cors);
+    }
+  }
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const key = friendKvKey("invphoto", caller.code);
+  if (photo) await friendPut(boards, key, JSON.stringify(photo));
+  else await deleteIfPresent(boards, key);
+  return friendJson(200, { ok: true }, cors);
+}
+
+function readInvitePhoto(raw) {
+  if (typeof raw !== "string") return null;
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!value || value.type !== INVITE_PHOTO_TYPE || typeof value.data !== "string") return null;
+  const data = value.data;
+  if (data.length < 8 || data.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) return null;
+  const bytes = (data.length / 4) * 3 - (data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0);
+  if (bytes > INVITE_PHOTO_MAX_BYTES) return null;
+  // JPEG files start with FF D8 FF ("/9j/" in base64).
+  if (!data.startsWith("/9j/")) return null;
+  return { type: INVITE_PHOTO_TYPE, data };
+}
+
+async function backfillOwnName(boards, caller) {
+  const ownKey = friendKvKey("ownname", caller.ownerId);
+  if (readInviteName(await friendGet(boards, ownKey))) return;
+  const name = readInviteName(await friendGet(boards, friendKvKey("invname", caller.code)));
+  if (name) await friendPut(boards, ownKey, name);
+}
+
+/** The other person's invite name for list rows, or the bare entry when unset or invalid. */
+async function withOwnerName(boards, ownerId) {
+  const name = readInviteName(await friendGet(boards, friendKvKey("ownname", ownerId)));
+  return name ? { ownerId, name } : { ownerId };
+}
+
+function readInviteName(raw) {
+  if (typeof raw !== "string") return null;
+  if (raw.length < 1 || [...raw].length > INVITE_NAME_MAX) return null;
+  if (raw !== raw.trim() || /[\u0000-\u001F\u007F]/.test(raw)) return null;
+  return raw;
+}
+
+/**
+ * The caller's past rounds for one friend. Body { ownerId, choice, rounds }.
+ * choice is "none", "10", "25" or "all". rounds must fit the choice (all = ROUND_CAP).
+ * The stored set is replaced, so a lower choice deletes the rest; "none" deletes the row.
+ * Only the caller's own row is written. No call returns a choice, the caller's or the friend's.
+ */
+async function setPastRounds(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const parsed = await readJsonObject(request, PAST_BODY_LIMIT, false);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  const body = parsed.value;
+  if (unknownFields(body, ["ownerId", "choice", "rounds"])) return friendJson(400, { error: "invalid_body" }, cors);
+  const ownerId = readOwnerId(body.ownerId);
+  const limit = pastChoiceLimit(body.choice);
+  if (!ownerId || limit == null || !Array.isArray(body.rounds)) return friendJson(400, { error: "invalid_body" }, cors);
+  if (body.rounds.length > limit) return friendJson(400, { error: "invalid_body" }, cors);
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  if (ownerId === caller.ownerId) return friendJson(400, { error: "invalid_body" }, cors);
+  const stored = [];
+  const seen = new Set();
+  for (const round of body.rounds) {
+    const clean = sanitizeRound(round, caller.ownerId);
+    if (!clean || seen.has(clean.id)) return friendJson(400, { error: "invalid_body" }, cors);
+    seen.add(clean.id);
+    stored.push(clean);
+  }
+  if (!(await areFriends(boards, caller.ownerId, ownerId)) || !(await areFriends(boards, ownerId, caller.ownerId))) {
+    return friendJson(409, { error: "not_friends" }, cors);
+  }
+  const limited = await consumeIpAction(request, env, "ippub:", cors);
+  if (limited) return limited;
+  // Past rounds live in the owner's one fr:rounds: value with a private
+  // audience (to: ownerIds). First this friend is taken off every past round,
+  // which deletes rounds no one else was given, then the new pick is added.
+  // A round already shared the normal way is visible to every friend and is not touched.
+  const next = withoutAudience(await loadOwnedRounds(boards, caller.ownerId), ownerId);
+  for (const round of stored) {
+    const index = next.findIndex((item) => item.id === round.id);
+    if (index >= 0) {
+      const current = next[index];
+      if (!Array.isArray(current.to)) continue;
+      next[index] = { ...round, to: [...current.to, ownerId] };
+      continue;
+    }
+    if (next.length >= ROUND_CAP) return friendJson(409, { error: "round_limit" }, cors);
+    next.push({ ...round, to: [ownerId] });
+  }
+  await saveOwnedRounds(boards, caller.ownerId, next);
+  return friendJson(200, { ok: true }, cors);
+}
+
+/** Take one friend off every past round. A past round left with no audience is dropped. */
+function withoutAudience(rounds, friendId) {
+  const out = [];
+  for (const round of rounds) {
+    if (!Array.isArray(round.to)) {
+      out.push(round);
+      continue;
+    }
+    const to = round.to.filter((id) => id !== friendId);
+    if (to.length > 0) out.push({ ...round, to });
+  }
+  return out;
+}
+
+async function saveOwnedRounds(boards, ownerId, rounds) {
+  const key = friendKvKey("rounds", ownerId);
+  if (rounds.length === 0) {
+    await deleteIfPresent(boards, key);
+    return;
+  }
+  await friendPut(boards, key, JSON.stringify(rounds), { expirationTtl: ROUND_TTL_SECONDS });
+}
+
+/** What a reader may see of a round: never the audience list. */
+function publicRound(round) {
+  if (!Object.hasOwn(round, "to")) return round;
+  const { to: _to, ...rest } = round;
+  return rest;
+}
+
+function pastChoiceLimit(choice) {
+  if (choice === "none") return 0;
+  if (choice === "10") return 10;
+  if (choice === "25") return 25;
+  if (choice === "all") return ROUND_CAP;
+  return null;
+}
+
+/** After remove or block: the other side's past rounds given to the caller are taken back too. */
+async function deletePastRoundsFor(boards, ownerId, friendId) {
+  const rounds = await loadOwnedRounds(boards, ownerId);
+  if (!rounds.some((round) => Array.isArray(round.to) && round.to.includes(friendId))) return;
+  await saveOwnedRounds(boards, ownerId, withoutAudience(rounds, friendId));
 }
 
 async function sendRequest(request, env, cors) {
@@ -293,21 +553,29 @@ async function sendRequest(request, env, cors) {
     await storeOutgoingNote(boards, caller.ownerId, ownerId);
     return friendJson(200, { status: "pending", ownerId }, cors);
   }
+  // No duplicates: an existing friend or a pending request in either direction
+  // is reported with `already` and does not store a second fr:req row.
   if (await areFriends(boards, caller.ownerId, ownerId)) {
     // Already friends. Delete the note only. Do not write pair-index keys:
     // there is no pending row to publish, and a put here would be a write
     // the 1,000/day budget does not need.
     await deleteOutgoingNote(boards, caller.ownerId, ownerId);
-    return friendJson(200, { status: "friends", ownerId }, cors);
+    return friendJson(200, { status: "friends", ownerId, already: "friends" }, cors);
   }
   const reqKey = requestKey(ownerId, caller.ownerId);
   const pending = await friendGet(boards, reqKey);
   if (typeof pending === "string" && pending.length > 0) {
     await deleteOutgoingNote(boards, caller.ownerId, ownerId);
     // Repair pair keys when the row was stored without them (repeat send
-    // after a failed index put, a rollback, or deploy overlap).
+    // after a failed index put, a rollback, or deploy overlap). A flag that
+    // is already "1" is not put again, so a duplicate send writes nothing.
     await indexOnCreate(boards, ownerId, caller.ownerId);
-    return friendJson(200, { status: "pending", ownerId }, cors);
+    return friendJson(200, { status: "pending", ownerId, already: "outgoing" }, cors);
+  }
+  const reverse = await friendGet(boards, requestKey(caller.ownerId, ownerId));
+  if (typeof reverse === "string" && reverse.length > 0) {
+    // They already asked you: no second request, and no pair-key write.
+    return friendJson(200, { status: "pending", ownerId, already: "incoming" }, cors);
   }
   // Pair keys before the request row. A failed index put leaves no fr:req
   // to hide. KV list can lag a new key by about 60s; the key is still stored.
@@ -357,9 +625,32 @@ async function acceptRequest(request, env, cors) {
   // fr:out:<caller>:<requester> is the acceptor's stale outgoing note.
   await deleteOutgoingNote(boards, ownerId, caller.ownerId);
   await deleteOutgoingNote(boards, caller.ownerId, ownerId);
+  // Both people may have sent a request (each opened the other's link). Drop the
+  // caller's own request to the other side too, so the new friend never sees a
+  // stale incoming row. Both fr:req rows are gone before the backfill. A list
+  // that still returns one would put that pair key again, and the delete after
+  // the backfill removes that put.
+  await friendDelete(boards, requestKey(ownerId, caller.ownerId));
   await friendDelete(boards, reqKey);
   await indexOnAccept(boards, caller.ownerId, ownerId);
+  await indexOnAccept(boards, ownerId, caller.ownerId);
   return friendJson(200, { status: "friends", ownerId }, cors);
+}
+
+/**
+ * Withdraw a request the caller sent. Deletes only the caller's own pending row
+ * (and any quiet-block note), so the recipient no longer sees it. Idempotent:
+ * nothing pending is still 200. Never touches friendships, blocks or rounds.
+ */
+async function cancelRequest(request, env, cors) {
+  const ready = await readyOwnerCall(request, env, cors);
+  if (ready.error) return ready.error;
+  const { boards, caller, ownerId } = ready;
+  // Pair keys are deleted only when a fr:req row was stored. A quiet-block
+  // note has no pair key. The note delete still runs when the row is absent.
+  await cancelPendingRequest(boards, caller.ownerId, ownerId);
+  await deleteOutgoingNote(boards, caller.ownerId, ownerId);
+  return friendJson(200, { ok: true }, cors);
 }
 
 async function blockPerson(request, env, cors) {
@@ -376,11 +667,15 @@ async function blockPerson(request, env, cors) {
   await saveFriendIds(boards, caller.ownerId, removeFriendId(await loadFriendIds(boards, caller.ownerId), ownerId));
   await saveFriendIds(boards, ownerId, removeFriendId(await loadFriendIds(boards, ownerId), caller.ownerId));
   // Incoming pending row: the caller declines it. Outgoing pending row: the
-  // caller cancels it. There is no decline or cancel route. Both updates
-  // keep fr:ridx: aligned with the fr:req: rows this call deletes.
+  // caller cancels it. Both updates delete that pair's fr:ridx keys after
+  // the backfill. They do not rewrite a shared list.
   await declinePendingRequest(boards, caller.ownerId, ownerId);
   await cancelPendingRequest(boards, caller.ownerId, ownerId);
-  await deleteOwnedRounds(boards, caller.ownerId);
+  // Only this friend loses access. Normal shared rounds reach friends through the
+  // friend list, so ending the friendship already ends access; the caller's rounds
+  // stay for everyone else. Past picks given to this one person are taken back both ways.
+  await deletePastRoundsFor(boards, caller.ownerId, ownerId);
+  await deletePastRoundsFor(boards, ownerId, caller.ownerId);
   return friendJson(200, { ok: true }, cors);
 }
 
@@ -406,7 +701,11 @@ async function removeFriend(request, env, cors) {
   await friendDelete(boards, friendKvKey("friend", `${ownerId}:${caller.ownerId}`));
   await saveFriendIds(boards, caller.ownerId, removeFriendId(await loadFriendIds(boards, caller.ownerId), ownerId));
   await saveFriendIds(boards, ownerId, removeFriendId(await loadFriendIds(boards, ownerId), caller.ownerId));
-  await deleteOwnedRounds(boards, caller.ownerId);
+  // Only this friend loses access. Normal shared rounds reach friends through the
+  // friend list, so ending the friendship already ends access; the caller's rounds
+  // stay for everyone else. Past picks given to this one person are taken back both ways.
+  await deletePastRoundsFor(boards, caller.ownerId, ownerId);
+  await deletePastRoundsFor(boards, ownerId, caller.ownerId);
   return friendJson(200, { ok: true }, cors);
 }
 
@@ -446,6 +745,37 @@ async function publishRound(request, env, cors) {
     expirationTtl: ROUND_TTL_SECONDS,
   });
   return friendJson(200, { ok: true, id: stored.id }, cors);
+}
+
+/**
+ * Delete some of the caller's own rounds by id. Body { ids: [roundId, ...] }, 1 to ROUND_CAP ids.
+ * Takes both normal shares and past-round picks. Ids the caller never shared
+ * (or already deleted) are fine, so a phone can retry after a lost answer.
+ * Only the caller's own fr:rounds: value is read or written.
+ */
+async function deleteRounds(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const parsed = await readJsonObject(request, DELETE_ROUNDS_BODY_LIMIT, false);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  const body = parsed.value;
+  if (unknownFields(body, ["ids"]) || !Array.isArray(body.ids)) return friendJson(400, { error: "invalid_body" }, cors);
+  if (body.ids.length < 1 || body.ids.length > ROUND_CAP) return friendJson(400, { error: "invalid_body" }, cors);
+  if (!body.ids.every((id) => typeof id === "string" && ROUND_ID_RE.test(id))) {
+    return friendJson(400, { error: "invalid_body" }, cors);
+  }
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const limited = await consumeIpAction(request, env, "ippub:", cors);
+  if (limited) return limited;
+  const drop = new Set(body.ids);
+  const existing = await loadOwnedRounds(boards, caller.ownerId);
+  const kept = existing.filter((round) => !drop.has(round.id));
+  const removed = existing.length - kept.length;
+  if (removed > 0) await saveOwnedRounds(boards, caller.ownerId, kept);
+  return friendJson(200, { ok: true, removed }, cors);
 }
 
 async function listRequests(request, env, cors) {
@@ -503,7 +833,11 @@ async function listRequests(request, env, cors) {
   }
   const incomingSorted = dedupeByOwnerId(incoming).sort(compareByOwnerId);
   const outgoingSorted = dedupeByOwnerId(outgoing).sort(compareByOwnerId);
-  return friendJson(200, { incoming: incomingSorted, outgoing: outgoingSorted }, cors);
+  const incomingNamed = [];
+  for (const row of incomingSorted) incomingNamed.push(await withOwnerName(boards, row.ownerId));
+  const outgoingNamed = [];
+  for (const row of outgoingSorted) outgoingNamed.push(await withOwnerName(boards, row.ownerId));
+  return friendJson(200, { incoming: incomingNamed, outgoing: outgoingNamed }, cors);
 }
 
 async function listFriends(request, env, cors) {
@@ -512,6 +846,8 @@ async function listFriends(request, env, cors) {
   const { boards, caller, friendKey } = ready;
   const limited = await consumeReadLimit(request, env, friendKey, "keylist:", "iplist:", cors);
   if (limited) return limited;
+  // Backfill: an invite name saved before fr:ownname: existed is copied once from the code row.
+  await backfillOwnName(boards, caller);
   // accept stores at most FRIEND_CAP ids. Inspect that many, in stored order.
   const ids = (await loadFriendIds(boards, caller.ownerId)).slice(0, FRIEND_CAP);
   const friends = [];
@@ -525,7 +861,9 @@ async function listFriends(request, env, cors) {
     // The friend row is "1". No created time is stored, so there is no since.
     friends.push({ ownerId: otherId });
   }
-  return friendJson(200, { friends: dedupeByOwnerId(friends).sort(compareByOwnerId) }, cors);
+  const named = [];
+  for (const row of dedupeByOwnerId(friends).sort(compareByOwnerId)) named.push(await withOwnerName(boards, row.ownerId));
+  return friendJson(200, { friends: named }, cors);
 }
 
 async function fetchRounds(request, env, cors) {
@@ -543,10 +881,122 @@ async function fetchRounds(request, env, cors) {
     const blockedByCaller = await hasBlock(boards, caller.ownerId, otherId);
     const blockedByOther = await hasBlock(boards, otherId, caller.ownerId);
     if (blockedByCaller || blockedByOther) continue;
-    rounds.push(...await loadOwnedRounds(boards, otherId));
+    for (const round of await loadOwnedRounds(boards, otherId)) {
+      // A past round reaches only the friends it was given to.
+      if (Array.isArray(round.to) && !round.to.includes(caller.ownerId)) continue;
+      rounds.push(round);
+    }
   }
   rounds.sort(compareRounds);
-  return friendJson(200, { rounds }, cors);
+  return friendJson(200, { rounds: rounds.map(publicRound) }, cors);
+}
+
+/**
+ * Your live round for friends. Body { courseName, hole, holes }. holes use the
+ * publishRound hole allowlist (score and par always; fir, gir, putts, clubs only
+ * when the phone's switches are on), so GPS or any other field is 400.
+ * Stored at fr:live:<ownerId> and replaced on every update. The phone sends this
+ * only while "Share live rounds with friends" is on and the round is shared.
+ */
+async function putLive(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const parsed = await readJsonObject(request, LIVE_BODY_LIMIT, false);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  const body = parsed.value;
+  if (unknownFields(body, ["courseName", "hole", "holes", "shots"])) return friendJson(400, { error: "invalid_body" }, cors);
+  if (!validCourseName(body.courseName)) return friendJson(400, { error: "invalid_body" }, cors);
+  if (!Number.isInteger(body.hole) || body.hole < 1 || body.hole > 18) return friendJson(400, { error: "invalid_body" }, cors);
+  if (!Array.isArray(body.holes) || body.holes.length > 18) return friendJson(400, { error: "invalid_body" }, cors);
+  const holes = [];
+  const seen = new Set();
+  for (const hole of body.holes) {
+    const clean = sanitizeLiveHole(hole);
+    if (!clean || seen.has(clean.hole)) return friendJson(400, { error: "invalid_body" }, cors);
+    seen.add(clean.hole);
+    holes.push(clean);
+  }
+  holes.sort((a, b) => a.hole - b.hole);
+  // Top-level shots are the current hole's, so only while that hole has no score.
+  let currentShots = null;
+  if (Object.hasOwn(body, "shots")) {
+    currentShots = sanitizeShots(body.shots, false);
+    if (!currentShots || seen.has(body.hole)) return friendJson(400, { error: "invalid_body" }, cors);
+  }
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const limited = await consumeIpAction(request, env, "iplive:", cors);
+  if (limited) return limited;
+  const row = { courseName: body.courseName, hole: body.hole, holes, updatedAt: Date.now() };
+  if (currentShots) row.shots = currentShots;
+  await friendPut(boards, friendKvKey("live", caller.ownerId), JSON.stringify(row), {
+    expirationTtl: Math.ceil(FRIEND_LIVE_TTL_MS / 1000),
+  });
+  return friendJson(200, { ok: true }, cors);
+}
+
+/** Round finished, switch turned off, or "Friends can follow" tapped: the row is deleted. */
+async function stopLive(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const parsed = await readJsonObject(request, FRIEND_BODY_LIMIT, true);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (!parsed.empty && unknownFields(parsed.value, [])) return friendJson(400, { error: "invalid_body" }, cors);
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  await deleteIfPresent(boards, friendKvKey("live", caller.ownerId));
+  return friendJson(200, { ok: true }, cors);
+}
+
+/**
+ * Friends playing now: accepted friends both ways, not blocked either way,
+ * with a live row updated in the last 30 minutes. Never your own row, never a
+ * non-friend's, and no field beyond the stored allowlist.
+ */
+async function fetchLive(request, env, cors) {
+  const ready = await readyReadCall(request, env, cors);
+  if (ready.error) return ready.error;
+  const { boards, caller } = ready;
+  const limited = await consumeIpAction(request, env, "iplive:", cors);
+  if (limited) return limited;
+  const now = Date.now();
+  const live = [];
+  for (const otherId of await loadFriendIds(boards, caller.ownerId)) {
+    if (!(await areFriends(boards, otherId, caller.ownerId))) continue;
+    if ((await hasBlock(boards, caller.ownerId, otherId)) || (await hasBlock(boards, otherId, caller.ownerId))) continue;
+    const row = readLiveRow(await friendGet(boards, friendKvKey("live", otherId)), now);
+    if (row) live.push({ ownerId: otherId, ...row });
+  }
+  return friendJson(200, { live }, cors);
+}
+
+function readLiveRow(raw, now) {
+  if (typeof raw !== "string") return null;
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== "object") return null;
+  if (!Number.isFinite(value.updatedAt) || now - value.updatedAt > FRIEND_LIVE_TTL_MS || value.updatedAt > now + 60_000) return null;
+  if (!validCourseName(value.courseName) || !Number.isInteger(value.hole)) return null;
+  const holes = Array.isArray(value.holes) ? value.holes.map(sanitizeLiveHole).filter(Boolean) : [];
+  const toPar = holes.reduce((sum, hole) => sum + hole.score - hole.par, 0);
+  const out = {
+    courseName: value.courseName,
+    hole: value.hole,
+    toPar,
+    holes,
+    updatedAt: new Date(value.updatedAt).toISOString(),
+  };
+  const shots = Object.hasOwn(value, "shots") ? sanitizeShots(value.shots, false) : null;
+  if (shots) out.shots = shots;
+  return out;
 }
 
 async function readyReadCall(request, env, cors) {
@@ -852,8 +1302,16 @@ async function loadOwnedRounds(boards, ownerId) {
   const seen = new Set();
   for (const item of parsed) {
     if (item == null || typeof item !== "object" || Array.isArray(item)) continue;
-    const round = sanitizeRound(item, ownerId);
+    const { to, ...body } = item;
+    const round = sanitizeRound(body, ownerId);
     if (!round || seen.has(round.id)) continue;
+    if (Object.hasOwn(item, "to")) {
+      // A past round with a bad or empty audience is dropped, never widened to everyone.
+      if (!Array.isArray(to)) continue;
+      const audience = [...new Set(to.filter((id) => typeof id === "string" && OWNER_ID_RE.test(id)))];
+      if (audience.length === 0) continue;
+      round.to = audience;
+    }
     seen.add(round.id);
     rounds.push(round);
   }
@@ -914,6 +1372,77 @@ function sanitizeHole(hole) {
     clean.clubs = hole.clubs.slice();
   }
   return clean;
+}
+
+/**
+ * Live rounds only (Brian OK 2026-10-22 9:26 AM CT): a hole may also carry shots.
+ * Published rounds and share links still use sanitizeHole, which refuses shots.
+ */
+function sanitizeLiveHole(hole) {
+  if (hole == null || typeof hole !== "object" || Array.isArray(hole)) return null;
+  const { shots, ...rest } = hole;
+  const clean = sanitizeHole(rest);
+  if (!clean) return null;
+  if (Object.hasOwn(hole, "shots")) {
+    const list = sanitizeShots(shots, true);
+    if (!list) return null;
+    clean.shots = list;
+  }
+  return clean;
+}
+
+/** 1 to 15 shots, numbered 1..15 with no repeats, in stroke order. Null on anything else. */
+function sanitizeShots(shots, scored) {
+  if (!Array.isArray(shots) || shots.length < 1 || shots.length > LIVE_SHOT_LIMIT) return null;
+  const out = [];
+  const seen = new Set();
+  for (const shot of shots) {
+    const clean = sanitizeShot(shot, scored);
+    if (!clean || seen.has(clean.n)) return null;
+    seen.add(clean.n);
+    out.push(clean);
+  }
+  return out.sort((a, b) => a.n - b.n);
+}
+
+/**
+ * Allowlist: n, club, yd, s, e, res. s and e are [lat, lng] at most 5 decimals.
+ * Putts carry no yards and no coordinates; Holed only on a scored hole.
+ */
+export function sanitizeShot(shot, scored = true) {
+  if (shot == null || typeof shot !== "object" || Array.isArray(shot)) return null;
+  if (unknownFields(shot, ["n", "club", "yd", "s", "e", "res"])) return null;
+  if (!Number.isInteger(shot.n) || shot.n < 1 || shot.n > LIVE_SHOT_LIMIT) return null;
+  const clean = { n: shot.n };
+  if (Object.hasOwn(shot, "club")) {
+    if (typeof shot.club !== "string" || !CLUB_RE.test(shot.club)) return null;
+    clean.club = shot.club;
+  }
+  const putt = clean.club === LIVE_PUTT_CLUB;
+  if (Object.hasOwn(shot, "yd")) {
+    if (putt || !Number.isInteger(shot.yd) || shot.yd < 0 || shot.yd > LIVE_SHOT_MAX_YARDS) return null;
+    clean.yd = shot.yd;
+  }
+  for (const key of ["s", "e"]) {
+    if (!Object.hasOwn(shot, key)) continue;
+    if (putt || !validLivePoint(shot[key])) return null;
+    clean[key] = [shot[key][0], shot[key][1]];
+  }
+  if (Object.hasOwn(shot, "res")) {
+    if (typeof shot.res !== "string" || !LIVE_SHOT_RESULTS.includes(shot.res)) return null;
+    if (shot.res === "holed" && !scored) return null;
+    clean.res = shot.res;
+  }
+  return clean;
+}
+
+/** [lat, lng], finite, in range, no more than 5 decimal places (about 1 m). */
+function validLivePoint(point) {
+  if (!Array.isArray(point) || point.length !== 2) return false;
+  const [lat, lng] = point;
+  if (typeof lat !== "number" || typeof lng !== "number" || !Number.isFinite(lat) || !Number.isFinite(lng)) return false;
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return false;
+  return Math.round(lat * 1e5) / 1e5 === lat && Math.round(lng * 1e5) / 1e5 === lng;
 }
 
 function validClubs(clubs) {
@@ -1077,7 +1606,11 @@ function friendKvKey(kind, id) {
     kind !== "friends" &&
     kind !== "round" &&
     kind !== "rounds" &&
-    kind !== "block"
+    kind !== "block" &&
+    kind !== "invname" &&
+    kind !== "invphoto" &&
+    kind !== "ownname" &&
+    kind !== "live"
   ) {
     throw new Error("friend_namespace");
   }

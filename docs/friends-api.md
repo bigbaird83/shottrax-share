@@ -54,7 +54,59 @@ Body: empty, or `{}`.
 
 The friend key must already have a code. Otherwise `401` `{ "error": "friend_key_required" }`.
 
-`200` with the new `code` and the same `ownerId`. The previous code then looks up as `404` `{ "error": "code_not_found" }`. Does not count as a guess, and does not clear the guess counter.
+`200` with the new `code` and the same `ownerId`. The previous code then looks up as `404` `{ "error": "code_not_found" }`. Does not count as a guess, and does not clear the guess counter. The invite name stored with the previous code (`fr:invname:<old CODE>`) and the invite photo (`fr:invphoto:<old CODE>`) are deleted on the same request. Neither is copied to the new code.
+
+### setInviteName
+
+`POST /v1/friends/code/name`
+
+```json
+{ "name": "Alex M." }
+```
+
+The sharer's name for this invite. It is stored with the caller's current code and is never part of the link or the URL. Whitespace runs collapse to one space and the ends are trimmed. 1 to 24 characters, no control characters, else `400` `{ "error": "invalid_body" }`. `null`, `""` or all spaces deletes it. A key with no code is `401`. `200` `{ "ok": true }`. Not a guess and not rate limited beyond the normal key check.
+
+The name is returned only by code lookup (below), when someone opens the link or types the code. `getCode`, `resetCode`, the lists and `fetchRounds` never carry it. It is invite-only: it changes nothing about what is shared.
+
+### setInvitePhoto
+
+`POST /v1/friends/code/photo`
+
+```json
+{ "photo": { "type": "image/jpeg", "data": "<base64>" } }
+```
+
+The sharer's optional photo for this invite, stored with the caller's current code at `fr:invphoto:<CODE>` and never part of the link or URL. Cap: `type` must be `image/jpeg` (else `415` `{ "error": "photo_type" }`), `data` is standard base64 of a JPEG (starts `FF D8 FF`) of at most 64 KB decoded (else `413` `{ "error": "photo_too_large" }`). Body cap 96 KB. Other shapes are `400`. `{ "photo": null }` deletes it. A key with no code is `401`. `200` `{ "ok": true }`.
+
+Returned only by code lookup as `photo` next to `name`. `resetCode` deletes it from the server. A copy the friend already saved on their phone is theirs and is not affected.
+
+### putLive / fetchLive / stopLive (live rounds for friends)
+
+`PUT /v1/friends/live`
+
+```json
+{ "courseName": "Pine Hollow GC", "hole": 7, "holes": [ { "hole": 1, "score": 5, "par": 4 } ] }
+```
+
+Your round in progress, for friends. `hole` is the current hole (1 to 18). `holes` (0 to 18) use the publishRound hole allowlist: `score` and `par` always, and `fir`, `gir`, `putts` and `clubs` only when the phone's Round stats and Club averages switches are on. GPS, position or any other field is `400`. Stored at `fr:live:<ownerId>` with `updatedAt`, and replaced on every update. KV TTL is 30 minutes. The phone sends it only while "Share live rounds with friends" is on and that round is shared. Rate limited on the `iplive:` IP counter (240 per hour, shared with fetchLive). `200` `{ "ok": true }`.
+
+`GET /v1/friends/live` returns `200` `{ "live": [ { "ownerId", "courseName", "hole", "toPar", "holes", "updatedAt" } ] }`: only accepted friends both ways, not blocked either way, whose row was updated in the last 30 minutes. `toPar` is worked out from `holes`. Your own row, non-friends' rows and anything older than 30 minutes are never returned.
+
+`POST /v1/friends/live/stop` (empty body) deletes your row: at round finish, when the switch is turned off, or when "Friends can follow" is tapped. `200` `{ "ok": true }`.
+
+### setPastRounds
+
+`PUT /v1/friends/past`
+
+```json
+{ "ownerId": "<friend>", "choice": "10", "rounds": [ { "id": "...", "courseName": "...", "playedOn": "2025-04-01", "gross": 84, "toPar": 12, "holes": [ ] } ] }
+```
+
+The caller's own past rounds for one accepted friend. `choice` is `"none"`, `"10"`, `"25"` or `"all"`. `rounds` may hold at most 0, 10, 25 or 100 (`ROUND_CAP`) entries for those choices. Each round passes the same allowlist as `publishRound`, so GPS, names and unknown fields are `400`. Body cap 256 KB. Not friends both ways: `409` `{ "error": "not_friends" }`. Rate limited on the `ippub:` IP counter. `200` `{ "ok": true }`.
+
+Storage: past rounds live in the owner's one `fr:rounds:<ownerId>` value with a private audience `to: [ownerIds]`. A call first takes this friend off every past round (a past round with no audience left is deleted), then adds the new pick. So a lower choice, or `"none"`, deletes the rounds that no longer fit from the Worker. A round already shared the normal way (no `to`) is visible to every friend and is left as it is. A later `publishRound` of the same id makes it a normal shared round. Counts toward the 100-round cap; over it is `409` `round_limit`.
+
+Each side picks only for its own rounds. No call returns a choice or an audience, the caller's or the friend's: `fetchRounds` strips `to`, and there is no read route for `/past` (`GET` is `405`). Remove and block take the caller off the other side's past rounds too.
 
 ### sendRequest
 
@@ -68,7 +120,7 @@ The friend key must already have a code. Otherwise `401` `{ "error": "friend_key
 
 Performs the code lookup below, including the guess limit. A limited caller gets `rate_limited` and is not told whether the code exists.
 
-A real code that is not the caller, and no block in either direction, stores a pending request. Access does not start here. The other person must accept.
+A real code that is not the caller, and no block in either direction, stores a pending request. No duplicates: when the two are already friends the answer is `{ "status": "friends", "ownerId", "already": "friends" }`; when the caller already asked, `{ "status": "pending", "ownerId", "already": "outgoing" }`; when the other person already asked the caller, `{ "status": "pending", "ownerId", "already": "incoming" }` and nothing is written (accept theirs). Access does not start here. The other person must accept.
 
 `200` `{ "status": "pending", "ownerId": "<their ownerId>" }`
 
@@ -103,7 +155,7 @@ Auth is `X-Friend-Key`, the same as the other friends routes. A missing or bad k
 }
 ```
 
-`incoming` is pending requests other people sent the caller. `outgoing` is pending requests the caller sent: `fr:req:<recipient>:<caller>` rows and the caller's own `fr:out:<caller>:<recipient>` notes. Each entry is the other person's `ownerId` only. The stored row is the string `pending`. It has no display name and no created time, so this route does not add those fields. The raw value is not returned. A friend code, a friend key, a raw KV key, and anyone who is not the other party of that request are not returned.
+`incoming` is pending requests other people sent the caller. `outgoing` is pending requests the caller sent: `fr:req:<recipient>:<caller>` rows and the caller's own `fr:out:<caller>:<recipient>` notes. Each entry is the other person's `ownerId`, plus `name` when that person has set an invite name (read from `fr:ownname:<ownerId>`, validated like lookup, omitted when unset or invalid). The stored row is the string `pending`. It has no created time. The raw value is not returned. A friend code, a friend key, a raw KV key, and anyone who is not the other party of that request are not returned.
 
 A requester the caller has blocked is left out of `incoming`. A stored outgoing `fr:req:` row is still returned to the sender when the recipient has a block row. A quiet-block note is returned in that same `outgoing` array, in the same `{ "ownerId" }` shape, in the same `ownerId` sort. Hiding either one would tell the sender they were blocked. Incoming reads `fr:req:` only. A note is not an incoming row. `listFriends`, `fetchRounds`, accept, block, unblock, and remove do not read `fr:out:`.
 
@@ -113,7 +165,7 @@ KV reads, no KV writes. The body is the same whether the caller has a ready mark
 
 When that ready marker is a non-empty string, the route lists `fr:ridx:in:<caller>:` and `fr:ridx:out:<caller>:` and does not list `fr:req:`. Each id is still confirmed with a get of the `fr:req:` row. A stale id whose row is missing or empty is omitted. The same block rule applies to incoming. When the marker is missing or empty, the route falls back to one list of prefix `fr:req:` (the requester id is the key suffix, so a per-caller prefix of `fr:req:` cannot see outgoing rows). The fallback does not write the marker or the pair keys, so a request stored before the index existed, and a backfill that stopped before the marker, still appear. A quiet-block note is still one list of prefix `fr:out:<caller>:`. A pair key `list` can lag the put by about 60 seconds at another location. The key is still stored, and a later list returns it.
 
-Formula: `2 + I + B + O + Q` gets. The `2` is the auth row and `fr:ridx:ready:<caller>`. When the ready marker is a non-empty string there are `Pin + Pout + S` lists and no `fr:req:` list. `Pin = max(1, ceil(Kin / 1000))` is the number of `fr:ridx:in:<caller>:` list pages, and `Kin` is every key with that prefix. `Pout = max(1, ceil(Kout / 1000))` is the same for `fr:ridx:out:<caller>:`. When the index is missing or unusable there are `P + S` lists. `P = max(1, ceil(R / 1000))` is the number of `fr:req:` list pages, and `R` is every `fr:req:` key in `BOARDS`. `S = max(1, ceil(N / 1000))` is the number of `fr:out:<caller>:` list pages, and `N` is every key with that prefix. An empty note prefix is still one list (`S = 1`). An empty pair-key prefix is still one list. On the fallback, `I` is how many `fr:req:` keys name the caller as recipient (each is one value get) and `O` is how many name the caller as requester and someone else as recipient. On the index, `I` is how many incoming pair-key suffixes are a different owner id and `O` is how many outgoing pair-key suffixes are. `B` is how many incoming values are a non-empty string (each is one `fr:block:<caller>:<requester>` get). `Q` is how many `fr:out:<caller>:` keys have a suffix that is a different owner id (each is one value get, including an empty value). Keys that belong to two other people are not gotten. A malformed note suffix is not gotten. No `put` and no `delete`.
+Formula: `2 + I + B + O + Q` gets, plus `F`. The `2` is the auth row and `fr:ridx:ready:<caller>`. `F` is one `fr:ownname:<other>` get for each returned incoming or outgoing entry. When the ready marker is a non-empty string there are `Pin + Pout + S` lists and no `fr:req:` list. `Pin = max(1, ceil(Kin / 1000))` is the number of `fr:ridx:in:<caller>:` list pages, and `Kin` is every key with that prefix. `Pout = max(1, ceil(Kout / 1000))` is the same for `fr:ridx:out:<caller>:`. When the index is missing or unusable there are `P + S` lists. `P = max(1, ceil(R / 1000))` is the number of `fr:req:` list pages, and `R` is every `fr:req:` key in `BOARDS`. `S = max(1, ceil(N / 1000))` is the number of `fr:out:<caller>:` list pages, and `N` is every key with that prefix. An empty note prefix is still one list (`S = 1`). An empty pair-key prefix is still one list. On the fallback, `I` is how many `fr:req:` keys name the caller as recipient (each is one value get) and `O` is how many name the caller as requester and someone else as recipient. On the index, `I` is how many incoming pair-key suffixes are a different owner id and `O` is how many outgoing pair-key suffixes are. `B` is how many incoming values are a non-empty string (each is one `fr:block:<caller>:<requester>` get). `Q` is how many `fr:out:<caller>:` keys have a suffix that is a different owner id (each is one value get, including an empty value). Keys that belong to two other people are not gotten. A malformed note suffix is not gotten. No `put` and no `delete`.
 
 The read limit is 60 calls per friend key per 60 minutes (`keyreq:` on `FriendGuessLimiter`) and 60 per IP hash per 60 minutes when `CF-Connecting-IP` is present (`ipreq:`). No IP header skips the IP limit. A missing `FRIEND_GUESSES` binding is `503` `{ "error": "guess_limiter_not_configured" }` and does not list. Over the limit is `429` `{ "error": "rate_limited" }` and `Retry-After`, and that request does not list. `invalid_body` and `payload_too_large` do not consume a call. These objects are not the code-guess, `ipget:`, or `ippub:` counters.
 
@@ -121,17 +173,17 @@ If `BOARDS` is missing, or it has no `list`, the call is `503` `{ "error": "boar
 
 ### Sender-only note lifetime
 
-A real pending request has no `expirationTtl`. It stays until the recipient accepts, or until a successful block deletes both `fr:req:` directions. There is no decline or withdraw call. Unblock, remove, and `resetCode` do not delete it. There is no cap on outstanding requests. Each send spends one code guess before the block check.
+A real pending request has no `expirationTtl`. It stays until the recipient accepts, the sender cancels, or a successful block deletes both `fr:req:` directions. Accept deletes both directions too: when each person sent a request, the accepter's own request to the other side goes with it. There is no decline call. Unblock, remove, and `resetCode` do not delete it. There is no cap on outstanding requests. Each send spends one code guess before the block check.
 
-The note has that same lifetime from the sender's side. The rule is: delete the note only when a real pending request would also leave the sender's outgoing list, and only as a result of the sender's own later send or of the recipient accepting a real request.
+The note has that same lifetime from the sender's side. The rule is: delete the note only when a real pending request would also leave the sender's outgoing list, and only as a result of the sender's own later send or cancel, or of the recipient accepting a real request.
 
 - No `expirationTtl`. A TTL on the note alone would drop it from `outgoing` while a real request stayed. That difference is the block.
-- No cancel. `POST /v1/friends/decline` stays `404` and deletes nothing, for a note and for a real request. There is no decline call.
+- `POST /v1/friends/decline` stays `404` and deletes nothing, for a note and for a real request. There is no decline call. `POST /v1/friends/requests/cancel` withdraws the caller's own outgoing request and deletes a quiet-block note for that pair. When a `fr:req:` row was stored, cancel deletes that pair's `fr:ridx:in:` and `fr:ridx:out:` keys after the backfill. It does not touch a friendship, a block, or a round.
 - Unblock does not delete the note and does not copy it to `fr:req:`. Deleting it on unblock would remove the sender's outgoing entry with no action of theirs. That is how they would learn the block ended. After unblock the note is still not acceptable. A fresh `sendRequest` is required. That fresh send writes `fr:req:` and deletes the note. Outgoing still shows that `ownerId`.
 - Remove does not delete the note. Remove does not delete `fr:req:` either. A quiet note exists only after the recipient has blocked the sender, so remove is `not_friends` and writes nothing, same as a pending request that was never accepted.
 - A successful block does not delete the note. Block requires a friendship. While the note is the sender's only outgoing row, the two people are not friends, so block is `not_friends` and writes nothing. A real `fr:req:` row is also left in place when block refuses. Deleting the note on the blocker's later unblock or remove would change the sender's outgoing list. A real pending request does not change on those calls.
 - `resetCode` does not delete the note. It does not delete `fr:req:` either, because `ownerId` is unchanged. Deleting only the note would make a quiet outgoing entry disappear on reset while a real one stayed.
-- The note is deleted, without being read, when a later real send to that same person stores or finds `fr:req:<recipient>:<sender>`, including the already-friends response. Accept deletes `fr:out:<requester>:<caller>` and `fr:out:<caller>:<requester>` without reading either key, and only after a real `fr:req:` row has already been confirmed, immediately before that row is deleted. The second key is the acceptor's stale outgoing note. Deleting it is a no-op when the key is already absent. A failed accept, including accept after unblock with no fresh send, does not delete either note and does not create a friendship. Accept never treats the note as a request.
+- The note is deleted, without being read, when a later real send to that same person stores or finds `fr:req:<recipient>:<sender>`, including the already-friends response, and when the sender cancels. Accept deletes `fr:out:<requester>:<caller>` and `fr:out:<caller>:<requester>` without reading either key, and only after a real `fr:req:` row has already been confirmed, immediately before that row is deleted. The second key is the acceptor's stale outgoing note. Deleting it is a no-op when the key is already absent. A failed accept, including accept after unblock with no fresh send, does not delete either note and does not create a friendship. Accept never treats the note as a request.
 - One note per pair, the same cardinality as one request per pair. No new cap was added. A note-only cap would reject a quiet send that a real send would store. The existing guess limits (8 per friend key and 24 per IP hash per 60 minutes) already bound how fast new notes are written. The 50-friend cap and the 100-round cap do not apply to sends. Notes are not given a separate KV bound, because real `fr:req:` rows do not have one either. A new friend key resets the 8-guess limit and can write more notes, the same way it can write more real requests.
 
 ### accept
@@ -150,7 +202,7 @@ Only the recipient of a pending request can accept. That creates the friendship.
 
 No pending request: `409` `{ "error": "not_friends" }`. The caller already blocked that person: `409` `{ "error": "blocked" }`. The caller is the one who was blocked: the same `not_friends` response as when there was never a request. No `blocked` signal. There is no decline call. A pending request stays pending until the recipient accepts or blocks.
 
-Accept reads `fr:req:` only. A sender-only `fr:out:` note is not a request and cannot be accepted. On success, after the `fr:req:` row is confirmed and before that row is deleted, accept deletes `fr:out:<requester>:<recipient>` and `fr:out:<caller>:<requester>` without reading either key. `caller` is the recipient. The second key is already absent on a normal accept; the delete still runs. A failed accept does not delete either note. Unblock does not turn the note into a row accept can grant. If either owner's ready marker is missing, accept backfills that owner from the `fr:req:` scan after the request row is gone, and writes `fr:ridx:ready:<owner>` last. Accept then deletes `fr:ridx:in:<caller>:<requester>` and `fr:ridx:out:<requester>:<caller>`. Those deletes run after the backfill, so a `fr:req:` list that still shows the deleted row cannot leave the pair keys behind. Older rows stay indexed. An owner whose ready marker is already set is not scanned.
+Accept reads `fr:req:` only. A sender-only `fr:out:` note is not a request and cannot be accepted. On success, after the `fr:req:` row is confirmed and before that row is deleted, accept deletes `fr:out:<requester>:<recipient>` and `fr:out:<caller>:<requester>` without reading either key. `caller` is the recipient. The second key is already absent on a normal accept; the delete still runs. A failed accept does not delete either note. Unblock does not turn the note into a row accept can grant. Accept also deletes `fr:req:<requester>:<caller>` when both people had sent a request. If either owner's ready marker is missing, accept backfills that owner from the `fr:req:` scan after both request rows are gone, and writes `fr:ridx:ready:<owner>` last. Accept then deletes `fr:ridx:in:<caller>:<requester>` and `fr:ridx:out:<requester>:<caller>`, and the reverse pair `fr:ridx:in:<requester>:<caller>` and `fr:ridx:out:<caller>:<requester>`. Those deletes run after the backfill, so a `fr:req:` list that still shows a deleted row cannot leave the pair keys behind. Older rows stay indexed. An owner whose ready marker is already set is not scanned.
 
 ### remove
 
@@ -162,9 +214,9 @@ Accept reads `fr:req:` only. A sender-only `fr:out:` note is not a request and c
 
 The phone's `id` is this `ownerId`.
 
-Deletes the friendship (both `fr:friend:` rows and both `fr:friends:` lists) and deletes only the caller's shared rounds. The other person's rounds stay for their remaining friends. Fetch no longer returns the caller's rounds to anyone.
+Deletes the friendship (both `fr:friend:` rows and both `fr:friends:` lists) and takes each side off the other's past-round audiences. No shared round is deleted: both people's rounds stay for their other friends, and the removed person no longer fetches the caller's rounds.
 
-This is Brian's approved behavior as of Oct 17, 2026, 5:37 PM CT. It replaces his earlier answer that remove and block wipe both people's shared rounds for every friend. There is no per-friend share list.
+This is Brian's approved behavior as of Oct 23, 2026, 5:50 PM CT: removing or blocking one friend only stops sharing with that friend. It replaces the Oct 17 answer that deleted the caller's shared rounds for every friend.
 
 `200` `{ "ok": true }`
 
@@ -182,7 +234,7 @@ The phone's `id` is this `ownerId`.
 
 Requires an accepted friendship (both `fr:friend:` rows). Otherwise `409` `{ "error": "not_friends" }` and nothing is written: no block row and no round delete. A key that only learned an `ownerId` from lookup cannot block that person.
 
-The block row is stored first. Then the friendship rows and both friend lists are deleted, then pending request rows, then only the caller's round list. Deleting `fr:req:<caller>:<other>` is a decline of that incoming request. Deleting `fr:req:<other>:<caller>` is a cancel of that outgoing request. There is still no decline or cancel route. A missing ready marker is backfilled from the `fr:req:` scan after that row is deleted, and the marker is written last. That pair's `fr:ridx:in:` and `fr:ridx:out:` keys are deleted after the backfill, so a `fr:req:` list that still shows the deleted row cannot leave the pair keys behind. Other pending rows stay indexed. An owner whose ready marker is already set is not scanned. A failure after the block row is stored must not leave the pair with the friendship already gone and no block. The other person's rounds stay for their remaining friends. Access ends immediately. The block is stored for the caller. Same as remove: caller-only round deletion is Brian's approved behavior as of Oct 17, 2026, 5:37 PM CT, replacing the earlier both-people answer.
+The block row is stored first. Then the friendship rows and both friend lists are deleted, then pending request rows, then each side's past-round audience entry for the other. No round list is deleted. Deleting `fr:req:<caller>:<other>` is a decline of that incoming request. Deleting `fr:req:<other>:<caller>` is a cancel of that outgoing request. There is no decline route. A missing ready marker is backfilled from the `fr:req:` scan after that row is deleted, and the marker is written last. That pair's `fr:ridx:in:` and `fr:ridx:out:` keys are deleted after the backfill, so a `fr:req:` list that still shows the deleted row cannot leave the pair keys behind. Other pending rows stay indexed. An owner whose ready marker is already set is not scanned. A failure after the block row is stored must not leave the pair with the friendship already gone and no block. The other person's rounds stay for their remaining friends. Access ends immediately. The block is stored for the caller. Same as remove: no shared round is deleted (Brian, Oct 23, 2026, 5:50 PM CT).
 
 `200` `{ "ok": true }`
 
@@ -217,16 +269,16 @@ No body. The `Content-Length` rules, auth errors, and `boards_not_configured` er
 `200`
 
 ```json
-{ "friends": [ { "ownerId": "k3mR9xQ2nB8wL4pT6vYs1A" } ] }
+{ "friends": [ { "ownerId": "k3mR9xQ2nB8wL4pT6vYs1A", "name": "Jordan Pike" } ] }
 ```
 
 Each entry is a current friend: an id in the caller's `fr:friends:` list, with both `fr:friend:` rows present (`fr:friend:<caller>:<friend>` and `fr:friend:<friend>:<caller>`). That is the accepted pair `accept` writes and the pair `remove` and `block` require. One row without the other is not a friend and is not listed. A block in either direction hides the friend, the same rule `fetchRounds` uses when it skips a friend's rounds. The response is at most 50 friends. Only the first 50 ids in the stored array are inspected, in that stored order, and ids past the cap are ignored.
 
-`since` is the friendship's created time when a row stores one. Today each `fr:friend:` value is the string `1`, and the `fr:friends:` array is only ids, so no created time is stored. The field is omitted. An entry is `{ "ownerId" }` only. No friend code, friend key, raw KV key, name, or other person's data is returned.
+`since` is the friendship's created time when a row stores one. Today each `fr:friend:` value is the string `1`, and the `fr:friends:` array is only ids, so no created time is stored. The field is omitted. An entry is `{ "ownerId" }` plus optional `name`, the friend's own invite name from `fr:ownname:<ownerId>` (1–24 characters, no control characters, omitted when unset or invalid). No friend code, friend key, raw KV key, or other person's data is returned. Older apps ignore `name`.
 
 Sort: `friends` is sorted by `ownerId` ascending, JavaScript string order. There is no cursor.
 
-KV reads, no KV writes, no list. Formula: `2 + N + P + 2M` gets. `N` is the number of ids inspected, `N = min(length of fr:friends:<caller>, 50)`. `P` is how many of those have a caller→friend row, so the reverse row is read. `M` is how many have both rows, so both block rows are read (`M ≤ P ≤ N`). The `2` is the auth row and the `fr:friends:` value. A clean list, every inspected id a mutual friend whether or not a block remains, is `2 + 4N` gets. No `put` and no `delete`.
+KV reads, no list. Formula: `3 + N + P + 2M + F` gets, plus 1 when the caller has no `fr:ownname:` row (then `fr:invname:<caller CODE>` is read, and when it holds a valid name it is copied to `fr:ownname:<caller>`: the only write, a one-time backfill for names saved before `fr:ownname:` existed). `F` is the number of friends returned (one `fr:ownname:` read each). `N` is the number of ids inspected, `N = min(length of fr:friends:<caller>, 50)`. `P` is how many of those have a caller→friend row, so the reverse row is read. `M` is how many have both rows, so both block rows are read (`M ≤ P ≤ N`). The `2` is the auth row and the `fr:friends:` value. A clean list, every inspected id a mutual unblocked friend, caller name already stored, is `3 + 5N` gets. No `delete`.
 
 The read limit is 60 calls per friend key per 60 minutes (`keylist:`) and 60 per IP hash per 60 minutes when `CF-Connecting-IP` is present (`iplist:`). It does not share the listRequests counters, the code-guess counters, `ipget:`, or `ippub:`. No IP header skips the IP limit. Over the limit is `429` `{ "error": "rate_limited" }` and `Retry-After`, and that request does not read the friend list. A bad body does not consume a call.
 
@@ -272,7 +324,7 @@ No body.
 
 `200` `{ "rounds": [ ] }`
 
-Each entry is a stored round from an accepted friend, plus the caller's own published rounds. Rounds the caller removed, blocked, or unshared are already gone. The other person's rounds are not deleted by remove or block, so that person's other friends still fetch them. Omitted stat fields stay omitted. A stored round that fails the allowlist, including one that carries GPS, is omitted on read. The response is the full list. There is no cursor. Rounds are sorted by `playedOn`, then `ownerId`, then `id`, ascending.
+Each entry is a stored round from an accepted friend, plus the caller's own published rounds. A friend's past round (see setPastRounds) is included only when it was given to the caller, and the `to` audience is never returned. Rounds the caller unshared are already gone. Remove and block delete no rounds; they only end access between those two people. Omitted stat fields stay omitted. A stored round that fails the allowlist, including one that carries GPS, is omitted on read. The response is the full list. There is no cursor. Rounds are sorted by `playedOn`, then `ownerId`, then `id`, ascending.
 
 Fetch reads `3 + 2N + F` KV values and does not list. `N` is the caller's friend-list length. `F` is how many of those friends are unblocked in both directions (`F` ≤ `N`). The reads are 1 auth row, 1 `fr:friends:` list, 1 own `fr:rounds:` value, 2 block checks per friend, and 1 round-list read per unblocked friend. When nobody is blocked, that is `3 + 3N` gets.
 
@@ -286,7 +338,7 @@ Fetch reads `3 + 2N + F` KV values and does not list. `N` is the caller's friend
 
 This is the resolve `sendRequest` uses. Both calls share one guess counter per friend key and one per IP. The friend key must already have a minted code, or the call is `401` `{ "error": "friend_key_required" }` and does not spend a guess.
 
-`200` `{ "ownerId": "<public id>" }`
+`200` `{ "ownerId": "<public id>" }`, plus `"name"` when the code's owner set an invite name (`{ "ownerId": "<public id>", "name": "Alex M." }`). Also `"photo": { "type": "image/jpeg", "data": "<base64>" }` when an invite photo is set.
 
 Unknown code, including a code that `resetCode` just replaced: `404` `{ "error": "code_not_found" }`.
 
@@ -370,7 +422,7 @@ Example with FIR and putts on, and GIR and clubs off:
 }
 ```
 
-League scores are these shared rounds. The Worker keeps one owner's rounds in one KV value for up to 1 year (`expirationTtl` of 365 days) or until `remove`, `block`, or unshare (`share: false` with `round: null`) deletes it, whichever comes first. Replacing a round refreshes that TTL. Text filtering for league titles and report notes is not part of this contract. Those fields are unknown today. Filtering comes later.
+League scores are these shared rounds. The Worker keeps one owner's rounds in one KV value for up to 1 year (`expirationTtl` of 365 days) or until unshare (`share: false` with `round: null`) deletes it, whichever comes first. Replacing a round refreshes that TTL. Text filtering for league titles and report notes is not part of this contract. Those fields are unknown today. Filtering comes later.
 
 An accepted friendship is capped at 50 friends per owner. `accept` checks both `fr:friends:` lists before it writes. If either person would go past 50, the call is `409` `{ "error": "friend_limit" }`, the pending request stays, and no friendship row is written.
 
@@ -389,7 +441,9 @@ Friend rows use the `fr:` prefix only. The keys this API writes are:
 - `fr:friend:<a>:<b>` — one direction of an accepted friendship. The value is `1`. Both directions are required.
 - `fr:friends:<ownerId>` — JSON array of the other owner ids. This is the fetch index and the 50-friend cap. `accept` writes both lists. `remove` and `block` take the other person out of both lists.
 - `fr:block:<blocker>:<blocked>` — the caller's block. The value is `1`.
-- `fr:rounds:<ownerId>` — JSON array of that owner's shared rounds, one value, `expirationTtl` of 365 days. This replaces per-round `fr:round:<owner>:<id>` keys.
+- `fr:rounds:<ownerId>` — JSON array of that owner's shared rounds, one value, `expirationTtl` of 365 days. This replaces per-round `fr:round:<owner>:<id>` keys. A past round carries `to: [ownerIds]`, the friends it was given to.
+- `fr:invname:<CODE>` — the invite name for that code, a plain string of 1–24 characters. `resetCode` deletes it with the old code.
+- `fr:ownname:<ownerId>` — the same invite name keyed by owner, written and cleared by setInviteName, deleted by resetCode. listFriends and listRequests return it as optional `name`. Names set before this key existed appear once the owner saves their invite name again.
 
 None of these routes read or write `id:`, `name:`, `osm:`, `gq:`, `gapi:`, `gqueue:`, `gca:`, or `cr:`. `GET /v1/friends/requests` and `GET /v1/friends/list` do not `put` or `delete` any KV key. The only mutation on those calls is the Durable Object attempt counter. Board `GET`, `PUT`, and `DELETE` reserve the `fr:` prefix and return `400` with no KV read or write. That includes a percent-encoded path (`fr%3A` and `fr%3a`), so a board path cannot read, replace, or forge a friend row. Guess counts live in the Durable Object, not in KV.
 

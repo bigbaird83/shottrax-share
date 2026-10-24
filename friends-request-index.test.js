@@ -664,6 +664,103 @@ describe("friend request index", () => {
     );
   });
 
+  it("keeps the mock request index and the friend list when remove or block races a send", async () => {
+    for (const action of ["remove", "block"]) {
+      const owner = await mint(`race-${action}-owner`);
+      const gone = await mint(`race-${action}-gone`);
+      const kept = await mint(`race-${action}-kept`);
+      const sender = await mint(`race-${action}-send`);
+      const stable = mockOwner(`Race${action}Stable`);
+      plantFriends(owner.ownerId, gone.ownerId);
+      plantFriends(owner.ownerId, kept.ownerId);
+      kv.set(`fr:friends:${owner.ownerId}`, { value: JSON.stringify([gone.ownerId, kept.ownerId]) });
+      kv.set(`fr:friends:${gone.ownerId}`, { value: JSON.stringify([owner.ownerId]) });
+      kv.set(`fr:friends:${kept.ownerId}`, { value: JSON.stringify([owner.ownerId]) });
+      plantReady(owner.ownerId);
+      plantReady(sender.ownerId);
+      plantReady(gone.ownerId);
+      kv.set(`fr:req:${owner.ownerId}:${stable}`, { value: "pending" });
+      kv.set(`fr:ridx:in:${owner.ownerId}:${stable}`, { value: "1" });
+      kv.set(`fr:req:${owner.ownerId}:${gone.ownerId}`, { value: "pending" });
+      plantPair(owner.ownerId, gone.ownerId);
+      const inKey = `fr:ridx:in:${owner.ownerId}:${sender.ownerId}`;
+      const friendsKey = `fr:friends:${owner.ownerId}`;
+      const boards = env.BOARDS;
+      let entered = 0;
+      let release;
+      const both = new Promise((resolve) => {
+        release = resolve;
+      });
+      env.BOARDS = {
+        ...boards,
+        async put(key, value, options) {
+          if (key === inKey || key === friendsKey) {
+            entered += 1;
+            if (entered === 2) release();
+            await both;
+          }
+          return boards.put(key, value, options);
+        },
+      };
+      const [sent, changed] = await Promise.all([
+        viaEntry("/v1/friends/requests", { method: "POST", friend: sender.key, body: { code: owner.code } }),
+        viaEntry(`/v1/friends/${action}`, { method: "POST", friend: owner.key, body: { ownerId: gone.ownerId } }),
+      ]);
+      env.BOARDS = boards;
+      expect(entered).toBe(2);
+      expect(sent.json).toEqual({ status: "pending", ownerId: owner.ownerId });
+      expect(changed.json).toEqual({ ok: true });
+      expect(kv.get(inKey).value).toBe("1");
+      expect(kv.get(`fr:ridx:out:${sender.ownerId}:${owner.ownerId}`).value).toBe("1");
+      expect(kv.get(`fr:req:${owner.ownerId}:${sender.ownerId}`).value).toBe("pending");
+      expect(kv.get(`fr:ridx:in:${owner.ownerId}:${stable}`).value).toBe("1");
+      expect(JSON.parse(kv.get(friendsKey).value)).toEqual([kept.ownerId]);
+      expect(JSON.parse(kv.get(`fr:friends:${kept.ownerId}`).value)).toEqual([owner.ownerId]);
+      expect(kv.has(`fr:friend:${owner.ownerId}:${kept.ownerId}`)).toBe(true);
+      expect(kv.has(`fr:friend:${owner.ownerId}:${gone.ownerId}`)).toBe(false);
+      expect(kv.has(`fr:friends:${gone.ownerId}`)).toBe(false);
+      if (action === "block") {
+        expect(kv.has(`fr:block:${owner.ownerId}:${gone.ownerId}`)).toBe(true);
+        expect(kv.has(`fr:req:${owner.ownerId}:${gone.ownerId}`)).toBe(false);
+        expect(kv.has(`fr:ridx:in:${owner.ownerId}:${gone.ownerId}`)).toBe(false);
+        expect(kv.has(`fr:ridx:out:${gone.ownerId}:${owner.ownerId}`)).toBe(false);
+      }
+      const listed = await viaEntry("/v1/friends/requests", { friend: owner.key });
+      const incoming = listed.json.incoming.map((entry) => entry.ownerId).sort();
+      const expected = [sender.ownerId, stable];
+      if (action === "remove") expected.push(gone.ownerId);
+      expect(incoming).toEqual(expected.sort());
+    }
+  });
+
+  it("cancel deletes the mock pair keys for that request and leaves the other indexed", async () => {
+    const sender = await mint("can-route-from");
+    const target = await mint("can-route-to");
+    const other = mockOwner("CanRouteOther");
+    const sent = await viaEntry("/v1/friends/requests", {
+      method: "POST",
+      friend: sender.key,
+      body: { code: target.code },
+    });
+    expect(sent.json).toEqual({ status: "pending", ownerId: target.ownerId });
+    kv.set(`fr:req:${other}:${sender.ownerId}`, { value: "pending" });
+    kv.set(`fr:ridx:out:${sender.ownerId}:${other}`, { value: "1" });
+    kv.set(`fr:ridx:in:${other}:${sender.ownerId}`, { value: "1" });
+    const cancelled = await viaEntry("/v1/friends/requests/cancel", {
+      method: "POST",
+      friend: sender.key,
+      body: { ownerId: target.ownerId },
+    });
+    expect(cancelled.json).toEqual({ ok: true });
+    expect(kv.has(`fr:req:${target.ownerId}:${sender.ownerId}`)).toBe(false);
+    expect(kv.has(`fr:ridx:in:${target.ownerId}:${sender.ownerId}`)).toBe(false);
+    expect(kv.has(`fr:ridx:out:${sender.ownerId}:${target.ownerId}`)).toBe(false);
+    expect(kv.get(`fr:ridx:out:${sender.ownerId}:${other}`).value).toBe("1");
+    expect(kv.get(`fr:ridx:in:${other}:${sender.ownerId}`).value).toBe("1");
+    expect(kv.get(`fr:ridx:ready:${sender.ownerId}`).value).toBe("1");
+    expect(kv.get(`fr:ridx:ready:${target.ownerId}`).value).toBe("1");
+  });
+
   it("stores no mock request when the index put fails", async () => {
     const from = await mint("fail-idx-from");
     const to = await mint("fail-idx-to");
@@ -706,7 +803,7 @@ describe("friend request index", () => {
       friend: from.key,
       body: { code: to.code },
     });
-    expect(again.json).toEqual({ status: "pending", ownerId: to.ownerId });
+    expect(again.json).toEqual({ status: "pending", ownerId: to.ownerId, already: "outgoing" });
     expect(kv.get(reqKey).value).toBe("pending");
     expect(kv.get(inKey).value).toBe("1");
     expect(kv.get(outKey).value).toBe("1");
@@ -726,7 +823,7 @@ describe("friend request index", () => {
       friend: friendFrom.key,
       body: { code: friendTo.code },
     });
-    expect(already.json).toEqual({ status: "friends", ownerId: friendTo.ownerId });
+    expect(already.json).toEqual({ status: "friends", ownerId: friendTo.ownerId, already: "friends" });
     expect(friends.put.filter((key) => key.startsWith("fr:ridx:"))).toEqual([]);
     expect(friends.delete).toContain(noted);
     expect([...kv.keys()].some((name) => name.startsWith(`fr:ridx:`) && name.includes(friendFrom.ownerId))).toBe(false);
@@ -758,7 +855,7 @@ describe("friend request index", () => {
       friend: from.key,
       body: { code: to.code },
     });
-    expect(again.json).toEqual({ status: "pending", ownerId: to.ownerId });
+    expect(again.json).toEqual({ status: "pending", ownerId: to.ownerId, already: "outgoing" });
     expect(repeat.put).toEqual([]);
     expect(repeat.delete).toEqual([note]);
   });

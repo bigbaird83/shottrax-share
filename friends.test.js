@@ -644,7 +644,8 @@ describe("friend codes", () => {
     expect(blocked.json).toEqual({ ok: true });
     expect(rows("fr:friend:")).toEqual([]);
     expect(rows("fr:req:")).toEqual([]);
-    expect(kv.has(`fr:rounds:${left.ownerId}`)).toBe(false);
+    // Build 169 (Brian, Oct 23): block ends only this friendship; the caller's rounds stay for everyone else.
+    expect(kv.get(`fr:rounds:${left.ownerId}`).value).toBe("[{\"id\":\"round_left\"}]");
     expect(kv.get(`fr:rounds:${right.ownerId}`).value).toBe("[{\"id\":\"round_right\"}]");
     expect(kv.get(`fr:rounds:${bystander}`).value).toBe("[{\"id\":\"round_other\"}]");
     expect(kv.get("id:14322").value).toBe("{\"holes\":1}");
@@ -656,7 +657,8 @@ describe("friend codes", () => {
     expect(rows("fr:friend:")).toEqual([]);
     expect(rows("fr:req:")).toEqual([]);
     expect(rows("fr:block:")).toEqual([]);
-    expect(kv.has(`fr:rounds:${left.ownerId}`)).toBe(false);
+    // Build 169 (Brian, Oct 23): block ends only this friendship; the caller's rounds stay for everyone else.
+    expect(kv.get(`fr:rounds:${left.ownerId}`).value).toBe("[{\"id\":\"round_left\"}]");
     expect(kv.get(`fr:rounds:${right.ownerId}`).value).toBe("[{\"id\":\"round_right\"}]");
     expect(kv.get(`fr:rounds:${bystander}`).value).toBe("[{\"id\":\"round_other\"}]");
     const still = await invoke("/v1/friends/requests/accept", { friend: right.key, body: { ownerId: left.ownerId } });
@@ -722,7 +724,7 @@ describe("friend codes", () => {
     expect(rows("fr:req:")).toEqual([]);
 
     const repeat = await invoke("/v1/friends/requests", { friend: other.key, body: { code: caller.code } });
-    expect(repeat.json).toEqual({ status: "friends", ownerId: caller.ownerId });
+    expect(repeat.json).toEqual({ status: "friends", ownerId: caller.ownerId, already: "friends" });
     expect(rows("fr:req:")).toEqual([]);
   });
 
@@ -870,7 +872,7 @@ describe("friend codes", () => {
     const first = await invoke("/v1/friends/requests", { friend: from.key, body: { code: to.code } });
     const second = await invoke("/v1/friends/requests", { friend: from.key, body: { code: to.code } });
     expect(second.status).toBe(200);
-    expect(second.json).toEqual(first.json);
+    expect(second.json).toEqual({ ...first.json, already: "outgoing" });
     expect(rows("fr:req:")).toEqual([`fr:req:${to.ownerId}:${from.ownerId}`]);
     const named = await invoke("/v1/friends/requests", { friend: from.key, body: { code: to.code, name: DISPLAY_NAME } });
     expect(named.status).toBe(400);
@@ -978,6 +980,103 @@ describe("friend codes", () => {
     return storedRounds(ownerId).some((round) => round && round.id === id);
   }
 
+  it("cancel withdraws only the caller's own sent request", async () => {
+    const sender = await mint("cx-sender");
+    const target = await mint("cx-target");
+    const other = await mint("cx-other");
+    await invoke("/v1/friends/requests", { friend: sender.key, body: { code: target.code } });
+    await invoke("/v1/friends/requests", { friend: other.key, body: { code: target.code } });
+    await invoke("/v1/friends/requests", { friend: target.key, body: { code: sender.code } });
+    expect(kv.has(`fr:req:${target.ownerId}:${sender.ownerId}`)).toBe(true);
+    const cancelled = await invoke("/v1/friends/requests/cancel", { friend: sender.key, body: { ownerId: target.ownerId } });
+    expect(cancelled.status).toBe(200);
+    expect(cancelled.json).toEqual({ ok: true });
+    expect(kv.has(`fr:req:${target.ownerId}:${sender.ownerId}`)).toBe(false);
+    // The other sender's request and the reverse request are untouched.
+    expect(kv.has(`fr:req:${target.ownerId}:${other.ownerId}`)).toBe(true);
+    // The reverse send was merged into the sender's pending request, so it never stored a row.
+    expect(kv.has(`fr:req:${sender.ownerId}:${target.ownerId}`)).toBe(false);
+    const late = await invoke("/v1/friends/requests/accept", { friend: target.key, body: { ownerId: sender.ownerId } });
+    expect(late.status).toBe(409);
+    expect(late.json).toEqual({ error: "not_friends" });
+    const again = await invoke("/v1/friends/requests/cancel", { friend: sender.key, body: { ownerId: target.ownerId } });
+    expect(again.status).toBe(200);
+  });
+
+  it("cancel keeps friendships and validates its body", async () => {
+    const left = await mint("cx-left");
+    const right = await mint("cx-right");
+    await befriend(left, right);
+    const before = kvSnapshot();
+    const cancelled = await invoke("/v1/friends/requests/cancel", { friend: left.key, body: { ownerId: right.ownerId } });
+    expect(cancelled.status).toBe(200);
+    expect(kvSnapshot()).toEqual(before);
+    const empty = await invoke("/v1/friends/requests/cancel", { friend: left.key, body: {} });
+    expect(empty.status).toBe(400);
+    const extra = await invoke("/v1/friends/requests/cancel", { friend: left.key, body: { ownerId: right.ownerId, x: 1 } });
+    expect(extra.status).toBe(400);
+    const self = await invoke("/v1/friends/requests/cancel", { friend: left.key, body: { ownerId: left.ownerId } });
+    expect(self.status).toBe(400);
+    const nokey = await invoke("/v1/friends/requests/cancel", { body: { ownerId: right.ownerId } });
+    expect(nokey.status).toBe(401);
+  });
+
+  function deleteRounds(friend, body) {
+    return invoke("/v1/friends/rounds/delete", { method: "POST", friend, body });
+  }
+
+  it("deletes only the caller's named rounds, shared or past, and retries are fine", async () => {
+    const caller = await mint("del-caller");
+    const pal = await mint("del-pal");
+    await befriend(pal, caller);
+    expect((await putRound(caller.key, baseRound({ id: "round_keep" }))).status).toBe(200);
+    expect((await putRound(caller.key, baseRound({ id: "round_gone", courseName: "Pine Hollow" }))).status).toBe(200);
+    expect((await putRound(caller.key, baseRound({ id: "round_dup", courseName: "Pine Hollow North" }))).status).toBe(200);
+    expect((await putRound(pal.key, baseRound({ id: "round_gone" }))).status).toBe(200);
+    const past = await invoke("/v1/friends/past", {
+      method: "PUT",
+      friend: caller.key,
+      body: { ownerId: pal.ownerId, choice: "10", rounds: [baseRound({ id: "round_past" })] },
+    });
+    expect(past.status).toBe(200);
+    expect(hasRound(caller.ownerId, "round_past")).toBe(true);
+
+    const gone = await deleteRounds(caller.key, { ids: ["round_gone", "round_dup", "round_past", "round_never"] });
+    expect(gone.status).toBe(200);
+    expect(gone.json).toEqual({ ok: true, removed: 3 });
+    expect(storedRounds(caller.ownerId).map((round) => round.id)).toEqual(["round_keep"]);
+    // The friend's round with the same id is theirs and stays.
+    expect(hasRound(pal.ownerId, "round_gone")).toBe(true);
+    const seen = await fetchRounds(pal.key);
+    expect(seen.json.rounds.filter((round) => round.ownerId === caller.ownerId).map((round) => round.id)).toEqual(["round_keep"]);
+
+    const again = await deleteRounds(caller.key, { ids: ["round_gone"] });
+    expect(again.status).toBe(200);
+    expect(again.json).toEqual({ ok: true, removed: 0 });
+
+    const last = await deleteRounds(caller.key, { ids: ["round_keep"] });
+    expect(last.json).toEqual({ ok: true, removed: 1 });
+    expect(kv.has(roundsKey(caller.ownerId))).toBe(false);
+  });
+
+  it("rejects bad delete bodies and missing keys without writing", async () => {
+    const caller = await mint("del-bad");
+    expect((await putRound(caller.key, baseRound({ id: "round_safe" }))).status).toBe(200);
+    const before = kvSnapshot();
+    for (const body of [{}, { ids: [] }, { ids: "round_safe" }, { ids: ["bad id!"] }, { ids: [7] }, { ids: ["round_safe"], extra: 1 }, { ids: Array.from({ length: 101 }, (_, i) => `r${i}`) }]) {
+      const res = await deleteRounds(caller.key, body);
+      expect(res.status).toBe(400);
+      expect(res.json).toEqual({ error: "invalid_body" });
+    }
+    const noKey = await invoke("/v1/friends/rounds/delete", { method: "POST", body: { ids: ["round_safe"] } });
+    expect(noKey.status).toBe(401);
+    const unknownKey = await deleteRounds(friendKey("nobody"), { ids: ["round_safe"] });
+    expect(unknownKey.status).toBe(401);
+    const wrongMethod = await invoke("/v1/friends/rounds/delete", { method: "GET", friend: caller.key });
+    expect(wrongMethod.status).toBe(405);
+    expect(kvSnapshot()).toEqual(before);
+  });
+
   it("remove without a friendship is 409 and deletes nothing", async () => {
     const caller = await mint("rm-none");
     const other = await mint("rm-other");
@@ -1024,7 +1123,7 @@ describe("friend codes", () => {
     expect(hasRound(other.ownerId, "round_keep")).toBe(true);
   });
 
-  it("remove deletes only the caller's rounds and keeps them for other friends", async () => {
+  it("remove ends only that friendship; everyone keeps their rounds for their other friends", async () => {
     const left = await mint("rm-left");
     const right = await mint("rm-right");
     const third = await mint("rm-third");
@@ -1046,7 +1145,7 @@ describe("friend codes", () => {
     expect(kv.has(`fr:friend:${right.ownerId}:${left.ownerId}`)).toBe(false);
     expect(kv.has(`fr:friend:${left.ownerId}:${third.ownerId}`)).toBe(true);
     expect(kv.has(`fr:friend:${third.ownerId}:${left.ownerId}`)).toBe(true);
-    expect(hasRound(left.ownerId, "round_left")).toBe(false);
+    expect(hasRound(left.ownerId, "round_left")).toBe(true);
     expect(hasRound(right.ownerId, "round_right")).toBe(true);
     expect(hasRound(third.ownerId, "round_third")).toBe(true);
     expect(hasRound(bystander.ownerId, "round_by")).toBe(true);
@@ -1056,10 +1155,10 @@ describe("friend codes", () => {
     const leftFetch = await fetchRounds(left.key);
     const rightFetch = await fetchRounds(right.key);
     const thirdFetch = await fetchRounds(third.key);
-    expect(leftFetch.json.rounds.map((round) => round.id)).toEqual(["round_third"]);
+    expect(leftFetch.json.rounds.map((round) => round.id)).toEqual(["round_left", "round_third"]);
     expect(rightFetch.json.rounds.map((round) => round.id)).toEqual(["round_right", "round_third"]);
-    expect(thirdFetch.json.rounds.map((round) => round.id)).toEqual(["round_right", "round_third"]);
-    expect(thirdFetch.text).not.toContain("round_left");
+    expect(rightFetch.text).not.toContain("round_left");
+    expect(thirdFetch.json.rounds.map((round) => round.id)).toEqual(["round_left", "round_right", "round_third"]);
     expect(rows("fr:round:")).toEqual([]);
   });
 
@@ -1331,14 +1430,14 @@ describe("friend codes", () => {
     expect((await putRound(other.key, baseRound({ id: "round_old_other", playedOn: "2026-10-02" }))).status).toBe(200);
     const blocked = await invoke("/v1/friends/block", { friend: opener.key, body: { ownerId: other.ownerId } });
     expect(blocked.json).toEqual({ ok: true });
-    expect(hasRound(opener.ownerId, "round_old_opener")).toBe(false);
+    expect(hasRound(opener.ownerId, "round_old_opener")).toBe(true);
     expect(hasRound(other.ownerId, "round_old_other")).toBe(true);
     expect((await putRound(other.key, baseRound({ id: "round_new_other", playedOn: "2026-10-04" }))).status).toBe(200);
     expect((await putRound(opener.key, baseRound({ id: "round_new_opener", playedOn: "2026-10-03" }))).status).toBe(200);
     const openerFetch = await fetchRounds(opener.key);
     const otherFetch = await fetchRounds(other.key);
     const thirdFetch = await fetchRounds(third.key);
-    expect(openerFetch.json.rounds.map((round) => round.id)).toEqual(["round_new_opener"]);
+    expect(openerFetch.json.rounds.map((round) => round.id)).toEqual(["round_old_opener", "round_new_opener"]);
     expect(otherFetch.json.rounds.map((round) => round.id)).toEqual(["round_old_other", "round_new_other"]);
     expect(thirdFetch.json.rounds.map((round) => round.id)).toEqual(["round_old_other", "round_new_other"]);
     expect(thirdFetch.text).not.toContain("round_old_opener");
@@ -1650,7 +1749,7 @@ describe("friend codes", () => {
     }), env, { waitUntil() {} });
     expect(removed.status).toBe(200);
     expect(await removed.json()).toEqual({ ok: true });
-    expect(hasRound(caller.ownerId, "round_entry")).toBe(false);
+    expect(hasRound(caller.ownerId, "round_entry")).toBe(true);
   });
 
   it("lookup requires a minted code before it spends a guess", async () => {

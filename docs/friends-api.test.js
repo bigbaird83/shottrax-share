@@ -23,6 +23,12 @@ const FRIEND_CODE_CALLS = [
   ["GET", "/v1/friends/rounds"],
   ["GET", "/v1/friends/requests"],
   ["GET", "/v1/friends/list"],
+  ["POST", "/v1/friends/code/name"],
+  ["POST", "/v1/friends/code/photo"],
+  ["PUT", "/v1/friends/live"],
+  ["GET", "/v1/friends/live"],
+  ["POST", "/v1/friends/live/stop"],
+  ["PUT", "/v1/friends/past"],
 ];
 
 function boards() {
@@ -105,7 +111,8 @@ describe("friends API contract", () => {
   });
 
   it("deletes a league round on unshare", () => {
-    expect(doc).toContain("until `remove`, `block`, or unshare (`share: false` with `round: null`) deletes it");
+    expect(doc).toContain("or until unshare (`share: false` with `round: null`) deletes it");
+    expect(doc).not.toContain("until `remove`, `block`, or unshare");
   });
 
   it("does not spend a guess on the caller's own code", () => {
