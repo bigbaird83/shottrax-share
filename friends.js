@@ -10,12 +10,21 @@
  * unblock, remove, publishRound, fetchRounds, listRequests, and listFriends.
  * Block is quiet for the blocked person. Unblock deletes only the caller's
  * block. Block requires a friendship and stores the block row before it
- * deletes that friendship. Remove and block delete only the caller's shared
- * rounds. One fr:rounds: value holds an owner's rounds. One fr:friends:
- * value is that owner's list. A pending request row is the string "pending"
- * and has no display name or created time. A quiet-block send writes
- * fr:out:<sender>:<recipient> = pending for that sender's outgoing list
- * only. It is not a request, it has no TTL, and unblock does not promote it.
+ * deletes that friendship. Remove and block stop sharing with only that
+ * friend. They do not delete the round list. One fr:rounds: value holds an
+ * owner's rounds. One fr:friends: value is that owner's list. A pending
+ * request row is the string "pending" and has no display name or created
+ * time. A quiet-block send writes fr:out:<sender>:<recipient> = pending
+ * for that sender's outgoing list only. It is not a request, it has no TTL,
+ * and unblock does not promote it.
+ * Pending requests are indexed one key per pair: fr:ridx:in:<owner>:<other>
+ * and fr:ridx:out:<owner>:<other>. Those keys are put and deleted. They are
+ * not read-modify-written. fr:ridx:ready:<owner> is written last, after a
+ * backfill scan for that owner. listRequests lists the caller's pair-key
+ * prefixes when the marker is present, and otherwise scans fr:req:. The
+ * read does not write. Block declines an incoming pending row and cancels
+ * an outgoing one by deleting those pair keys. POST /v1/friends/requests/cancel
+ * withdraws a sent request the same way. There is no decline route.
  * setInvitePhoto stores the sharer's invite photo (JPEG, 64 KB cap) at fr:invphoto:<code>,
  * the same way as the name: never in a URL, returned only by lookup, deleted by reset.
  * setInviteName stores the sharer's invite name at fr:invname:<code>; only
@@ -549,8 +558,11 @@ async function sendRequest(request, env, cors) {
     return friendJson(200, { status: "pending", ownerId }, cors);
   }
   // No duplicates: an existing friend or a pending request in either direction
-  // is reported with `already` and nothing new is written.
+  // is reported with `already` and does not store a second fr:req row.
   if (await areFriends(boards, caller.ownerId, ownerId)) {
+    // Already friends. Delete the note only. Do not write pair-index keys:
+    // there is no pending row to publish, and a put here would be a write
+    // the 1,000/day budget does not need.
     await deleteOutgoingNote(boards, caller.ownerId, ownerId);
     return friendJson(200, { status: "friends", ownerId, already: "friends" }, cors);
   }
@@ -558,13 +570,20 @@ async function sendRequest(request, env, cors) {
   const pending = await friendGet(boards, reqKey);
   if (typeof pending === "string" && pending.length > 0) {
     await deleteOutgoingNote(boards, caller.ownerId, ownerId);
+    // Repair pair keys when the row was stored without them (repeat send
+    // after a failed index put, a rollback, or deploy overlap). A flag that
+    // is already "1" is not put again, so a duplicate send writes nothing.
+    await indexOnCreate(boards, ownerId, caller.ownerId);
     return friendJson(200, { status: "pending", ownerId, already: "outgoing" }, cors);
   }
   const reverse = await friendGet(boards, requestKey(caller.ownerId, ownerId));
   if (typeof reverse === "string" && reverse.length > 0) {
-    // They already asked you: no second request. Accept theirs instead.
+    // They already asked you: no second request, and no pair-key write.
     return friendJson(200, { status: "pending", ownerId, already: "incoming" }, cors);
   }
+  // Pair keys before the request row. A failed index put leaves no fr:req
+  // to hide. KV list can lag a new key by about 60s; the key is still stored.
+  await indexOnCreate(boards, ownerId, caller.ownerId);
   await friendPut(boards, reqKey, "pending");
   await deleteOutgoingNote(boards, caller.ownerId, ownerId);
   return friendJson(200, { status: "pending", ownerId }, cors);
@@ -604,15 +623,21 @@ async function acceptRequest(request, env, cors) {
   await friendPut(boards, friendKvKey("friend", `${ownerId}:${caller.ownerId}`), "1");
   await saveFriendIds(boards, caller.ownerId, addFriendId(callerIds, ownerId));
   await saveFriendIds(boards, ownerId, addFriendId(otherIds, caller.ownerId));
-  // Drop a leftover sender note before the request row. A retry can still
-  // see fr:req: if this delete fails. The note is not read and not accepted.
+  // Drop leftover notes before the request row. A retry can still see
+  // fr:req: if a delete fails. Neither note is read, and neither is accepted.
+  // fr:out:<requester>:<caller> is the requester's quiet note.
+  // fr:out:<caller>:<requester> is the acceptor's stale outgoing note.
   await deleteOutgoingNote(boards, ownerId, caller.ownerId);
+  await deleteOutgoingNote(boards, caller.ownerId, ownerId);
   // Both people may have sent a request (each opened the other's link). Drop the
   // caller's own request to the other side too, so the new friend never sees a
-  // stale incoming row whose Decline (remove) would end the friendship and delete
-  // their shared rounds.
-  await deleteIfPresent(boards, requestKey(ownerId, caller.ownerId));
+  // stale incoming row. Both fr:req rows are gone before the backfill. A list
+  // that still returns one would put that pair key again, and the delete after
+  // the backfill removes that put.
+  await friendDelete(boards, requestKey(ownerId, caller.ownerId));
   await friendDelete(boards, reqKey);
+  await indexOnAccept(boards, caller.ownerId, ownerId);
+  await indexOnAccept(boards, ownerId, caller.ownerId);
   return friendJson(200, { status: "friends", ownerId }, cors);
 }
 
@@ -625,7 +650,9 @@ async function cancelRequest(request, env, cors) {
   const ready = await readyOwnerCall(request, env, cors);
   if (ready.error) return ready.error;
   const { boards, caller, ownerId } = ready;
-  await deleteIfPresent(boards, requestKey(ownerId, caller.ownerId));
+  // Pair keys are deleted only when a fr:req row was stored. A quiet-block
+  // note has no pair key. The note delete still runs when the row is absent.
+  await cancelPendingRequest(boards, caller.ownerId, ownerId);
   await deleteOutgoingNote(boards, caller.ownerId, ownerId);
   return friendJson(200, { ok: true }, cors);
 }
@@ -643,8 +670,11 @@ async function blockPerson(request, env, cors) {
   await friendDelete(boards, friendKvKey("friend", `${ownerId}:${caller.ownerId}`));
   await saveFriendIds(boards, caller.ownerId, removeFriendId(await loadFriendIds(boards, caller.ownerId), ownerId));
   await saveFriendIds(boards, ownerId, removeFriendId(await loadFriendIds(boards, ownerId), caller.ownerId));
-  await deleteIfPresent(boards, requestKey(ownerId, caller.ownerId));
-  await deleteIfPresent(boards, requestKey(caller.ownerId, ownerId));
+  // Incoming pending row: the caller declines it. Outgoing pending row: the
+  // caller cancels it. Both updates delete that pair's fr:ridx keys after
+  // the backfill. They do not rewrite a shared list.
+  await declinePendingRequest(boards, caller.ownerId, ownerId);
+  await cancelPendingRequest(boards, caller.ownerId, ownerId);
   // Only this friend loses access. Normal shared rounds reach friends through the
   // friend list, so ending the friendship already ends access; the caller's rounds
   // stay for everyone else. Past picks given to this one person are taken back both ways.
@@ -759,26 +789,42 @@ async function listRequests(request, env, cors) {
   if (typeof boards.list !== "function") return friendJson(503, { error: "boards_not_configured" }, cors);
   const limited = await consumeReadLimit(request, env, friendKey, "keyreq:", "ipreq:", cors);
   if (limited) return limited;
-  // The requester id is the key suffix, so outgoing fr:req: rows are not a
-  // prefix. One fr:req: scan feeds incoming and real outgoing. A quiet-block
-  // note lives at fr:out:<sender>:<recipient> and is listed only for that
-  // sender. Do not invent a row from fr:block:*:<caller>: a block without a
-  // send is not a request, and reading those block rows would reveal it.
-  const names = await listKeysByPrefix(boards, "fr:req:");
+  // fr:ridx:ready:<caller> means this owner's pair keys were backfilled.
+  // Until that marker exists, scan fr:req: so a pre-deploy row, a partial
+  // backfill, or a row stored without its pair key is still listed. The
+  // read does not write the marker or the pair keys. A quiet-block note
+  // lives at fr:out:<sender>:<recipient> and is listed only for that
+  // sender. Do not invent a row from fr:block:*:<caller>.
+  const readyMarker = await friendGet(boards, readyKey(caller.ownerId));
   const incoming = [];
   const outgoing = [];
-  for (const name of names) {
-    const parsed = parseRequestKey(name);
-    if (!parsed || parsed.recipient === parsed.requester) continue;
-    if (parsed.recipient === caller.ownerId) {
-      const raw = await friendGet(boards, name);
-      if (typeof raw !== "string" || raw.length === 0) continue;
-      if (await hasBlock(boards, caller.ownerId, parsed.requester)) continue;
-      incoming.push({ ownerId: parsed.requester });
-    } else if (parsed.requester === caller.ownerId) {
-      const raw = await friendGet(boards, name);
-      if (typeof raw !== "string" || raw.length === 0) continue;
-      outgoing.push({ ownerId: parsed.recipient });
+  if (typeof readyMarker === "string" && readyMarker.length > 0) {
+    const inPrefix = `fr:ridx:in:${caller.ownerId}:`;
+    const outPrefix = `fr:ridx:out:${caller.ownerId}:`;
+    for (const name of await listKeysByPrefix(boards, inPrefix)) {
+      const requester = pairOwnerFromKey(name, inPrefix);
+      if (!requester) continue;
+      const entry = await readIncomingRequest(boards, caller.ownerId, requester);
+      if (entry) incoming.push(entry);
+    }
+    for (const name of await listKeysByPrefix(boards, outPrefix)) {
+      const recipient = pairOwnerFromKey(name, outPrefix);
+      if (!recipient) continue;
+      const entry = await readOutgoingRequest(boards, caller.ownerId, recipient);
+      if (entry) outgoing.push(entry);
+    }
+  } else {
+    const names = await listKeysByPrefix(boards, "fr:req:");
+    for (const name of names) {
+      const parsed = parseRequestKey(name);
+      if (!parsed || parsed.recipient === parsed.requester) continue;
+      if (parsed.recipient === caller.ownerId) {
+        const entry = await readIncomingRequest(boards, caller.ownerId, parsed.requester);
+        if (entry) incoming.push(entry);
+      } else if (parsed.requester === caller.ownerId) {
+        const entry = await readOutgoingRequest(boards, caller.ownerId, parsed.recipient);
+        if (entry) outgoing.push(entry);
+      }
     }
   }
   const noteNames = await listKeysByPrefix(boards, `fr:out:${caller.ownerId}:`);
@@ -1133,6 +1179,119 @@ async function storeOutgoingNote(boards, senderOwnerId, recipientOwnerId) {
 
 async function deleteOutgoingNote(boards, senderOwnerId, recipientOwnerId) {
   await friendDelete(boards, outgoingNoteKey(senderOwnerId, recipientOwnerId));
+}
+
+function readyKey(ownerId) {
+  return friendKvKey("ridx", `ready:${ownerId}`);
+}
+
+function incomingIndexKey(ownerId, otherId) {
+  return friendKvKey("ridx", `in:${ownerId}:${otherId}`);
+}
+
+function outgoingIndexKey(ownerId, otherId) {
+  return friendKvKey("ridx", `out:${ownerId}:${otherId}`);
+}
+
+function legacyIndexBlobKey(ownerId) {
+  return friendKvKey("ridx", ownerId);
+}
+
+function pairOwnerFromKey(name, prefix) {
+  if (typeof name !== "string" || !name.startsWith(prefix)) return null;
+  const other = name.slice(prefix.length);
+  if (!OWNER_ID_RE.test(other)) return null;
+  return other;
+}
+
+async function hasReadyMarker(boards, ownerId) {
+  const raw = await friendGet(boards, readyKey(ownerId));
+  return typeof raw === "string" && raw.length > 0;
+}
+
+async function putIndexFlag(boards, key) {
+  const existing = await friendGet(boards, key);
+  if (typeof existing === "string" && existing.length > 0) return;
+  await friendPut(boards, key, "1");
+}
+
+async function ensurePairIndex(boards, recipientOwnerId, requesterOwnerId) {
+  await putIndexFlag(boards, incomingIndexKey(recipientOwnerId, requesterOwnerId));
+  await putIndexFlag(boards, outgoingIndexKey(requesterOwnerId, recipientOwnerId));
+}
+
+async function deletePairIndex(boards, recipientOwnerId, requesterOwnerId) {
+  await friendDelete(boards, incomingIndexKey(recipientOwnerId, requesterOwnerId));
+  await friendDelete(boards, outgoingIndexKey(requesterOwnerId, recipientOwnerId));
+}
+
+async function backfillOwner(boards, ownerId) {
+  if (await hasReadyMarker(boards, ownerId)) return;
+  const names = await listKeysByPrefix(boards, "fr:req:");
+  for (const name of names) {
+    const parsed = parseRequestKey(name);
+    if (!parsed || parsed.recipient === parsed.requester) continue;
+    if (parsed.recipient === ownerId) await putIndexFlag(boards, incomingIndexKey(ownerId, parsed.requester));
+    else if (parsed.requester === ownerId) await putIndexFlag(boards, outgoingIndexKey(ownerId, parsed.recipient));
+  }
+  // Old single-blob index. Ignored on read. Drop it only after the pair
+  // keys above have been put, and before the ready marker.
+  await deleteIfPresent(boards, legacyIndexBlobKey(ownerId));
+  await friendPut(boards, readyKey(ownerId), "1");
+}
+
+async function indexOnCreate(boards, recipientOwnerId, requesterOwnerId) {
+  await backfillOwner(boards, recipientOwnerId);
+  await backfillOwner(boards, requesterOwnerId);
+  await ensurePairIndex(boards, recipientOwnerId, requesterOwnerId);
+}
+
+async function indexOnAccept(boards, recipientOwnerId, requesterOwnerId) {
+  // Backfill an owner who has no ready marker before deleting this pair.
+  // The fr:req row is already gone. A list that still returns it would put
+  // the pair key again, and the delete below removes that put.
+  await backfillOwner(boards, recipientOwnerId);
+  await backfillOwner(boards, requesterOwnerId);
+  await deletePairIndex(boards, recipientOwnerId, requesterOwnerId);
+}
+
+async function deletePendingRow(boards, recipientOwnerId, requesterOwnerId) {
+  const key = requestKey(recipientOwnerId, requesterOwnerId);
+  const raw = await friendGet(boards, key);
+  if (typeof raw !== "string" || raw.length === 0) return false;
+  await friendDelete(boards, key);
+  return true;
+}
+
+async function declinePendingRequest(boards, recipientOwnerId, requesterOwnerId) {
+  const removed = await deletePendingRow(boards, recipientOwnerId, requesterOwnerId);
+  if (!removed) return;
+  await backfillOwner(boards, recipientOwnerId);
+  await backfillOwner(boards, requesterOwnerId);
+  await deletePairIndex(boards, recipientOwnerId, requesterOwnerId);
+}
+
+async function cancelPendingRequest(boards, requesterOwnerId, recipientOwnerId) {
+  const removed = await deletePendingRow(boards, recipientOwnerId, requesterOwnerId);
+  if (!removed) return;
+  await backfillOwner(boards, requesterOwnerId);
+  await backfillOwner(boards, recipientOwnerId);
+  await deletePairIndex(boards, recipientOwnerId, requesterOwnerId);
+}
+
+async function readIncomingRequest(boards, callerOwnerId, requesterOwnerId) {
+  if (!OWNER_ID_RE.test(requesterOwnerId) || requesterOwnerId === callerOwnerId) return null;
+  const raw = await friendGet(boards, requestKey(callerOwnerId, requesterOwnerId));
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  if (await hasBlock(boards, callerOwnerId, requesterOwnerId)) return null;
+  return { ownerId: requesterOwnerId };
+}
+
+async function readOutgoingRequest(boards, callerOwnerId, recipientOwnerId) {
+  if (!OWNER_ID_RE.test(recipientOwnerId) || recipientOwnerId === callerOwnerId) return null;
+  const raw = await friendGet(boards, requestKey(recipientOwnerId, callerOwnerId));
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  return { ownerId: recipientOwnerId };
 }
 
 async function hasBlock(boards, blockerOwnerId, blockedOwnerId) {
@@ -1552,6 +1711,7 @@ function friendKvKey(kind, id) {
     kind !== "k" &&
     kind !== "code" &&
     kind !== "req" &&
+    kind !== "ridx" &&
     kind !== "out" &&
     kind !== "friend" &&
     kind !== "friends" &&
