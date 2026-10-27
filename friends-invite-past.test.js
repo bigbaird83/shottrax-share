@@ -187,16 +187,17 @@ describe("invite name and past rounds", () => {
     return invoke("/v1/friends/past", { method: "PUT", friend: who.key, body: { ownerId: friend.ownerId, choice, rounds } });
   }
 
-  it("stores the invite name with the code, not in the URL or the auth row, and returns it only on lookup", async () => {
+  it("stores the invite name with the code and owner, not in the URL or the auth row", async () => {
     const sharer = await mint("name-sharer");
     const opener = await mint("name-opener");
     const set = await invoke("/v1/friends/code/name", { friend: sharer.key, body: { name: `  ${INVITE_NAME} ` } });
     expect(set.status).toBe(200);
     expect(set.json).toEqual({ ok: true });
     expect(kv.get(`fr:invname:${sharer.code}`).value).toBe(INVITE_NAME);
+    expect(kv.get(`fr:ownname:${sharer.ownerId}`).value).toBe(INVITE_NAME);
     const authRow = [...kv.entries()].find(([name]) => name.startsWith("fr:k:"));
     for (const [name, row] of kv.entries()) {
-      if (name !== `fr:invname:${sharer.code}`) expect(row.value).not.toContain(INVITE_NAME);
+      if (name !== `fr:invname:${sharer.code}` && name !== `fr:ownname:${sharer.ownerId}`) expect(row.value).not.toContain(INVITE_NAME);
     }
     expect(authRow[1].value).not.toContain(INVITE_NAME);
     // The code call (what the phone builds the link from) never carries the name.
@@ -205,12 +206,12 @@ describe("invite name and past rounds", () => {
     expect(again.text).not.toContain(INVITE_NAME);
     const lookup = await invoke("/v1/friends/codes/lookup", { friend: opener.key, body: { code: sharer.code } });
     expect(lookup.json).toEqual({ ownerId: sharer.ownerId, name: INVITE_NAME });
-    // Lists and rounds never carry it.
+    // Rounds never carry it. Friend and request lists do (friends-names.test.js).
     await befriend(opener, sharer);
-    for (const path of ["/v1/friends/list", "/v1/friends/requests", "/v1/friends/rounds"]) {
-      const res = await invoke(path, { method: "GET", friend: opener.key });
-      expect(res.text).not.toContain(INVITE_NAME);
-    }
+    const rounds = await invoke("/v1/friends/rounds", { method: "GET", friend: opener.key });
+    expect(rounds.text).not.toContain(INVITE_NAME);
+    const listed = await invoke("/v1/friends/list", { method: "GET", friend: opener.key });
+    expect(listed.json.friends).toEqual([{ ownerId: sharer.ownerId, name: INVITE_NAME }]);
   });
 
   it("resetting the code deletes the stored name; the new code has none", async () => {
@@ -244,6 +245,7 @@ describe("invite name and past rounds", () => {
     await say({ name: "Alex" });
     expect((await say({ name: null })).status).toBe(200);
     expect(kv.has(`fr:invname:${sharer.code}`)).toBe(false);
+    expect(kv.has(`fr:ownname:${sharer.ownerId}`)).toBe(false);
     expect((await invoke("/v1/friends/code/name", { body: { name: "Alex" } })).status).toBe(401);
     expect((await invoke("/v1/friends/code/name", { friend: friendKey("nobody"), body: { name: "Alex" } })).status).toBe(401);
   });

@@ -85,14 +85,29 @@ Returned only by code lookup as `photo` next to `name`. `resetCode` deletes it f
 `PUT /v1/friends/live`
 
 ```json
-{ "courseName": "Pine Hollow GC", "hole": 7, "holes": [ { "hole": 1, "score": 5, "par": 4 } ] }
+{ "courseName": "Pine Hollow GC", "hole": 7, "roundStats": true, "clubAverages": false, "holes": [ { "hole": 1, "score": 5, "par": 4, "shots": [ { "n": 1, "club": "Dr", "yd": 248, "s": [10.12345, 20.12345], "e": [10.12545, 20.12445] } ] } ] }
 ```
 
-Your round in progress, for friends. `hole` is the current hole (1 to 18). `holes` (0 to 18) use the publishRound hole allowlist: `score` and `par` always, and `fir`, `gir`, `putts` and `clubs` only when the phone's Round stats and Club averages switches are on. GPS, position or any other field is `400`. Stored at `fr:live:<ownerId>` with `updatedAt`, and replaced on every update. KV TTL is 30 minutes. The phone sends it only while "Share live rounds with friends" is on and that round is shared. Rate limited on the `iplive:` IP counter (240 per hour, shared with fetchLive). `200` `{ "ok": true }`.
+Your round in progress, for friends. `hole` is the current hole (1 to 18). `holes` (0 to 18) use the publishRound hole allowlist for `score` and `par`. The phone draft has no field for the Round stats or Club averages switches. This call adds these booleans. Any other value is `invalid_body`.
 
-`GET /v1/friends/live` returns `200` `{ "live": [ { "ownerId", "courseName", "hole", "toPar", "holes", "updatedAt" } ] }`: only accepted friends both ways, not blocked either way, whose row was updated in the last 30 minutes. `toPar` is worked out from `holes`. Your own row, non-friends' rows and anything older than 30 minutes are never returned.
+| Field | Rule |
+|---|---|
+| `roundStats` | Boolean. The Round stats setting. When `true`, `fir`, `gir`, and `putts` on each hole are stored and served to followers. When `false`, those three are omitted from the stored row and from `GET /v1/friends/live`, even if the hole objects included them. When the field is omitted, a stat that is present is served. That keeps phones that already drop the stat when the switch is off. |
+| `clubAverages` | Boolean. The Club averages setting. Stored but does not hide anything on live rounds: the hole `clubs` array and per-shot `club`, `yd`, and `s` / `e` lat/lon are accepted and served whether it is `true`, `false`, or omitted (Brian's decision, Oct 24, 2026). |
+| `roundKind` | `"round"`, `"practice"`, or `"test"`. Leading and trailing space is ignored and the match is case-insensitive. `"practice"` and `"test"` are `400` `{ "error": "practice_or_test" }`. Nothing is written, and an existing live row is left as it was. |
+| `finished` | Boolean. `true` deletes `fr:live:<ownerId>`, including every shot location, and returns `200` `{ "ok": true }`. The rest of the body is not stored. This is checked before the practice/test refusal, so a finished practice round still deletes. `false` is a normal update. |
 
-`POST /v1/friends/live/stop` (empty body) deletes your row: at round finish, when the switch is turned off, or when "Friends can follow" is tapped. `200` `{ "ok": true }`.
+Optional `skippedHoles` (Brian Baird OK Oct 23, 2026, 11:55 PM CT): an array of up to 18 hole numbers (integers 1 to 18) the golfer skipped, so friends see "Skipped" instead of unscored. Repeats are merged and the list is stored sorted. A hole that is also in `holes`, or the current `hole` when top-level `shots` are sent, is `400`. An empty list or a missing field stores nothing, so older apps keep working unchanged.
+
+Shots (live rounds only) sit on a hole as `shots`, 1 to 15, and top-level `shots` is the current hole. Top-level `shots` is refused when that hole already has a score. Shot allowlist: `n`, `club`, `yd`, `s`, `e`, `res`. `s` and `e` are `[lat, lon]`. Brian decided on Oct 23, 2026 at 10:02 AM CT that a coordinate with 6 or more decimal places is accepted and rounded to 5 decimal places on write, and followers are served that rounded value. Rounding is `Math.round` (half toward +∞): `10.123456` is stored as `10.12346`, `10.123455` as `10.12346`, and `-10.123455` as `-10.12345`. A non-numeric coordinate, or one outside −90..90 latitude or −180..180 longitude after that rounding, is `invalid_body` and nothing is stored. Putts (`club` `"Putt"`) carry no yards and no coordinates. `res` is `fairway`, `rough`, `sand`, `green`, `holed`, or `missed`. `holed` is only on a scored hole. Per-shot `club`, `yd`, and lat/lon are served to followers whether or not `clubAverages` is on. Published rounds and past rounds still refuse `shots`.
+
+Round-level or hole-level GPS (`lat`, `lng`, `lon`, `position`, and any other key not in the allowlist) is `400` `{ "error": "invalid_body" }`. Shot coordinates are only the `s` and `e` pairs above.
+
+Stored at `fr:live:<ownerId>` with `updatedAt`, and replaced on every update. KV `expirationTtl` is 30 minutes (1800 seconds), from the last update. The phone sends it only while "Share live rounds with friends" is on and that round is shared. That switch is on by default for players who never chose, and stays off for anyone who turned it off; the phone shows the notice. The Worker keeps no share flag: the PUT itself is the opt-in, and a missing `roundStats`, `clubAverages`, or `roundKind` never refuses or strips it. Rate limited on the `iplive:` IP counter (240 per hour, shared with fetchLive). A practice/test refusal and a finish delete do not take a slot on that counter. `200` `{ "ok": true }`.
+
+`GET /v1/friends/live` returns `200` `{ "live": [ { "ownerId", "courseName", "hole", "toPar", "holes", "updatedAt" } ] }`, plus `skippedHoles` when the golfer skipped an unscored hole, and top-level `shots` when the current hole has them: only accepted friends both ways, not blocked either way, whose row was updated in the last 30 minutes. `toPar` is worked out from `holes`. Your own row, non-friends' rows and anything older than 30 minutes are never returned. A follower read that finds a row older than 30 minutes deletes that key, so the shot locations are gone, and a later read still returns nothing. `fir`, `gir`, and `putts` are left out of each hole when the stored `roundStats` is `false`. The hole `clubs` array, per-shot club, yards, and the rounded lat/lon stay even when `clubAverages` is `false`. The setting flags themselves are not returned.
+
+`POST /v1/friends/live/stop` (empty body) deletes your row, including every shot location: at round finish, when the switch is turned off, or when "Friends can follow" is tapped. `PUT` with `{ "finished": true }` does the same delete. `200` `{ "ok": true }`.
 
 ### setPastRounds
 
@@ -120,7 +135,7 @@ Each side picks only for its own rounds. No call returns a choice or an audience
 
 Performs the code lookup below, including the guess limit. A limited caller gets `rate_limited` and is not told whether the code exists.
 
-A real code that is not the caller, and no block in either direction, stores a pending request. Access does not start here. The other person must accept.
+A real code that is not the caller, and no block in either direction, stores a pending request. No duplicates: when the two are already friends the answer is `{ "status": "friends", "ownerId", "already": "friends" }`; when the caller already asked, `{ "status": "pending", "ownerId", "already": "outgoing" }`; when the other person already asked the caller, `{ "status": "pending", "ownerId", "already": "incoming" }` and nothing is written (accept theirs). Access does not start here. The other person must accept.
 
 `200` `{ "status": "pending", "ownerId": "<their ownerId>" }`
 
@@ -151,7 +166,7 @@ Auth is `X-Friend-Key`, the same as the other friends routes. A missing or bad k
 }
 ```
 
-`incoming` is pending requests other people sent the caller. `outgoing` is pending requests the caller sent: `fr:req:<recipient>:<caller>` rows and the caller's own `fr:out:<caller>:<recipient>` notes. Each entry is the other person's `ownerId` only. The stored row is the string `pending`. It has no display name and no created time, so this route does not add those fields. The raw value is not returned. A friend code, a friend key, a raw KV key, and anyone who is not the other party of that request are not returned.
+`incoming` is pending requests other people sent the caller. `outgoing` is pending requests the caller sent: `fr:req:<recipient>:<caller>` rows and the caller's own `fr:out:<caller>:<recipient>` notes. Each entry is the other person's `ownerId`, plus `name` when that person has set an invite name (read from `fr:ownname:<ownerId>`, validated like lookup, omitted when unset or invalid). The stored row is the string `pending`. It has no created time. The raw value is not returned. A friend code, a friend key, a raw KV key, and anyone who is not the other party of that request are not returned.
 
 A requester the caller has blocked is left out of `incoming`. A stored outgoing `fr:req:` row is still returned to the sender when the recipient has a block row. A quiet-block note is returned in that same `outgoing` array, in the same `{ "ownerId" }` shape, in the same `ownerId` sort. Hiding either one would tell the sender they were blocked. Incoming reads `fr:req:` only. A note is not an incoming row. `listFriends`, `fetchRounds`, accept, block, unblock, and remove do not read `fr:out:`.
 
@@ -165,7 +180,7 @@ If `BOARDS` is missing, or it has no `list`, the call is `503` `{ "error": "boar
 
 ### Sender-only note lifetime
 
-A real pending request has no `expirationTtl`. It stays until the recipient accepts, or until a successful block deletes both `fr:req:` directions. There is no decline or withdraw call. Unblock, remove, and `resetCode` do not delete it. There is no cap on outstanding requests. Each send spends one code guess before the block check.
+A real pending request has no `expirationTtl`. It stays until the recipient accepts, or until a successful block deletes both `fr:req:` directions. Accept deletes both directions too: when each person sent a request, the accepter's own request to the other side goes with it. There is no decline or withdraw call. Unblock, remove, and `resetCode` do not delete it. There is no cap on outstanding requests. Each send spends one code guess before the block check.
 
 The note has that same lifetime from the sender's side. The rule is: delete the note only when a real pending request would also leave the sender's outgoing list, and only as a result of the sender's own later send or of the recipient accepting a real request.
 
@@ -206,9 +221,9 @@ Accept reads `fr:req:` only. A sender-only `fr:out:` note is not a request and c
 
 The phone's `id` is this `ownerId`.
 
-Deletes the friendship (both `fr:friend:` rows and both `fr:friends:` lists) and deletes only the caller's shared rounds. The other person's rounds stay for their remaining friends. Fetch no longer returns the caller's rounds to anyone.
+Deletes the friendship (both `fr:friend:` rows and both `fr:friends:` lists) and takes each side off the other's past-round audiences. No shared round is deleted: both people's rounds stay for their other friends, and the removed person no longer fetches the caller's rounds.
 
-This is Brian's approved behavior as of Oct 17, 2026, 5:37 PM CT. It replaces his earlier answer that remove and block wipe both people's shared rounds for every friend. There is no per-friend share list.
+This is Brian's approved behavior as of Oct 23, 2026, 5:50 PM CT: removing or blocking one friend only stops sharing with that friend. It replaces the Oct 17 answer that deleted the caller's shared rounds for every friend.
 
 `200` `{ "ok": true }`
 
@@ -226,7 +241,7 @@ The phone's `id` is this `ownerId`.
 
 Requires an accepted friendship (both `fr:friend:` rows). Otherwise `409` `{ "error": "not_friends" }` and nothing is written: no block row and no round delete. A key that only learned an `ownerId` from lookup cannot block that person.
 
-The block row is stored first. Then the friendship rows and both friend lists are deleted, then pending request rows, then only the caller's round list. A failure after the block row is stored must not leave the pair with the friendship already gone and no block. The other person's rounds stay for their remaining friends. Access ends immediately. The block is stored for the caller. Same as remove: caller-only round deletion is Brian's approved behavior as of Oct 17, 2026, 5:37 PM CT, replacing the earlier both-people answer.
+The block row is stored first. Then the friendship rows and both friend lists are deleted, then pending request rows, then each side's past-round audience entry for the other. No round list is deleted. A failure after the block row is stored must not leave the pair with the friendship already gone and no block. The other person's rounds stay for their remaining friends. Access ends immediately. The block is stored for the caller. Same as remove: no shared round is deleted (Brian, Oct 23, 2026, 5:50 PM CT).
 
 `200` `{ "ok": true }`
 
@@ -261,16 +276,16 @@ No body. The `Content-Length` rules, auth errors, and `boards_not_configured` er
 `200`
 
 ```json
-{ "friends": [ { "ownerId": "k3mR9xQ2nB8wL4pT6vYs1A" } ] }
+{ "friends": [ { "ownerId": "k3mR9xQ2nB8wL4pT6vYs1A", "name": "Jordan Pike" } ] }
 ```
 
 Each entry is a current friend: an id in the caller's `fr:friends:` list, with both `fr:friend:` rows present (`fr:friend:<caller>:<friend>` and `fr:friend:<friend>:<caller>`). That is the accepted pair `accept` writes and the pair `remove` and `block` require. One row without the other is not a friend and is not listed. A block in either direction hides the friend, the same rule `fetchRounds` uses when it skips a friend's rounds. The response is at most 50 friends. Only the first 50 ids in the stored array are inspected, in that stored order, and ids past the cap are ignored.
 
-`since` is the friendship's created time when a row stores one. Today each `fr:friend:` value is the string `1`, and the `fr:friends:` array is only ids, so no created time is stored. The field is omitted. An entry is `{ "ownerId" }` only. No friend code, friend key, raw KV key, name, or other person's data is returned.
+`since` is the friendship's created time when a row stores one. Today each `fr:friend:` value is the string `1`, and the `fr:friends:` array is only ids, so no created time is stored. The field is omitted. An entry is `{ "ownerId" }` plus optional `name`, the friend's own invite name from `fr:ownname:<ownerId>` (1–24 characters, no control characters, omitted when unset or invalid). No friend code, friend key, raw KV key, or other person's data is returned. Older apps ignore `name`.
 
 Sort: `friends` is sorted by `ownerId` ascending, JavaScript string order. There is no cursor.
 
-KV reads, no KV writes, no list. Formula: `2 + N + P + 2M` gets. `N` is the number of ids inspected, `N = min(length of fr:friends:<caller>, 50)`. `P` is how many of those have a caller→friend row, so the reverse row is read. `M` is how many have both rows, so both block rows are read (`M ≤ P ≤ N`). The `2` is the auth row and the `fr:friends:` value. A clean list, every inspected id a mutual friend whether or not a block remains, is `2 + 4N` gets. No `put` and no `delete`.
+KV reads, no list. Formula: `3 + N + P + 2M + F` gets, plus 1 when the caller has no `fr:ownname:` row (then `fr:invname:<caller CODE>` is read, and when it holds a valid name it is copied to `fr:ownname:<caller>`: the only write, a one-time backfill for names saved before `fr:ownname:` existed). `F` is the number of friends returned (one `fr:ownname:` read each). `N` is the number of ids inspected, `N = min(length of fr:friends:<caller>, 50)`. `P` is how many of those have a caller→friend row, so the reverse row is read. `M` is how many have both rows, so both block rows are read (`M ≤ P ≤ N`). The `2` is the auth row and the `fr:friends:` value. A clean list, every inspected id a mutual unblocked friend, caller name already stored, is `3 + 5N` gets. No `delete`.
 
 The read limit is 60 calls per friend key per 60 minutes (`keylist:`) and 60 per IP hash per 60 minutes when `CF-Connecting-IP` is present (`iplist:`). It does not share the listRequests counters, the code-guess counters, `ipget:`, or `ippub:`. No IP header skips the IP limit. Over the limit is `429` `{ "error": "rate_limited" }` and `Retry-After`, and that request does not read the friend list. A bad body does not consume a call.
 
@@ -316,7 +331,7 @@ No body.
 
 `200` `{ "rounds": [ ] }`
 
-Each entry is a stored round from an accepted friend, plus the caller's own published rounds. A friend's past round (see setPastRounds) is included only when it was given to the caller, and the `to` audience is never returned. Rounds the caller removed, blocked, or unshared are already gone. The other person's rounds are not deleted by remove or block, so that person's other friends still fetch them. Omitted stat fields stay omitted. A stored round that fails the allowlist, including one that carries GPS, is omitted on read. The response is the full list. There is no cursor. Rounds are sorted by `playedOn`, then `ownerId`, then `id`, ascending.
+Each entry is a stored round from an accepted friend, plus the caller's own published rounds. A friend's past round (see setPastRounds) is included only when it was given to the caller, and the `to` audience is never returned. Rounds the caller unshared are already gone. Remove and block delete no rounds; they only end access between those two people. Omitted stat fields stay omitted. A stored round that fails the allowlist, including one that carries GPS, is omitted on read. The response is the full list. There is no cursor. Rounds are sorted by `playedOn`, then `ownerId`, then `id`, ascending.
 
 Fetch reads `3 + 2N + F` KV values and does not list. `N` is the caller's friend-list length. `F` is how many of those friends are unblocked in both directions (`F` ≤ `N`). The reads are 1 auth row, 1 `fr:friends:` list, 1 own `fr:rounds:` value, 2 block checks per friend, and 1 round-list read per unblocked friend. When nobody is blocked, that is `3 + 3N` gets.
 
@@ -414,7 +429,7 @@ Example with FIR and putts on, and GIR and clubs off:
 }
 ```
 
-League scores are these shared rounds. The Worker keeps one owner's rounds in one KV value for up to 1 year (`expirationTtl` of 365 days) or until `remove`, `block`, or unshare (`share: false` with `round: null`) deletes it, whichever comes first. Replacing a round refreshes that TTL. Text filtering for league titles and report notes is not part of this contract. Those fields are unknown today. Filtering comes later.
+League scores are these shared rounds. The Worker keeps one owner's rounds in one KV value for up to 1 year (`expirationTtl` of 365 days) or until unshare (`share: false` with `round: null`) deletes it, whichever comes first. Replacing a round refreshes that TTL. Text filtering for league titles and report notes is not part of this contract. Those fields are unknown today. Filtering comes later.
 
 An accepted friendship is capped at 50 friends per owner. `accept` checks both `fr:friends:` lists before it writes. If either person would go past 50, the call is `409` `{ "error": "friend_limit" }`, the pending request stays, and no friendship row is written.
 
@@ -431,6 +446,8 @@ Friend rows use the `fr:` prefix only. The keys this API writes are:
 - `fr:block:<blocker>:<blocked>` — the caller's block. The value is `1`.
 - `fr:rounds:<ownerId>` — JSON array of that owner's shared rounds, one value, `expirationTtl` of 365 days. This replaces per-round `fr:round:<owner>:<id>` keys. A past round carries `to: [ownerIds]`, the friends it was given to.
 - `fr:invname:<CODE>` — the invite name for that code, a plain string of 1–24 characters. `resetCode` deletes it with the old code.
+- `fr:ownname:<ownerId>` — the same invite name keyed by owner, written and cleared by setInviteName, deleted by resetCode. listFriends and listRequests return it as optional `name`. Names set before this key existed appear once the owner saves their invite name again.
+- `fr:live:<ownerId>` — that owner's live round, one JSON value, `expirationTtl` of 30 minutes from the last `PUT`. Shot lat/lon live only inside this value. Deleted by `POST /v1/friends/live/stop`, by `PUT` with `finished: true`, and by a follower read that finds the row older than 30 minutes.
 
 None of these routes read or write `id:`, `name:`, `osm:`, `gq:`, `gapi:`, `gqueue:`, `gca:`, or `cr:`. `GET /v1/friends/requests` and `GET /v1/friends/list` do not `put` or `delete` any KV key. The only mutation on those calls is the Durable Object attempt counter. Board `GET`, `PUT`, and `DELETE` reserve the `fr:` prefix and return `400` with no KV read or write. That includes a percent-encoded path (`fr%3A` and `fr%3a`), so a board path cannot read, replace, or forge a friend row. Guess counts live in the Durable Object, not in KV.
 
@@ -454,6 +471,6 @@ ShotTraxx PR #533 `src/domain/friendsApi.ts` returns `FriendsApiResult` on every
 | `publishRound({ round, share })` | `PUT /v1/friends/rounds`. `share: true` and a round publishes it. `share: false` and `round: null` unshares and deletes the caller's shared rounds. |
 | `fetchRounds()` | `GET /v1/friends/rounds` → `{ rounds }` |
 
-`off` is the phone switch. No request is sent. `todo` is a call the phone has not finished, or a server that is not ready: `unknown_route`, `boards_not_configured`, `guess_limiter_not_configured`. `refused` is every other error: `friend_key_required`, `invalid_body`, `payload_too_large`, `method_not_allowed`, `code_not_found`, `not_friends`, `friend_limit`, `round_limit`, `rate_limited`, and `blocked`.
+`off` is the phone switch. No request is sent. `todo` is a call the phone has not finished, or a server that is not ready: `unknown_route`, `boards_not_configured`, `guess_limiter_not_configured`. `refused` is every other error: `friend_key_required`, `invalid_body`, `payload_too_large`, `method_not_allowed`, `code_not_found`, `not_friends`, `friend_limit`, `round_limit`, `rate_limited`, `blocked`, and `practice_or_test`.
 
 `blocked` is returned only to the person who blocked, and the phone maps it to `refused`, the same reason it uses for `code_not_found` and `not_friends`. The blocked person never receives `blocked`. Their `sendRequest` is the normal `200` pending body, and their `accept` is `not_friends`. That is a success or a `refused`, not a block.
