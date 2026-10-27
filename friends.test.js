@@ -1,8 +1,7 @@
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import entry from "./entry.js";
-import worker, { FriendGuessLimiter } from "./worker.js";
+import entry, { FriendGuessLimiter } from "./entry.js";
 import { limiterNameForFriendKey } from "./friends.js";
 
 const ORIGIN = "https://shottrax-share.bcbaird.workers.dev";
@@ -129,7 +128,7 @@ describe("friend codes", () => {
     if (friend) requestHeaders["X-Friend-Key"] = friend;
     if (ip) requestHeaders["CF-Connecting-IP"] = ip;
     if (body !== undefined && !requestHeaders["Content-Type"]) requestHeaders["Content-Type"] = "application/json";
-    const response = await worker.fetch(new Request(`${ORIGIN}${pathname}`, {
+    const response = await entry.fetch(new Request(`${ORIGIN}${pathname}`, {
       method,
       headers: requestHeaders,
       body: body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body),
@@ -2072,10 +2071,6 @@ describe("friend codes", () => {
 
   it("deployed entry reserves fr: for raw and percent-encoded paths", async () => {
     await expectReserved(entry.fetch.bind(entry), "entry");
-  });
-
-  it("worker.js reserves fr: for raw and percent-encoded paths", async () => {
-    await expectReserved(worker.fetch.bind(worker), "worker");
   });
 
   it("keeps the stockpile flag false and adds no binding", () => {

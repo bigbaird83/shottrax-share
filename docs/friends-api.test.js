@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import worker from "../worker.js";
+import entry from "../entry.js";
 
 const doc = readFileSync(new URL("./friends-api.md", import.meta.url), "utf8");
 const wrangler = readFileSync(new URL("../wrangler.toml", import.meta.url), "utf8");
@@ -53,7 +53,7 @@ function boards() {
 
 async function call(path, method) {
   const store = boards();
-  const response = await worker.fetch(new Request(`${ORIGIN}${path}`, {
+  const response = await entry.fetch(new Request(`${ORIGIN}${path}`, {
     method,
     body: method === "GET" || method === "OPTIONS" ? undefined : "{}",
     headers: { "X-Friend-Key": "a".repeat(32), "Content-Type": "application/json" },

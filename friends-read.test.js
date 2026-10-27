@@ -1,7 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import entry from "./entry.js";
-import worker, { FriendGuessLimiter } from "./worker.js";
+import entry, { FriendGuessLimiter } from "./entry.js";
 import { FRIEND_CAP, FRIEND_READ_IP_LIMIT, FRIEND_READ_KEY_LIMIT } from "./friends.js";
 
 const ORIGIN = "https://shottrax-share.bcbaird.workers.dev";
@@ -144,10 +143,6 @@ describe("friend read routes", () => {
     return call(entry.fetch.bind(entry), pathname, options);
   }
 
-  function viaWorker(pathname, options) {
-    return call(worker.fetch.bind(worker), pathname, options);
-  }
-
   async function mint(suffix) {
     const key = friendKey(suffix);
     const created = await viaEntry("/v1/friends/code", { method: "POST", friend: key, body: {} });
@@ -227,12 +222,6 @@ describe("friend read routes", () => {
     expect(Object.keys(friends.json)).toEqual(["friends"]);
     expect(friends.json.friends).toEqual([{ ownerId: delta.ownerId }]);
     for (const entry of friends.json.friends) expect(Object.keys(entry)).toEqual(["ownerId"]);
-
-    const mirrored = await viaWorker("/v1/friends/requests", { friend: alpha.key });
-    expect(mirrored.status).toBe(200);
-    expect(mirrored.json).toEqual(requests.json);
-    const mirroredFriends = await viaWorker("/v1/friends/list", { friend: alpha.key });
-    expect(mirroredFriends.json).toEqual(friends.json);
 
     const empty = await mint("read-empty");
     expect((await viaEntry("/v1/friends/requests", { friend: empty.key })).json).toEqual({ incoming: [], outgoing: [] });
