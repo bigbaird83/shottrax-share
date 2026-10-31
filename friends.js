@@ -63,8 +63,10 @@ export const LIVE_SHOT_RESULTS = ["fairway", "rough", "sand", "green", "holed", 
 /** Shot lat/lon are stored and served at 5 decimal places (about 1 m). */
 export const LIVE_COORD_DECIMALS = 5;
 const LIVE_COORD_SCALE = 10 ** LIVE_COORD_DECIMALS;
-const LIVE_ROUND_FIELDS = ["courseName", "hole", "holes", "shots", "skippedHoles", "roundStats", "clubAverages", "roundKind", "finished"];
+const LIVE_ROUND_FIELDS = ["courseName", "hole", "holes", "shots", "skippedHoles", "roundStats", "clubAverages", "roundKind", "finished", "scramble"];
 const LIVE_PUTT_CLUB = "Putt";
+/** Scramble team sizes (ShotTraxx src/domain/scramble.ts SCRAMBLE_SIZES). */
+export const SCRAMBLE_SIZES = Object.freeze([2, 3, 4]);
 // 100 ids of 64 characters plus quotes and commas.
 const DELETE_ROUNDS_BODY_LIMIT = 8192;
 const PAST_BODY_LIMIT = 256 * 1024;
@@ -895,6 +897,11 @@ async function putLive(request, env, cors) {
     currentShots = sanitizeShots(body.shots, false);
     if (!currentShots || seen.has(body.hole) || (skippedHoles && skippedHoles.includes(body.hole))) return friendJson(400, { error: "invalid_body" }, cors);
   }
+  let scramble = null;
+  if (Object.hasOwn(body, "scramble")) {
+    scramble = sanitizeScramble(body.scramble);
+    if (!scramble) return friendJson(400, { error: "invalid_body" }, cors);
+  }
   const boards = boardsBinding(env);
   if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
   const caller = await loadCaller(boards, friendKey);
@@ -906,6 +913,7 @@ async function putLive(request, env, cors) {
   if (typeof body.roundStats === "boolean") row.roundStats = body.roundStats;
   if (typeof body.clubAverages === "boolean") row.clubAverages = body.clubAverages;
   if (skippedHoles && skippedHoles.length > 0) row.skippedHoles = skippedHoles;
+  if (scramble) row.scramble = scramble;
   await friendPut(boards, friendKvKey("live", caller.ownerId), JSON.stringify(row), {
     expirationTtl: Math.ceil(FRIEND_LIVE_TTL_MS / 1000),
   });
@@ -989,6 +997,10 @@ function readLiveRow(raw, now) {
   };
   const shots = Object.hasOwn(value, "shots") ? sanitizeShots(value.shots, false) : null;
   if (shots) out.shots = shots;
+  if (Object.hasOwn(value, "scramble")) {
+    const scramble = sanitizeScramble(value.scramble);
+    if (scramble) out.scramble = scramble;
+  }
   if (Object.hasOwn(value, "skippedHoles")) {
     const scored = new Set(holes.map((hole) => hole.hole));
     const skipped = sanitizeSkippedHoles(value.skippedHoles);
@@ -1219,7 +1231,7 @@ async function loadOwnedRounds(boards, ownerId) {
 
 function sanitizeRound(round, callerOwnerId) {
   if (round == null || typeof round !== "object" || Array.isArray(round)) return null;
-  if (unknownFields(round, ["id", "ownerId", "courseName", "playedOn", "gross", "toPar", "holes"])) return null;
+  if (unknownFields(round, ["id", "ownerId", "courseName", "playedOn", "gross", "toPar", "holes", "scramble"])) return null;
   if (typeof round.id !== "string" || !ROUND_ID_RE.test(round.id)) return null;
   if (Object.hasOwn(round, "ownerId") && round.ownerId !== callerOwnerId) return null;
   if (!validCourseName(round.courseName)) return null;
@@ -1236,7 +1248,12 @@ function sanitizeRound(round, callerOwnerId) {
     seen.add(clean.hole);
     holes.push(clean);
   }
-  return {
+  let scramble = null;
+  if (Object.hasOwn(round, "scramble")) {
+    scramble = sanitizeScramble(round.scramble);
+    if (!scramble) return null;
+  }
+  const out = {
     id: round.id,
     ownerId: callerOwnerId,
     courseName: round.courseName,
@@ -1245,6 +1262,31 @@ function sanitizeRound(round, callerOwnerId) {
     toPar: round.toPar,
     holes,
   };
+  if (scramble) out.scramble = scramble;
+  return out;
+}
+
+/**
+ * Scramble rounds only: { size, codes, guests }. size is 2, 3 or 4. codes are the
+ * friend codes of teammates who are friends (no repeats). guests counts everyone else.
+ * codes plus guests is at most size - 1 (the owner is the other player). Names, notes
+ * and any other field are refused: null, and the caller answers invalid_body.
+ * Same shape as SharedScramble in ShotTraxx src/domain/scramble.ts. The Worker keeps no
+ * Board; the app leaves scramble rounds off it.
+ */
+function sanitizeScramble(value) {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) return null;
+  if (unknownFields(value, ["size", "codes", "guests"])) return null;
+  if (!SCRAMBLE_SIZES.includes(value.size)) return null;
+  if (!Array.isArray(value.codes) || value.codes.length > value.size - 1) return null;
+  const codes = [];
+  for (const code of value.codes) {
+    if (typeof code !== "string" || !CODE_RE.test(code) || codes.includes(code)) return null;
+    codes.push(code);
+  }
+  if (!Number.isInteger(value.guests) || value.guests < 0) return null;
+  if (codes.length + value.guests > value.size - 1) return null;
+  return { size: value.size, codes, guests: value.guests };
 }
 
 function sanitizeHole(hole) {
