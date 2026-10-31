@@ -198,6 +198,7 @@ describe("scramble info on live and shared rounds", () => {
     ],
   };
   const putLive = (who, body = LIVE) => invoke("/v1/friends/live", { method: "PUT", friend: who.key, body });
+  const limiterStub = async (who) => env.FRIEND_GUESSES.get(env.FRIEND_GUESSES.idFromName(await limiterNameForFriendKey(who.key)));
   const getLive = (who) => invoke("/v1/friends/live", { method: "GET", friend: who.key });
   const stop = (who) => invoke("/v1/friends/live/stop", { friend: who.key, body: {} });
 
@@ -395,10 +396,13 @@ describe("scramble info on live and shared rounds", () => {
     expect((await lookup(golfer, FAKE[7])).status).toBe(404);
     // Spent: a plain lookup and a scramble with codes are both refused, and nothing new is stored.
     expect((await lookup(golfer, FAKE[8])).status).toBe(429);
+    // Spent: the round is still stored, its code counted as a guest, with no lookup and no hash.
     const over = await shareRound(golfer, round("r_mock_over", "2026-10-31", { scramble: { size: 2, codes: [FAKE[8]], guests: 0 } }));
-    expect(over.status).toBe(429);
-    expect(over.json).toEqual({ error: "rate_limited" });
-    expect(JSON.parse(kv.get(`fr:rounds:${golfer.ownerId}`).value).map((r) => r.id)).toEqual(["r_mock_lim"]);
+    expect(over.status).toBe(200);
+    const rows = JSON.parse(kv.get(`fr:rounds:${golfer.ownerId}`).value);
+    expect(rows.map((r) => r.id)).toEqual(["r_mock_lim", "r_mock_over"]);
+    expect(rows[1].scramble).toEqual({ size: 2, ownerIds: [], guests: 1 });
+    expect(Object.hasOwn(rows[1], "scrambleHash")).toBe(false);
     // A scramble with no codes, and a solo round, never touch the limiter.
     expect((await shareRound(golfer, round("r_mock_guests", "2026-10-31", { scramble: { size: 3, codes: [], guests: 2 } }))).status).toBe(200);
   });
@@ -421,13 +425,123 @@ describe("scramble info on live and shared rounds", () => {
     for (const code of FAKE) expect(seen.text.includes(code)).toBe(false);
   });
 
-  it("limiter: a missing guess limiter fails closed for scramble codes only", async () => {
-    const golfer = await mint("scr-lim-none");
+  it("limiter: a missing guess limiter still stores and serves the live update, team as guests, no lookups", async () => {
+    const { golfer, pal, mate } = await crew("scr-lim-none");
+    const limiter = env.FRIEND_GUESSES;
     delete env.FRIEND_GUESSES;
-    const res = await putLive(golfer, { ...LIVE, scramble: { size: 2, codes: [FAKE[0]], guests: 0 } });
-    expect(res.status).toBe(503);
-    expect(res.json).toEqual({ error: "guess_limiter_not_configured" });
-    expect(kv.has(`fr:live:${golfer.ownerId}`)).toBe(false);
-    expect((await putLive(golfer, { ...LIVE, scramble: { size: 2, codes: [], guests: 1 } })).json).toEqual({ ok: true });
+    const reads = [];
+    const get = env.BOARDS.get;
+    env.BOARDS.get = async (key) => {
+      reads.push(key);
+      return get(key);
+    };
+    const res = await putLive(golfer, { ...LIVE, scramble: { size: 3, codes: [mate.code], guests: 1 } });
+    expect(res.json).toEqual({ ok: true });
+    expect(reads.some((key) => key.startsWith("fr:code:"))).toBe(false);
+    env.BOARDS.get = get;
+    const row = JSON.parse(kv.get(`fr:live:${golfer.ownerId}`).value);
+    expect(row.holes).toEqual(LIVE.holes);
+    expect(row.scramble).toEqual({ size: 3, ownerIds: [], guests: 2 });
+    expect(Object.hasOwn(row, "scrambleCodesHash")).toBe(false);
+    env.FRIEND_GUESSES = limiter;
+    const seen = await getLive(pal);
+    expect(seen.json.live[0].holes).toEqual(LIVE.holes);
+    expect(seen.json.live[0].scramble).toEqual({ size: 3, ownerIds: [], guests: 2 });
+    // Limiter back: the next update recovers and resolves the friend.
+    expect((await putLive(golfer, { ...LIVE, hole: 4, scramble: { size: 3, codes: [mate.code], guests: 1 } })).json).toEqual({ ok: true });
+    expect((await getLive(pal)).json.live[0].scramble).toEqual({ size: 3, ownerIds: [mate.ownerId], guests: 1 });
+  });
+
+  it("limiter: an over-limit live update still stores and serves scores, team as guests, then recovers", async () => {
+    const { golfer, pal, mate } = await crew("scr-lim-over");
+    for (const code of FAKE.slice(0, KEY_LIMIT)) expect((await lookup(golfer, code)).status).toBe(404);
+    const reads = [];
+    const get = env.BOARDS.get;
+    env.BOARDS.get = async (key) => {
+      reads.push(key);
+      return get(key);
+    };
+    const res = await putLive(golfer, { ...LIVE, scramble: { size: 3, codes: [mate.code], guests: 0 } });
+    env.BOARDS.get = get;
+    expect(res.json).toEqual({ ok: true });
+    expect(reads.some((key) => key.startsWith("fr:code:"))).toBe(false);
+    const seen = await getLive(pal);
+    expect(seen.json.live[0].holes).toEqual(LIVE.holes);
+    expect(seen.json.live[0].scramble).toEqual({ size: 3, ownerIds: [], guests: 1 });
+    expect(Object.hasOwn(JSON.parse(kv.get(`fr:live:${golfer.ownerId}`).value), "scrambleCodesHash")).toBe(false);
+    expectNoCodes(seen.text, [mate, golfer, pal]);
+    // A new window: the same team is charged and resolved on the next update.
+    await (await limiterStub(golfer)).fetch("https://friend-guess.internal/limit", { method: "POST", body: JSON.stringify({ op: "reset" }) });
+    expect((await putLive(golfer, { ...LIVE, hole: 4, scramble: { size: 3, codes: [mate.code], guests: 0 } })).json).toEqual({ ok: true });
+    expect((await getLive(pal)).json.live[0].scramble).toEqual({ size: 3, ownerIds: [mate.ownerId], guests: 0 });
+  });
+
+  it("limiter: a reservation that does not fit spends no slots", async () => {
+    const golfer = await mint("scr-lim-part");
+    // 6 of 8 used; a 3-code team does not fit, and the 2 left stay free.
+    for (const code of FAKE.slice(0, 6)) expect((await lookup(golfer, code)).status).toBe(404);
+    expect((await putLive(golfer, { ...LIVE, scramble: { size: 4, codes: FAKE.slice(6, 9), guests: 0 } })).json).toEqual({ ok: true });
+    expect((await lookup(golfer, FAKE[6])).status).toBe(404);
+    expect((await lookup(golfer, FAKE[7])).status).toBe(404);
+    expect((await lookup(golfer, FAKE[8])).status).toBe(429);
+  });
+
+  it("limiter: an IP refusal gives the key slots back", async () => {
+    const golfer = await mint("scr-lim-ip");
+    const ip = "198.51.100.7";
+    const withIp = (body) =>
+      entry.fetch(new Request(`${ORIGIN}/v1/friends/live`, {
+        method: "PUT",
+        headers: { "X-Friend-Key": golfer.key, "Content-Type": "application/json", "CF-Connecting-IP": ip },
+        body: JSON.stringify(body),
+      }), env, { waitUntil() {} });
+    // Fill the IP counter from other keys so 2 IP slots are left.
+    let filled = 0;
+    for (let k = 0; filled < IP_LIMIT - 2; k += 1) {
+      const other = await mint(`scr-lim-ip-o${k}`);
+      for (let i = 0; i < KEY_LIMIT - 1 && filled < IP_LIMIT - 2; i += 1, filled += 1) {
+        const r = await entry.fetch(new Request(`${ORIGIN}/v1/friends/codes/lookup`, {
+          method: "POST",
+          headers: { "X-Friend-Key": other.key, "Content-Type": "application/json", "CF-Connecting-IP": ip },
+          body: JSON.stringify({ code: FAKE[i] }),
+        }), env, { waitUntil() {} });
+        expect(r.status).toBe(404);
+      }
+    }
+    expect((await withIp({ ...LIVE, scramble: { size: 4, codes: FAKE.slice(0, 3), guests: 0 } })).status).toBe(200);
+    // Fill the last 2 IP slots from another key; a 1-code team is then refused on IP and refunded too.
+    const last = await mint("scr-lim-ip-last");
+    for (const code of FAKE.slice(0, 2)) {
+      const r = await entry.fetch(new Request(`${ORIGIN}/v1/friends/codes/lookup`, {
+        method: "POST",
+        headers: { "X-Friend-Key": last.key, "Content-Type": "application/json", "CF-Connecting-IP": ip },
+        body: JSON.stringify({ code }),
+      }), env, { waitUntil() {} });
+      expect(r.status).toBe(404);
+    }
+    expect((await withIp({ ...LIVE, scramble: { size: 2, codes: [FAKE[3]], guests: 0 } })).status).toBe(200);
+    // The key spent nothing: all 8 key slots are still there (no IP header on these).
+    for (const code of FAKE.slice(0, KEY_LIMIT)) expect((await lookup(golfer, code)).status).toBe(404);
+    expect((await lookup(golfer, FAKE[8])).status).toBe(429);
+  });
+
+  it("limiter: resharing an unchanged team spends no slots (shared and past rounds)", async () => {
+    const { golfer, pal, mate } = await crew("scr-lim-reshare");
+    const team = { size: 4, codes: [mate.code, FAKE[0], FAKE[1]], guests: 0 };
+    for (let i = 0; i < 4; i += 1) {
+      expect((await shareRound(golfer, round("r_mock_same", "2026-10-30", { scramble: { ...team, codes: [...team.codes].reverse() } }))).status).toBe(200);
+    }
+    for (let i = 0; i < 3; i += 1) {
+      expect((await setPast(golfer, pal, "10", [round("p_mock_same", "2025-06-01", { scramble: { size: 3, codes: [FAKE[2]], guests: 0 } })])).status).toBe(200);
+    }
+    // 3 + 1 used of 8.
+    for (const code of FAKE.slice(3, 7)) expect((await lookup(golfer, code)).status).toBe(404);
+    expect((await lookup(golfer, FAKE[7])).status).toBe(429);
+    const res = await invoke("/v1/friends/rounds", { method: "GET", friend: pal.key });
+    const byId = Object.fromEntries(res.json.rounds.map((r) => [r.id, r]));
+    expect(byId.r_mock_same.scramble).toEqual({ size: 4, ownerIds: [mate.ownerId], guests: 2 });
+    expect(Object.hasOwn(byId.r_mock_same, "scrambleHash")).toBe(false);
+    expect(Object.hasOwn(byId.p_mock_same, "scrambleHash")).toBe(false);
+    expect(res.text.includes("scrambleHash")).toBe(false);
   });
 });
