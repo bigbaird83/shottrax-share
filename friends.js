@@ -455,6 +455,7 @@ async function setPastRounds(request, env, cors) {
   }
   const limited = await consumeIpAction(request, env, "ippub:", cors);
   if (limited) return limited;
+  for (let i = 0; i < stored.length; i += 1) stored[i] = await resolveRoundScramble(boards, caller.ownerId, stored[i]);
   // Past rounds live in the owner's one fr:rounds: value with a private
   // audience (to: ownerIds). First this friend is taken off every past round,
   // which deletes rounds no one else was given, then the new pick is added.
@@ -708,8 +709,9 @@ async function publishRound(request, env, cors) {
   if (share !== true || round == null || typeof round !== "object" || Array.isArray(round)) {
     return friendJson(400, { error: "invalid_body" }, cors);
   }
-  const stored = sanitizeRound(round, caller.ownerId);
-  if (!stored) return friendJson(400, { error: "invalid_body" }, cors);
+  const clean = sanitizeRound(round, caller.ownerId);
+  if (!clean) return friendJson(400, { error: "invalid_body" }, cors);
+  const stored = await resolveRoundScramble(boards, caller.ownerId, clean);
   const existing = await loadOwnedRounds(boards, caller.ownerId);
   const index = existing.findIndex((item) => item.id === stored.id);
   if (index >= 0) existing[index] = stored;
@@ -909,11 +911,12 @@ async function putLive(request, env, cors) {
   const limited = await consumeIpAction(request, env, "iplive:", cors);
   if (limited) return limited;
   const row = { courseName: body.courseName, hole: body.hole, holes, updatedAt: Date.now() };
+  const team = scramble ? await resolveScramble(boards, caller.ownerId, scramble) : null;
   if (currentShots) row.shots = currentShots;
   if (typeof body.roundStats === "boolean") row.roundStats = body.roundStats;
   if (typeof body.clubAverages === "boolean") row.clubAverages = body.clubAverages;
   if (skippedHoles && skippedHoles.length > 0) row.skippedHoles = skippedHoles;
-  if (scramble) row.scramble = scramble;
+  if (team) row.scramble = team;
   await friendPut(boards, friendKvKey("live", caller.ownerId), JSON.stringify(row), {
     expirationTtl: Math.ceil(FRIEND_LIVE_TTL_MS / 1000),
   });
@@ -998,7 +1001,7 @@ function readLiveRow(raw, now) {
   const shots = Object.hasOwn(value, "shots") ? sanitizeShots(value.shots, false) : null;
   if (shots) out.shots = shots;
   if (Object.hasOwn(value, "scramble")) {
-    const scramble = sanitizeScramble(value.scramble);
+    const scramble = sanitizeStoredScramble(value.scramble);
     if (scramble) out.scramble = scramble;
   }
   if (Object.hasOwn(value, "skippedHoles")) {
@@ -1214,7 +1217,7 @@ async function loadOwnedRounds(boards, ownerId) {
   for (const item of parsed) {
     if (item == null || typeof item !== "object" || Array.isArray(item)) continue;
     const { to, ...body } = item;
-    const round = sanitizeRound(body, ownerId);
+    const round = sanitizeRound(body, ownerId, true);
     if (!round || seen.has(round.id)) continue;
     if (Object.hasOwn(item, "to")) {
       // A past round with a bad or empty audience is dropped, never widened to everyone.
@@ -1229,7 +1232,12 @@ async function loadOwnedRounds(boards, ownerId) {
   return rounds;
 }
 
-function sanitizeRound(round, callerOwnerId) {
+/**
+ * stored = false: a round from the phone; scramble carries friend codes and must be
+ * passed through resolveRoundScramble before it is saved.
+ * stored = true: a round read back from KV; scramble carries ownerIds, and a bad one is dropped.
+ */
+function sanitizeRound(round, callerOwnerId, stored = false) {
   if (round == null || typeof round !== "object" || Array.isArray(round)) return null;
   if (unknownFields(round, ["id", "ownerId", "courseName", "playedOn", "gross", "toPar", "holes", "scramble"])) return null;
   if (typeof round.id !== "string" || !ROUND_ID_RE.test(round.id)) return null;
@@ -1250,8 +1258,8 @@ function sanitizeRound(round, callerOwnerId) {
   }
   let scramble = null;
   if (Object.hasOwn(round, "scramble")) {
-    scramble = sanitizeScramble(round.scramble);
-    if (!scramble) return null;
+    scramble = stored ? sanitizeStoredScramble(round.scramble) : sanitizeScramble(round.scramble);
+    if (!scramble && !stored) return null;
   }
   const out = {
     id: round.id,
@@ -1287,6 +1295,53 @@ function sanitizeScramble(value) {
   if (!Number.isInteger(value.guests) || value.guests < 0) return null;
   if (codes.length + value.guests > value.size - 1) return null;
   return { size: value.size, codes, guests: value.guests };
+}
+
+/**
+ * Friend codes never leave the Worker. Each code becomes the teammate's public ownerId
+ * only when that person and the sharer are friends both ways and neither has blocked
+ * the other. Any other code (unknown, reset, the sharer's own, a non-friend) is a guest.
+ * Stored and served shape: { size, ownerIds, guests }.
+ */
+async function resolveScramble(boards, ownerId, clean) {
+  const ownerIds = [];
+  let guests = clean.guests;
+  for (const code of clean.codes) {
+    const other = await friendGet(boards, friendKvKey("code", code));
+    const ok =
+      typeof other === "string" &&
+      OWNER_ID_RE.test(other) &&
+      other !== ownerId &&
+      !ownerIds.includes(other) &&
+      (await areFriends(boards, ownerId, other)) &&
+      (await areFriends(boards, other, ownerId)) &&
+      !(await hasBlock(boards, ownerId, other)) &&
+      !(await hasBlock(boards, other, ownerId));
+    if (ok) ownerIds.push(other);
+    else guests += 1;
+  }
+  return { size: clean.size, ownerIds, guests };
+}
+
+async function resolveRoundScramble(boards, ownerId, round) {
+  if (!round.scramble) return round;
+  return { ...round, scramble: await resolveScramble(boards, ownerId, round.scramble) };
+}
+
+/** A stored scramble: { size, ownerIds, guests }. Null (served without it) on anything else, including codes. */
+function sanitizeStoredScramble(value) {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) return null;
+  if (unknownFields(value, ["size", "ownerIds", "guests"])) return null;
+  if (!SCRAMBLE_SIZES.includes(value.size)) return null;
+  if (!Array.isArray(value.ownerIds) || value.ownerIds.length > value.size - 1) return null;
+  const ownerIds = [];
+  for (const id of value.ownerIds) {
+    if (typeof id !== "string" || !OWNER_ID_RE.test(id) || ownerIds.includes(id)) return null;
+    ownerIds.push(id);
+  }
+  if (!Number.isInteger(value.guests) || value.guests < 0) return null;
+  if (ownerIds.length + value.guests > value.size - 1) return null;
+  return { size: value.size, ownerIds, guests: value.guests };
 }
 
 function sanitizeHole(hole) {

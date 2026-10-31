@@ -228,26 +228,61 @@ describe("scramble info on live and shared rounds", () => {
     ["string", "Scramble · 3"],
   ];
 
-  it("live: a clean scramble is stored and served to friends as size, codes and guests only", async () => {
-    const golfer = await mint("scr-live");
-    const pal = await mint("scr-live-pal");
+  // Golfer, follower pal, and teammate mate are friends with each other; outsider is no one's friend.
+  async function crew(tag) {
+    const golfer = await mint(`${tag}-golfer`);
+    const pal = await mint(`${tag}-pal`);
+    const mate = await mint(`${tag}-mate`);
+    const outsider = await mint(`${tag}-out`);
     await befriend(pal, golfer);
-    expect((await putLive(golfer, { ...LIVE, scramble: TEAM })).json).toEqual({ ok: true });
-    const row = JSON.parse(kv.get(`fr:live:${golfer.ownerId}`).value);
-    expect(row.scramble).toEqual(TEAM);
+    await befriend(mate, golfer);
+    return { golfer, pal, mate, outsider };
+  }
+
+  function expectNoCodes(text, people) {
+    for (const who of people) expect(text.includes(who.code)).toBe(false);
+  }
+
+  it("live: codes become friends' ownerIds on the server; followers never see a code", async () => {
+    const { golfer, pal, mate, outsider } = await crew("scr-live");
+    const team = { size: 4, codes: [mate.code, outsider.code], guests: 1 };
+    expect((await putLive(golfer, { ...LIVE, scramble: team })).json).toEqual({ ok: true });
+    const stored = kv.get(`fr:live:${golfer.ownerId}`).value;
+    expect(JSON.parse(stored).scramble).toEqual({ size: 4, ownerIds: [mate.ownerId], guests: 2 });
+    expectNoCodes(stored, [mate, outsider, golfer, pal]);
     const seen = await getLive(pal);
-    expect(seen.json.live[0].scramble).toEqual(TEAM);
-    expect(seen.json.live[0].holes).toEqual(LIVE.holes);
+    expect(seen.json.live[0].scramble).toEqual({ size: 4, ownerIds: [mate.ownerId], guests: 2 });
+    expectNoCodes(seen.text, [mate, outsider, golfer, pal]);
+  });
+
+  it("live: non-friend, unknown, reset, own and blocked codes all count as guests", async () => {
+    const { golfer, pal, mate, outsider } = await crew("scr-guest");
+    const old = mate.code;
+    const reset = await invoke("/v1/friends/code/reset", { friend: mate.key, body: {} });
+    expect(reset.status).toBe(200);
+    const blocked = await mint("scr-guest-blk");
+    await befriend(blocked, golfer);
+    expect((await invoke("/v1/friends/block", { friend: blocked.key, body: { ownerId: golfer.ownerId } })).status).toBe(200);
+    for (const codes of [[outsider.code], ["ZZZZ2345"], [old], [golfer.code], [blocked.code]]) {
+      expect((await putLive(golfer, { ...LIVE, scramble: { size: 2, codes, guests: 0 } })).json).toEqual({ ok: true });
+      const seen = await getLive(pal);
+      expect(seen.json.live[0].scramble).toEqual({ size: 2, ownerIds: [], guests: 1 });
+      expect(seen.text.includes(codes[0])).toBe(false);
+    }
+  });
+
+  it("live: a one-sided friend edge is not enough to name a teammate", async () => {
+    const { golfer, pal, mate } = await crew("scr-edge");
+    expect(kv.delete(`fr:friend:${mate.ownerId}:${golfer.ownerId}`)).toBe(true);
+    await putLive(golfer, { ...LIVE, scramble: { size: 2, codes: [mate.code], guests: 0 } });
+    expect((await getLive(pal)).json.live[0].scramble).toEqual({ size: 2, ownerIds: [], guests: 1 });
   });
 
   it("live: a solo update (no scramble) works as before and serves no scramble", async () => {
-    const golfer = await mint("scr-solo");
-    const pal = await mint("scr-solo-pal");
-    await befriend(pal, golfer);
+    const { golfer, pal } = await crew("scr-solo");
     expect((await putLive(golfer)).json).toEqual({ ok: true });
     const seen = (await getLive(pal)).json.live[0];
     expect(Object.hasOwn(seen, "scramble")).toBe(false);
-    // The next solo update replaces an earlier scramble row.
     await putLive(golfer, { ...LIVE, scramble: { size: 2, codes: [], guests: 1 } });
     await putLive(golfer);
     expect(Object.hasOwn((await getLive(pal)).json.live[0], "scramble")).toBe(false);
@@ -280,7 +315,8 @@ describe("scramble info on live and shared rounds", () => {
       { size: 4, codes: [], guests: 3 },
     ]) {
       expect((await putLive(golfer, { ...LIVE, scramble })).json).toEqual({ ok: true });
-      expect(JSON.parse(kv.get(`fr:live:${golfer.ownerId}`).value).scramble).toEqual(scramble);
+      const stored = JSON.parse(kv.get(`fr:live:${golfer.ownerId}`).value).scramble;
+      expect(stored).toEqual({ size: scramble.size, ownerIds: [], guests: scramble.codes.length + scramble.guests });
     }
   });
 
@@ -291,7 +327,7 @@ describe("scramble info on live and shared rounds", () => {
     await putLive(golfer);
     const key = `fr:live:${golfer.ownerId}`;
     const row = JSON.parse(kv.get(key).value);
-    kv.set(key, { value: JSON.stringify({ ...row, scramble: { size: 9, codes: [], guests: 1, names: SNEAKY } }) });
+    kv.set(key, { value: JSON.stringify({ ...row, scramble: { size: 3, codes: ["MKPQRS23"], guests: 1, names: SNEAKY } }) });
     const seen = (await getLive(pal)).json.live[0];
     expect(seen.courseName).toBe(LIVE.courseName);
     expect(Object.hasOwn(seen, "scramble")).toBe(false);
@@ -305,26 +341,43 @@ describe("scramble info on live and shared rounds", () => {
     expect(kv.has(`fr:live:${golfer.ownerId}`)).toBe(false);
   });
 
-  it("shared round: scramble is stored and served to friends; rounds without it are unchanged", async () => {
-    const golfer = await mint("scr-pub");
-    const pal = await mint("scr-pub-pal");
-    await befriend(pal, golfer);
-    expect((await shareRound(golfer, round("r_mock_scr", "2026-10-30", { scramble: TEAM }))).status).toBe(200);
+  it("shared round: codes become friends' ownerIds; no code in any follower response", async () => {
+    const { golfer, pal, mate, outsider } = await crew("scr-pub");
+    const team = { size: 4, codes: [mate.code, outsider.code], guests: 0 };
+    expect((await shareRound(golfer, round("r_mock_scr", "2026-10-30", { scramble: team }))).status).toBe(200);
     expect((await shareRound(golfer, round("r_mock_solo", "2026-10-29"))).status).toBe(200);
-    const res = await invoke("/v1/friends/rounds", { method: "GET", friend: pal.key });
-    expect(res.status).toBe(200);
-    const byId = Object.fromEntries(res.json.rounds.map((r) => [r.id, r]));
-    expect(byId.r_mock_scr.scramble).toEqual(TEAM);
-    expect(Object.hasOwn(byId.r_mock_solo, "scramble")).toBe(false);
+    const stored = kv.get(`fr:rounds:${golfer.ownerId}`).value;
+    expectNoCodes(stored, [mate, outsider]);
+    for (const viewer of [pal, mate, golfer]) {
+      const res = await invoke("/v1/friends/rounds", { method: "GET", friend: viewer.key });
+      expect(res.status).toBe(200);
+      expectNoCodes(res.text, [mate, outsider, golfer, pal]);
+      const byId = Object.fromEntries(res.json.rounds.map((r) => [r.id, r]));
+      expect(byId.r_mock_scr.scramble).toEqual({ size: 4, ownerIds: [mate.ownerId], guests: 1 });
+      expect(Object.hasOwn(byId.r_mock_solo, "scramble")).toBe(false);
+    }
   });
 
-  it("past rounds: scramble passes the same allowlist", async () => {
-    const golfer = await mint("scr-past");
-    const pal = await mint("scr-past-pal");
-    await befriend(pal, golfer);
-    expect((await setPast(golfer, pal, "10", [round("p_mock_scr", "2025-06-01", { scramble: TEAM })])).status).toBe(200);
+  it("shared round: a stored round with a bad scramble is served without it", async () => {
+    const { golfer, pal } = await crew("scr-pub-bad");
+    expect((await shareRound(golfer, round("r_mock_x", "2026-10-30", { scramble: { size: 2, codes: [], guests: 1 } }))).status).toBe(200);
+    const key = `fr:rounds:${golfer.ownerId}`;
+    const rows = JSON.parse(kv.get(key).value);
+    rows[0].scramble = { size: 2, codes: ["MKPQRS23"], guests: 0 };
+    kv.set(key, { value: JSON.stringify(rows) });
+    const res = await invoke("/v1/friends/rounds", { method: "GET", friend: pal.key });
+    expect(res.json.rounds[0].id).toBe("r_mock_x");
+    expect(Object.hasOwn(res.json.rounds[0], "scramble")).toBe(false);
+    expect(res.text.includes("MKPQRS23")).toBe(false);
+  });
+
+  it("past rounds: codes resolve the same way and are never served", async () => {
+    const { golfer, pal, mate, outsider } = await crew("scr-past");
+    const team = { size: 3, codes: [mate.code, outsider.code], guests: 0 };
+    expect((await setPast(golfer, pal, "10", [round("p_mock_scr", "2025-06-01", { scramble: team })])).status).toBe(200);
     expect((await setPast(golfer, pal, "10", [round("p_mock_bad", "2025-06-02", { scramble: { ...TEAM, notes: SNEAKY[1] } })])).status).toBe(400);
     const res = await invoke("/v1/friends/rounds", { method: "GET", friend: pal.key });
-    expect(res.json.rounds.find((r) => r.id === "p_mock_scr").scramble).toEqual(TEAM);
+    expect(res.json.rounds.find((r) => r.id === "p_mock_scr").scramble).toEqual({ size: 3, ownerIds: [mate.ownerId], guests: 1 });
+    expectNoCodes(res.text, [mate, outsider, golfer, pal]);
   });
 });
