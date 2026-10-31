@@ -63,8 +63,12 @@ export const LIVE_SHOT_RESULTS = ["fairway", "rough", "sand", "green", "holed", 
 /** Shot lat/lon are stored and served at 5 decimal places (about 1 m). */
 export const LIVE_COORD_DECIMALS = 5;
 const LIVE_COORD_SCALE = 10 ** LIVE_COORD_DECIMALS;
-const LIVE_ROUND_FIELDS = ["courseName", "hole", "holes", "shots", "skippedHoles", "roundStats", "clubAverages", "roundKind", "finished"];
+const LIVE_ROUND_FIELDS = ["courseName", "hole", "holes", "shots", "skippedHoles", "roundStats", "clubAverages", "roundKind", "finished", "scramble"];
 const LIVE_PUTT_CLUB = "Putt";
+/** Scramble team sizes (ShotTraxx src/domain/scramble.ts SCRAMBLE_SIZES). */
+export const SCRAMBLE_SIZES = Object.freeze([2, 3, 4]);
+// Never a real ownerId (one character too short), so lookups for a missing code read keys that do not exist.
+const SCRAMBLE_MISSING_OWNER_ID = "_".repeat(21);
 // 100 ids of 64 characters plus quotes and commas.
 const DELETE_ROUNDS_BODY_LIMIT = 8192;
 const PAST_BODY_LIMIT = 256 * 1024;
@@ -135,7 +139,19 @@ export class FriendGuessLimiter {
     if (body && body.op === "attempt") {
       // Read, compare, and increment stay inside this synchronous transaction.
       const result = this.ctx.storage.transactionSync(() => this.#attemptSync(now));
+      return doJson(result.ok ? { ok: true } : result);
+    }
+    if (body && body.op === "reserve") {
+      // All or nothing: count slots are taken only when every one of them fits.
+      if (!Number.isInteger(body.count) || body.count < 1 || body.count > 64) return doJson({ error: "invalid_body" }, 400);
+      const result = this.ctx.storage.transactionSync(() => this.#attemptSync(now, body.count));
       return doJson(result);
+    }
+    if (body && body.op === "refund") {
+      if (!Number.isInteger(body.count) || body.count < 1 || body.count > 64) return doJson({ error: "invalid_body" }, 400);
+      if (!Number.isFinite(body.windowStart)) return doJson({ error: "invalid_body" }, 400);
+      this.ctx.storage.transactionSync(() => this.#refundSync(body.count, body.windowStart));
+      return doJson({ ok: true });
     }
     if (body && body.op === "reset") {
       this.ctx.storage.transactionSync(() => this.#resetSync());
@@ -152,17 +168,19 @@ export class FriendGuessLimiter {
     this.ctx.storage.sql.exec(GUESS_SCHEMA);
   }
 
-  #attemptSync(now) {
+  #attemptSync(now, count = 1) {
     this.#ensure();
     const rows = this.ctx.storage.sql
       .exec("SELECT attempts, window_start, blocked FROM guess_limit WHERE id = 1")
       .toArray();
     if (rows.length === 0) {
+      if (count > this.limit) return { ok: false, retryAfterSec: Math.ceil(FRIEND_GUESS_WINDOW_MS / 1000) };
       this.ctx.storage.sql.exec(
-        "INSERT INTO guess_limit (id, attempts, window_start, blocked) VALUES (1, 1, ?, 0)",
+        "INSERT INTO guess_limit (id, attempts, window_start, blocked) VALUES (1, ?, ?, 0)",
+        count,
         now,
       );
-      return { ok: true };
+      return { ok: true, windowStart: now };
     }
     let attempts = Number(rows[0].attempts);
     let windowStart = Number(rows[0].window_start);
@@ -172,17 +190,28 @@ export class FriendGuessLimiter {
       attempts = 0;
       windowStart = now;
     }
-    if (attempts >= this.limit) {
+    if (attempts + count > this.limit) {
       const retryAfterSec = Math.max(1, Math.ceil((FRIEND_GUESS_WINDOW_MS - (now - windowStart)) / 1000));
       return { ok: false, retryAfterSec };
     }
-    attempts += 1;
+    attempts += count;
     this.ctx.storage.sql.exec(
       "UPDATE guess_limit SET attempts = ?, window_start = ? WHERE id = 1",
       attempts,
       windowStart,
     );
-    return { ok: true };
+    return { ok: true, windowStart };
+  }
+
+  /** Give back slots taken by a reserve in the same window. A later window or a block is left alone. */
+  #refundSync(count, windowStart) {
+    this.#ensure();
+    const rows = this.ctx.storage.sql
+      .exec("SELECT attempts, window_start, blocked FROM guess_limit WHERE id = 1")
+      .toArray();
+    if (rows.length === 0 || Number(rows[0].blocked) === 1 || Number(rows[0].window_start) !== windowStart) return;
+    const attempts = Math.max(0, Number(rows[0].attempts) - count);
+    this.ctx.storage.sql.exec("UPDATE guess_limit SET attempts = ? WHERE id = 1", attempts);
   }
 
   #resetSync() {
@@ -453,6 +482,9 @@ async function setPastRounds(request, env, cors) {
   }
   const limited = await consumeIpAction(request, env, "ippub:", cors);
   if (limited) return limited;
+  const owned = await loadOwnedRounds(boards, caller.ownerId);
+  const resolved = await chargeAndResolveRounds(request, env, friendKey, boards, caller.ownerId, stored, owned);
+  for (let i = 0; i < stored.length; i += 1) stored[i] = resolved[i];
   // Past rounds live in the owner's one fr:rounds: value with a private
   // audience (to: ownerIds). First this friend is taken off every past round,
   // which deletes rounds no one else was given, then the new pick is added.
@@ -498,8 +530,8 @@ async function saveOwnedRounds(boards, ownerId, rounds) {
 
 /** What a reader may see of a round: never the audience list. */
 function publicRound(round) {
-  if (!Object.hasOwn(round, "to")) return round;
-  const { to: _to, ...rest } = round;
+  if (!Object.hasOwn(round, "to") && !Object.hasOwn(round, "scrambleHash")) return round;
+  const { to: _to, scrambleHash: _hash, ...rest } = round;
   return rest;
 }
 
@@ -706,9 +738,10 @@ async function publishRound(request, env, cors) {
   if (share !== true || round == null || typeof round !== "object" || Array.isArray(round)) {
     return friendJson(400, { error: "invalid_body" }, cors);
   }
-  const stored = sanitizeRound(round, caller.ownerId);
-  if (!stored) return friendJson(400, { error: "invalid_body" }, cors);
+  const clean = sanitizeRound(round, caller.ownerId);
+  if (!clean) return friendJson(400, { error: "invalid_body" }, cors);
   const existing = await loadOwnedRounds(boards, caller.ownerId);
+  const [stored] = await chargeAndResolveRounds(request, env, friendKey, boards, caller.ownerId, [clean], existing);
   const index = existing.findIndex((item) => item.id === stored.id);
   if (index >= 0) existing[index] = stored;
   else if (existing.length >= ROUND_CAP) return friendJson(409, { error: "round_limit" }, cors);
@@ -895,6 +928,11 @@ async function putLive(request, env, cors) {
     currentShots = sanitizeShots(body.shots, false);
     if (!currentShots || seen.has(body.hole) || (skippedHoles && skippedHoles.includes(body.hole))) return friendJson(400, { error: "invalid_body" }, cors);
   }
+  let scramble = null;
+  if (Object.hasOwn(body, "scramble")) {
+    scramble = sanitizeScramble(body.scramble);
+    if (!scramble) return friendJson(400, { error: "invalid_body" }, cors);
+  }
   const boards = boardsBinding(env);
   if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
   const caller = await loadCaller(boards, friendKey);
@@ -902,10 +940,28 @@ async function putLive(request, env, cors) {
   const limited = await consumeIpAction(request, env, "iplive:", cors);
   if (limited) return limited;
   const row = { courseName: body.courseName, hole: body.hole, holes, updatedAt: Date.now() };
+  // Live updates go out every hole. The same codes as the stored row were already charged,
+  // so only a new or changed team takes slots. The row keeps a private hash, never served.
+  const codesHash = scramble && scramble.codes.length > 0 ? await scrambleCodesHash(caller.ownerId, scramble.codes) : null;
+  let unchanged = false;
+  if (codesHash) {
+    try {
+      const prior = JSON.parse((await friendGet(boards, friendKvKey("live", caller.ownerId))) ?? "null");
+      unchanged = Boolean(prior && prior.scrambleCodesHash === codesHash);
+    } catch {
+      unchanged = false;
+    }
+  }
+  // Over the limit or no limiter: the update (holes, scores, shots) is still stored, the
+  // team is all guests with no lookup, and no hash is kept so a later update tries again.
+  const charged = unchanged || (await chargeScrambleLookups(request, env, friendKey, codesHash ? scramble.codes.length : 0));
+  const team = !scramble ? null : charged ? await resolveScramble(boards, caller.ownerId, scramble) : scrambleAllGuests(scramble);
   if (currentShots) row.shots = currentShots;
   if (typeof body.roundStats === "boolean") row.roundStats = body.roundStats;
   if (typeof body.clubAverages === "boolean") row.clubAverages = body.clubAverages;
   if (skippedHoles && skippedHoles.length > 0) row.skippedHoles = skippedHoles;
+  if (team) row.scramble = team;
+  if (codesHash && charged) row.scrambleCodesHash = codesHash;
   await friendPut(boards, friendKvKey("live", caller.ownerId), JSON.stringify(row), {
     expirationTtl: Math.ceil(FRIEND_LIVE_TTL_MS / 1000),
   });
@@ -989,6 +1045,10 @@ function readLiveRow(raw, now) {
   };
   const shots = Object.hasOwn(value, "shots") ? sanitizeShots(value.shots, false) : null;
   if (shots) out.shots = shots;
+  if (Object.hasOwn(value, "scramble")) {
+    const scramble = sanitizeStoredScramble(value.scramble);
+    if (scramble) out.scramble = scramble;
+  }
   if (Object.hasOwn(value, "skippedHoles")) {
     const scored = new Set(holes.map((hole) => hole.hole));
     const skipped = sanitizeSkippedHoles(value.skippedHoles);
@@ -1201,9 +1261,10 @@ async function loadOwnedRounds(boards, ownerId) {
   const seen = new Set();
   for (const item of parsed) {
     if (item == null || typeof item !== "object" || Array.isArray(item)) continue;
-    const { to, ...body } = item;
-    const round = sanitizeRound(body, ownerId);
+    const { to, scrambleHash, ...body } = item;
+    const round = sanitizeRound(body, ownerId, true);
     if (!round || seen.has(round.id)) continue;
+    if (round.scramble && typeof scrambleHash === "string" && /^[0-9a-f]{64}$/.test(scrambleHash)) round.scrambleHash = scrambleHash;
     if (Object.hasOwn(item, "to")) {
       // A past round with a bad or empty audience is dropped, never widened to everyone.
       if (!Array.isArray(to)) continue;
@@ -1217,9 +1278,14 @@ async function loadOwnedRounds(boards, ownerId) {
   return rounds;
 }
 
-function sanitizeRound(round, callerOwnerId) {
+/**
+ * stored = false: a round from the phone; scramble carries friend codes and must be
+ * passed through chargeAndResolveRounds before it is saved.
+ * stored = true: a round read back from KV; scramble carries ownerIds, and a bad one is dropped.
+ */
+function sanitizeRound(round, callerOwnerId, stored = false) {
   if (round == null || typeof round !== "object" || Array.isArray(round)) return null;
-  if (unknownFields(round, ["id", "ownerId", "courseName", "playedOn", "gross", "toPar", "holes"])) return null;
+  if (unknownFields(round, ["id", "ownerId", "courseName", "playedOn", "gross", "toPar", "holes", "scramble"])) return null;
   if (typeof round.id !== "string" || !ROUND_ID_RE.test(round.id)) return null;
   if (Object.hasOwn(round, "ownerId") && round.ownerId !== callerOwnerId) return null;
   if (!validCourseName(round.courseName)) return null;
@@ -1236,7 +1302,12 @@ function sanitizeRound(round, callerOwnerId) {
     seen.add(clean.hole);
     holes.push(clean);
   }
-  return {
+  let scramble = null;
+  if (Object.hasOwn(round, "scramble")) {
+    scramble = stored ? sanitizeStoredScramble(round.scramble) : sanitizeScramble(round.scramble);
+    if (!scramble && !stored) return null;
+  }
+  const out = {
     id: round.id,
     ownerId: callerOwnerId,
     courseName: round.courseName,
@@ -1245,6 +1316,146 @@ function sanitizeRound(round, callerOwnerId) {
     toPar: round.toPar,
     holes,
   };
+  if (scramble) out.scramble = scramble;
+  return out;
+}
+
+/**
+ * Scramble rounds only: { size, codes, guests }. size is 2, 3 or 4. codes are the
+ * friend codes of teammates who are friends (no repeats). guests counts everyone else.
+ * codes plus guests is at most size - 1 (the owner is the other player). Names, notes
+ * and any other field are refused: null, and the caller answers invalid_body.
+ * Same shape as SharedScramble in ShotTraxx src/domain/scramble.ts. The Worker keeps no
+ * Board; the app leaves scramble rounds off it.
+ */
+function sanitizeScramble(value) {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) return null;
+  if (unknownFields(value, ["size", "codes", "guests"])) return null;
+  if (!SCRAMBLE_SIZES.includes(value.size)) return null;
+  if (!Array.isArray(value.codes) || value.codes.length > value.size - 1) return null;
+  const codes = [];
+  for (const code of value.codes) {
+    if (typeof code !== "string" || !CODE_RE.test(code) || codes.includes(code)) return null;
+    codes.push(code);
+  }
+  if (!Number.isInteger(value.guests) || value.guests < 0) return null;
+  if (codes.length + value.guests > value.size - 1) return null;
+  return { size: value.size, codes, guests: value.guests };
+}
+
+/**
+ * Friend codes never leave the Worker. Each code becomes the teammate's public ownerId
+ * only when that person and the sharer are friends both ways and neither has blocked
+ * the other. Any other code (unknown, reset, the sharer's own, a non-friend) is a guest.
+ * Stored and served shape: { size, ownerIds, guests }.
+ */
+async function resolveScramble(boards, ownerId, clean) {
+  const ownerIds = [];
+  let guests = clean.guests;
+  for (const code of clean.codes) {
+    const found = await friendGet(boards, friendKvKey("code", code));
+    const valid = typeof found === "string" && OWNER_ID_RE.test(found);
+    // Same reads for every code, found or not, so timing does not tell whether a code exists.
+    const other = valid ? found : SCRAMBLE_MISSING_OWNER_ID;
+    const [ab, ba, blockAb, blockBa] = [
+      await areFriends(boards, ownerId, other),
+      await areFriends(boards, other, ownerId),
+      await hasBlock(boards, ownerId, other),
+      await hasBlock(boards, other, ownerId),
+    ];
+    if (valid && other !== ownerId && !ownerIds.includes(other) && ab && ba && !blockAb && !blockBa) ownerIds.push(other);
+    else guests += 1;
+  }
+  return { size: clean.size, ownerIds, guests };
+}
+
+/** Private hash of a team's codes (plus the round id for shared and past rounds). Never served. */
+async function scrambleCodesHash(ownerId, codes, roundId = "") {
+  return sha256Hex(`shottrax-scramble-codes-v1:${ownerId}:${roundId}:${[...codes].sort().join(",")}`);
+}
+
+/**
+ * Each scramble code is a code lookup, so each one takes a slot on the same friend-code
+ * guess limiter as lookupCode (per friend key and per IP). All count slots are reserved
+ * on the key limiter, then on the IP limiter; if the IP one refuses, the key slots are
+ * given back. True only when every slot was taken. Over the limit or no limiter: false,
+ * and the caller stores the update with every code as a guest, without any lookup.
+ */
+async function chargeScrambleLookups(request, env, friendKey, count) {
+  if (count <= 0) return true;
+  if (!guessNamespace(env)) return false;
+  const now = Date.now();
+  const keyName = await limiterNameForFriendKey(friendKey);
+  const keyAttempt = await guessAttempt(env, keyName, now, count);
+  if (!keyAttempt.ok) return false;
+  const ipHash = await friendIpHash(request);
+  if (ipHash) {
+    const ipAttempt = await guessAttempt(env, `ip:${ipHash}`, now, count);
+    if (!ipAttempt.ok) {
+      await guessRefund(env, keyName, count, keyAttempt.windowStart);
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Every code counted as a guest. No code lookup at all. */
+function scrambleAllGuests(clean) {
+  return { size: clean.size, ownerIds: [], guests: clean.guests + clean.codes.length };
+}
+
+/**
+ * Shared and past rounds: a round whose id and codes match an already stored, charged
+ * round takes no slots. Changed rounds share one all-or-nothing reservation; refused,
+ * their codes become guests and no hash is kept, so the next share tries again.
+ */
+async function chargeAndResolveRounds(request, env, friendKey, boards, ownerId, rounds, prior) {
+  const priorHash = new Map(prior.filter((r) => r.scrambleHash).map((r) => [r.id, r.scrambleHash]));
+  const hashes = [];
+  let count = 0;
+  for (const round of rounds) {
+    const codes = round.scramble ? round.scramble.codes : [];
+    const hash = codes.length > 0 ? await scrambleCodesHash(ownerId, codes, round.id) : null;
+    const unchanged = Boolean(hash) && priorHash.get(round.id) === hash;
+    hashes.push({ hash, unchanged });
+    if (hash && !unchanged) count += codes.length;
+  }
+  const charged = await chargeScrambleLookups(request, env, friendKey, count);
+  const out = [];
+  for (let i = 0; i < rounds.length; i += 1) {
+    const round = rounds[i];
+    const { hash, unchanged } = hashes[i];
+    if (!round.scramble) {
+      out.push(round);
+      continue;
+    }
+    if (!hash) {
+      out.push({ ...round, scramble: scrambleAllGuests(round.scramble) });
+      continue;
+    }
+    if (unchanged || charged) {
+      out.push({ ...round, scramble: await resolveScramble(boards, ownerId, round.scramble), scrambleHash: hash });
+      continue;
+    }
+    out.push({ ...round, scramble: scrambleAllGuests(round.scramble) });
+  }
+  return out;
+}
+
+/** A stored scramble: { size, ownerIds, guests }. Null (served without it) on anything else, including codes. */
+function sanitizeStoredScramble(value) {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) return null;
+  if (unknownFields(value, ["size", "ownerIds", "guests"])) return null;
+  if (!SCRAMBLE_SIZES.includes(value.size)) return null;
+  if (!Array.isArray(value.ownerIds) || value.ownerIds.length > value.size - 1) return null;
+  const ownerIds = [];
+  for (const id of value.ownerIds) {
+    if (typeof id !== "string" || !OWNER_ID_RE.test(id) || ownerIds.includes(id)) return null;
+    ownerIds.push(id);
+  }
+  if (!Number.isInteger(value.guests) || value.guests < 0) return null;
+  if (ownerIds.length + value.guests > value.size - 1) return null;
+  return { size: value.size, ownerIds, guests: value.guests };
 }
 
 function sanitizeHole(hole) {
@@ -1534,17 +1745,29 @@ async function consumeGuess(request, env, friendKey, cors) {
   return null;
 }
 
-async function guessAttempt(env, name, now) {
+async function guessAttempt(env, name, now, count = 0) {
   const ns = guessNamespace(env);
   const stub = ns.get(ns.idFromName(name));
+  // count 0: one plain attempt. count n: an all-or-nothing reserve of n slots, answered with its window.
+  const op = count > 0 ? { op: "reserve", now, count } : { op: "attempt", now };
   const response = await stub.fetch("https://friend-guess.internal/limit", {
     method: "POST",
-    body: JSON.stringify({ op: "attempt", now }),
+    body: JSON.stringify(op),
   });
   const body = await response.json();
-  if (body && body.ok === true) return { ok: true };
+  if (body && body.ok === true) return { ok: true, windowStart: body.windowStart };
   const retryAfterSec = Number.isFinite(body && body.retryAfterSec) ? body.retryAfterSec : Math.ceil(FRIEND_GUESS_WINDOW_MS / 1000);
   return { ok: false, retryAfterSec };
+}
+
+async function guessRefund(env, name, count, windowStart) {
+  if (!Number.isFinite(windowStart)) return;
+  const ns = guessNamespace(env);
+  const stub = ns.get(ns.idFromName(name));
+  await stub.fetch("https://friend-guess.internal/limit", {
+    method: "POST",
+    body: JSON.stringify({ op: "refund", count, windowStart }),
+  });
 }
 
 function friendKvKey(kind, id) {
