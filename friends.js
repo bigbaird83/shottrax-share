@@ -67,6 +67,8 @@ const LIVE_ROUND_FIELDS = ["courseName", "hole", "holes", "shots", "skippedHoles
 const LIVE_PUTT_CLUB = "Putt";
 /** Scramble team sizes (ShotTraxx src/domain/scramble.ts SCRAMBLE_SIZES). */
 export const SCRAMBLE_SIZES = Object.freeze([2, 3, 4]);
+// Never a real ownerId (one character too short), so lookups for a missing code read keys that do not exist.
+const SCRAMBLE_MISSING_OWNER_ID = "_".repeat(21);
 // 100 ids of 64 characters plus quotes and commas.
 const DELETE_ROUNDS_BODY_LIMIT = 8192;
 const PAST_BODY_LIMIT = 256 * 1024;
@@ -455,6 +457,9 @@ async function setPastRounds(request, env, cors) {
   }
   const limited = await consumeIpAction(request, env, "ippub:", cors);
   if (limited) return limited;
+  const pastCodes = new Set(stored.flatMap((round) => (round.scramble ? round.scramble.codes : []))).size;
+  const pastCharged = await chargeScrambleLookups(request, env, friendKey, pastCodes, cors);
+  if (pastCharged) return pastCharged;
   for (let i = 0; i < stored.length; i += 1) stored[i] = await resolveRoundScramble(boards, caller.ownerId, stored[i]);
   // Past rounds live in the owner's one fr:rounds: value with a private
   // audience (to: ownerIds). First this friend is taken off every past round,
@@ -711,6 +716,8 @@ async function publishRound(request, env, cors) {
   }
   const clean = sanitizeRound(round, caller.ownerId);
   if (!clean) return friendJson(400, { error: "invalid_body" }, cors);
+  const charged = await chargeScrambleLookups(request, env, friendKey, clean.scramble ? clean.scramble.codes.length : 0, cors);
+  if (charged) return charged;
   const stored = await resolveRoundScramble(boards, caller.ownerId, clean);
   const existing = await loadOwnedRounds(boards, caller.ownerId);
   const index = existing.findIndex((item) => item.id === stored.id);
@@ -911,12 +918,27 @@ async function putLive(request, env, cors) {
   const limited = await consumeIpAction(request, env, "iplive:", cors);
   if (limited) return limited;
   const row = { courseName: body.courseName, hole: body.hole, holes, updatedAt: Date.now() };
+  // Live updates go out every hole. The same codes as the stored row were already charged,
+  // so only a new or changed team takes slots. The row keeps a private hash, never served.
+  const codesHash = scramble && scramble.codes.length > 0 ? await scrambleCodesHash(caller.ownerId, scramble.codes) : null;
+  let unchanged = false;
+  if (codesHash) {
+    try {
+      const prior = JSON.parse((await friendGet(boards, friendKvKey("live", caller.ownerId))) ?? "null");
+      unchanged = Boolean(prior && prior.scrambleCodesHash === codesHash);
+    } catch {
+      unchanged = false;
+    }
+  }
+  const charged = await chargeScrambleLookups(request, env, friendKey, unchanged ? 0 : codesHash ? scramble.codes.length : 0, cors);
+  if (charged) return charged;
   const team = scramble ? await resolveScramble(boards, caller.ownerId, scramble) : null;
   if (currentShots) row.shots = currentShots;
   if (typeof body.roundStats === "boolean") row.roundStats = body.roundStats;
   if (typeof body.clubAverages === "boolean") row.clubAverages = body.clubAverages;
   if (skippedHoles && skippedHoles.length > 0) row.skippedHoles = skippedHoles;
   if (team) row.scramble = team;
+  if (codesHash) row.scrambleCodesHash = codesHash;
   await friendPut(boards, friendKvKey("live", caller.ownerId), JSON.stringify(row), {
     expirationTtl: Math.ceil(FRIEND_LIVE_TTL_MS / 1000),
   });
@@ -1307,20 +1329,39 @@ async function resolveScramble(boards, ownerId, clean) {
   const ownerIds = [];
   let guests = clean.guests;
   for (const code of clean.codes) {
-    const other = await friendGet(boards, friendKvKey("code", code));
-    const ok =
-      typeof other === "string" &&
-      OWNER_ID_RE.test(other) &&
-      other !== ownerId &&
-      !ownerIds.includes(other) &&
-      (await areFriends(boards, ownerId, other)) &&
-      (await areFriends(boards, other, ownerId)) &&
-      !(await hasBlock(boards, ownerId, other)) &&
-      !(await hasBlock(boards, other, ownerId));
-    if (ok) ownerIds.push(other);
+    const found = await friendGet(boards, friendKvKey("code", code));
+    const valid = typeof found === "string" && OWNER_ID_RE.test(found);
+    // Same reads for every code, found or not, so timing does not tell whether a code exists.
+    const other = valid ? found : SCRAMBLE_MISSING_OWNER_ID;
+    const [ab, ba, blockAb, blockBa] = [
+      await areFriends(boards, ownerId, other),
+      await areFriends(boards, other, ownerId),
+      await hasBlock(boards, ownerId, other),
+      await hasBlock(boards, other, ownerId),
+    ];
+    if (valid && other !== ownerId && !ownerIds.includes(other) && ab && ba && !blockAb && !blockBa) ownerIds.push(other);
     else guests += 1;
   }
   return { size: clean.size, ownerIds, guests };
+}
+
+/**
+ * Each scramble code is a code lookup, so each one takes a slot on the same friend-code
+ * guess limiter as lookupCode (per friend key and per IP). Charged before any lookup;
+ * over the limit is 429 rate_limited and nothing is stored. No limiter fails closed.
+ */
+async function scrambleCodesHash(ownerId, codes) {
+  return sha256Hex(`shottrax-scramble-codes-v1:${ownerId}:${[...codes].sort().join(",")}`);
+}
+
+async function chargeScrambleLookups(request, env, friendKey, count, cors) {
+  if (count <= 0) return null;
+  if (!guessNamespace(env)) return friendJson(503, { error: "guess_limiter_not_configured" }, cors);
+  for (let i = 0; i < count; i += 1) {
+    const limited = await consumeGuess(request, env, friendKey, cors);
+    if (limited) return limited;
+  }
+  return null;
 }
 
 async function resolveRoundScramble(boards, ownerId, round) {

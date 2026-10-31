@@ -380,4 +380,54 @@ describe("scramble info on live and shared rounds", () => {
     expect(res.json.rounds.find((r) => r.id === "p_mock_scr").scramble).toEqual({ size: 3, ownerIds: [mate.ownerId], guests: 1 });
     expectNoCodes(res.text, [mate, outsider, golfer, pal]);
   });
+  // Made-up codes from the code alphabet; none of them exist.
+  const FAKE = ["MKPQRS23", "TVWXYZ45", "HJKLMN67", "ABCDEF89", "GHJKLM23", "NPQRST45", "UVWXYZ67", "BCDFGH89", "JKLMNP23"];
+  const lookup = (who, code) => invoke("/v1/friends/codes/lookup", { friend: who.key, body: { code } });
+
+  it("limiter: each scramble code takes a slot on the friend-code guess limiter", async () => {
+    const golfer = await mint("scr-lim");
+    // 3 codes on a live update + 3 on a shared round = 6 of the 8 per-key slots.
+    const live = await putLive(golfer, { ...LIVE, scramble: { size: 4, codes: FAKE.slice(0, 3), guests: 0 } });
+    expect(live.json).toEqual({ ok: true });
+    const shared = await shareRound(golfer, round("r_mock_lim", "2026-10-30", { scramble: { size: 4, codes: FAKE.slice(3, 6), guests: 0 } }));
+    expect(shared.status).toBe(200);
+    expect((await lookup(golfer, FAKE[6])).status).toBe(404);
+    expect((await lookup(golfer, FAKE[7])).status).toBe(404);
+    // Spent: a plain lookup and a scramble with codes are both refused, and nothing new is stored.
+    expect((await lookup(golfer, FAKE[8])).status).toBe(429);
+    const over = await shareRound(golfer, round("r_mock_over", "2026-10-31", { scramble: { size: 2, codes: [FAKE[8]], guests: 0 } }));
+    expect(over.status).toBe(429);
+    expect(over.json).toEqual({ error: "rate_limited" });
+    expect(JSON.parse(kv.get(`fr:rounds:${golfer.ownerId}`).value).map((r) => r.id)).toEqual(["r_mock_lim"]);
+    // A scramble with no codes, and a solo round, never touch the limiter.
+    expect((await shareRound(golfer, round("r_mock_guests", "2026-10-31", { scramble: { size: 3, codes: [], guests: 2 } }))).status).toBe(200);
+  });
+
+  it("limiter: the same live team is charged once, not on every hole", async () => {
+    const golfer = await mint("scr-lim-live");
+    const pal = await mint("scr-lim-live-pal");
+    await befriend(pal, golfer);
+    const team = { size: 3, codes: FAKE.slice(0, 2), guests: 0 };
+    for (let hole = 1; hole <= 6; hole += 1) {
+      expect((await putLive(golfer, { ...LIVE, hole: 3, scramble: { ...team, codes: [...team.codes].reverse() } })).json).toEqual({ ok: true });
+    }
+    // 2 used; a new team charges again.
+    expect((await putLive(golfer, { ...LIVE, scramble: { size: 4, codes: FAKE.slice(2, 5), guests: 0 } })).json).toEqual({ ok: true });
+    for (const code of FAKE.slice(5, 8)) expect((await lookup(golfer, code)).status).toBe(404);
+    expect((await lookup(golfer, FAKE[8])).status).toBe(429);
+    // The private hash is never served.
+    const seen = await getLive(pal);
+    expect(Object.hasOwn(seen.json.live[0], "scrambleCodesHash")).toBe(false);
+    for (const code of FAKE) expect(seen.text.includes(code)).toBe(false);
+  });
+
+  it("limiter: a missing guess limiter fails closed for scramble codes only", async () => {
+    const golfer = await mint("scr-lim-none");
+    delete env.FRIEND_GUESSES;
+    const res = await putLive(golfer, { ...LIVE, scramble: { size: 2, codes: [FAKE[0]], guests: 0 } });
+    expect(res.status).toBe(503);
+    expect(res.json).toEqual({ error: "guess_limiter_not_configured" });
+    expect(kv.has(`fr:live:${golfer.ownerId}`)).toBe(false);
+    expect((await putLive(golfer, { ...LIVE, scramble: { size: 2, codes: [], guests: 1 } })).json).toEqual({ ok: true });
+  });
 });
