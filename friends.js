@@ -1770,7 +1770,11 @@ async function reserveGuess(request, env, friendKey, cors) {
   if (ipHash) {
     const ipName = `ip:${ipHash}`;
     const ipAttempt = await guessAttempt(env, ipName, now, 1);
-    if (!ipAttempt.ok) return { response: rateLimited(cors, ipAttempt.retryAfterSec) };
+    if (!ipAttempt.ok) {
+      // Refused by the IP limit: the key slot held above goes back, the way #52 does.
+      await refund();
+      return { response: rateLimited(cors, ipAttempt.retryAfterSec) };
+    }
     held.push({ name: ipName, windowStart: ipAttempt.windowStart });
   }
   return { refund };

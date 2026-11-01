@@ -493,7 +493,16 @@ async function readyMemberRead(request, url, env, cors) {
   }
   const limited = await consumeReadLimit(request, env, ready.friendKey, "keylgread:", "iplgread:", cors);
   if (limited) return { response: limited };
+  // A member the owner blocked (or who blocked the owner) after joining reads nothing.
+  const owner = await rosterCall(env, leagueId, { op: "owner" });
+  if (!owner.ok || (await blockedEitherWay(ready.boards, owner.ownerId, ready.caller.ownerId))) {
+    return { response: friendJson(404, { error: "not_found" }, cors) };
+  }
   return { ...ready, leagueId };
+}
+
+async function blockedEitherWay(boards, ownerId, callerId) {
+  return (await hasBlock(boards, ownerId, callerId)) || (await hasBlock(boards, callerId, ownerId));
 }
 
 /** Code entry for preview and join: the friend-code validator and guess limits. A blocked caller reads as not found. */
@@ -515,8 +524,8 @@ async function leagueForCode(request, env, cors, allowed) {
   }
   const owner = await rosterCall(env, leagueId, { op: "owner" });
   if (!owner.ok) return { response: friendJson(404, { error: "code_not_found" }, cors) };
-  // Owner blocked the caller: same answer as a bad code, so the block is not revealed.
-  if (await hasBlock(ready.boards, owner.ownerId, ready.caller.ownerId)) {
+  // A block either way (PLAN.md): same answer as a bad code, so the block is not revealed.
+  if (await blockedEitherWay(ready.boards, owner.ownerId, ready.caller.ownerId)) {
     return { response: friendJson(404, { error: "code_not_found" }, cors) };
   }
   return { ...ready, body: parsed.value, code, leagueId, refundGuess: guess.refund };

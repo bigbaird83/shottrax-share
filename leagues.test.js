@@ -324,6 +324,59 @@ describe("leagues", () => {
     });
   });
 
+  for (const direction of ["owner blocks member", "member blocks owner"]) {
+    it(`a block either way (${direction}): preview and join read as an unknown code and still use a guess`, async () => {
+      const owner = await player(1);
+      const { code } = await created(owner);
+      const guest = await player(2);
+      const [a, b] = direction === "owner blocks member" ? [owner, guest] : [guest, owner];
+      kv.set(`fr:block:${a.ownerId}:${b.ownerId}`, "1");
+      const preview = await call("/v1/leagues/preview", { friend: guest.friend, body: { code } });
+      expect(preview).toEqual({ status: 404, json: { error: "code_not_found" } });
+      const join = await call("/v1/leagues/join", { friend: guest.friend, body: { code, name: "Player K" } });
+      expect(join).toEqual({ status: 404, json: { error: "code_not_found" } });
+      for (let i = 0; i < 6; i += 1) {
+        expect((await call("/v1/leagues/preview", { friend: guest.friend, body: { code: "AAAABBBB" } })).status).toBe(404);
+      }
+      expect((await call("/v1/leagues/preview", { friend: guest.friend, body: { code: "AAAABBBB" } })).status).toBe(429);
+    });
+
+    it(`a block either way after joining (${direction}): members and standings answer 404`, async () => {
+      const owner = await player(1);
+      const { code, league } = await created(owner);
+      const guest = await player(2);
+      expect((await call("/v1/leagues/join", { friend: guest.friend, body: { code, name: "Player K" } })).status).toBe(200);
+      const members = `/v1/leagues/members?league=${league.id}`;
+      const standings = `/v1/leagues/standings?league=${league.id}`;
+      expect((await call(members, { method: "GET", friend: guest.friend })).status).toBe(200);
+      expect((await call(standings, { method: "GET", friend: guest.friend })).status).toBe(200);
+      const [a, b] = direction === "owner blocks member" ? [owner, guest] : [guest, owner];
+      kv.set(`fr:block:${a.ownerId}:${b.ownerId}`, "1");
+      for (const path of [members, standings]) {
+        const res = await call(path, { method: "GET", friend: guest.friend });
+        expect(res).toEqual({ status: 404, json: { error: "not_found" } });
+      }
+      expect((await call(members, { method: "GET", friend: owner.friend })).status).toBe(200);
+      expect((await call(standings, { method: "GET", friend: owner.friend })).status).toBe(200);
+    });
+  }
+
+  it("a guess refused by the per-IP limit gives back the per-key slot", async () => {
+    const ip = "198.51.100.7";
+    for (let i = 10; i < 34; i += 1) {
+      const p = await player(i);
+      expect((await call("/v1/leagues/preview", { friend: p.friend, ip, body: { code: "AAAABBBB" } })).status).toBe(404);
+    }
+    const guest = await player(2);
+    for (let i = 0; i < 3; i += 1) {
+      expect((await call("/v1/leagues/preview", { friend: guest.friend, ip, body: { code: "AAAABBBB" } })).status).toBe(429);
+    }
+    for (let i = 0; i < 8; i += 1) {
+      expect((await call("/v1/leagues/preview", { friend: guest.friend, ip: "198.51.100.8", body: { code: "AAAABBBB" } })).status).toBe(404);
+    }
+    expect((await call("/v1/leagues/preview", { friend: guest.friend, ip: "198.51.100.8", body: { code: "AAAABBBB" } })).status).toBe(429);
+  });
+
   it("members and standings are for members only; any member sees the code", async () => {
     const owner = await player(1);
     const { code, league } = await created(owner);
