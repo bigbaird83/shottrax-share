@@ -6,9 +6,11 @@
 import live from "./live-shottrax-share.js";
 import { coverageFromOverlayResponse, handleGolfProxy, GolfapiCounter, runGolfapiStockpile, STOCKPILE_CRON } from "./golf-proxy.js";
 import { FriendGuessLimiter, handleFriends, isFriendPath } from "./friends.js";
+import { LeagueRoster, handleLeagues, isLeaguePath } from "./leagues.js";
 
 export { GolfapiCounter };
 export { FriendGuessLimiter };
+export { LeagueRoster };
 
 function friendCors() {
   return {
@@ -146,6 +148,11 @@ export default {
       const cors = friendCors();
       if (request.method === "OPTIONS") return new Response(null, { headers: cors });
       return handleFriends(request, url, env, cors);
+    }
+    if (isLeaguePath(pathname)) {
+      const cors = friendCors();
+      if (request.method === "OPTIONS") return new Response(null, { headers: cors });
+      return handleLeagues(request, url, env, cors);
     }
     if (request.method !== "OPTIONS" && friendGolfapiBlocked(pathname, url)) {
       return withLiveCors(new Response(JSON.stringify({ error: "unknown_route" }), {

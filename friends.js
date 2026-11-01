@@ -35,6 +35,8 @@ export const FRIEND_READ_KEY_LIMIT = 60;
 export const FRIEND_READ_IP_LIMIT = 60;
 export const FRIEND_GUESS_WINDOW_MS = 60 * 60 * 1000;
 export const FRIEND_CAP = 50;
+/** New leagues per IP per hour. Same number as friend code mints. */
+export const LEAGUE_CREATE_IP_LIMIT = 30;
 export const ROUND_CAP = 100;
 // Live rounds for friends (approved 2026-10-21 11:10 CT). A row is gone 30 minutes after its last update.
 export const FRIEND_LIVE_TTL_MS = 30 * 60 * 1000;
@@ -110,6 +112,10 @@ function limitForDurableObjectName(name) {
   if (name.startsWith("ip:")) return FRIEND_IP_GUESS_LIMIT;
   if (name.startsWith("keyreq:")) return FRIEND_READ_KEY_LIMIT;
   if (name.startsWith("keylist:")) return FRIEND_READ_KEY_LIMIT;
+  // Leagues (leagues.js): creates per IP, and member/standings reads per key and per IP.
+  if (name.startsWith("iplgnew:")) return LEAGUE_CREATE_IP_LIMIT;
+  if (name.startsWith("iplgread:")) return FRIEND_READ_IP_LIMIT;
+  if (name.startsWith("keylgread:")) return FRIEND_READ_KEY_LIMIT;
   return FRIEND_CODE_GUESS_LIMIT;
 }
 
@@ -1745,6 +1751,35 @@ async function consumeGuess(request, env, friendKey, cors) {
   return null;
 }
 
+/**
+ * Like consumeGuess, but the slot is only held: the caller gives it back with
+ * refund() when the code turned out good. A caller already at the limit is still
+ * refused here, so a good code cannot get past a block.
+ */
+async function reserveGuess(request, env, friendKey, cors) {
+  const now = Date.now();
+  const held = [];
+  const refund = async () => {
+    for (const { name, windowStart } of held) await guessRefund(env, name, 1, windowStart);
+  };
+  const keyName = await limiterNameForFriendKey(friendKey);
+  const keyAttempt = await guessAttempt(env, keyName, now, 1);
+  if (!keyAttempt.ok) return { response: rateLimited(cors, keyAttempt.retryAfterSec) };
+  held.push({ name: keyName, windowStart: keyAttempt.windowStart });
+  const ipHash = await friendIpHash(request);
+  if (ipHash) {
+    const ipName = `ip:${ipHash}`;
+    const ipAttempt = await guessAttempt(env, ipName, now, 1);
+    if (!ipAttempt.ok) {
+      // Refused by the IP limit: the key slot held above goes back, the way #52 does.
+      await refund();
+      return { response: rateLimited(cors, ipAttempt.retryAfterSec) };
+    }
+    held.push({ name: ipName, windowStart: ipAttempt.windowStart });
+  }
+  return { refund };
+}
+
 async function guessAttempt(env, name, now, count = 0) {
   const ns = guessNamespace(env);
   const stub = ns.get(ns.idFromName(name));
@@ -1902,3 +1937,28 @@ function doJson(body, status = 200) {
     headers: { "Content-Type": "application/json" },
   });
 }
+
+// Shared with leagues.js so league calls use the same auth, body, name and limit rules.
+export {
+  boardsBinding,
+  consumeGuess,
+  consumeIpAction,
+  consumeReadLimit,
+  friendGet,
+  friendJson,
+  friendKvKey,
+  friendPut,
+  guessNamespace,
+  hasBlock,
+  loadCaller,
+  normalizeFriendCode,
+  randomFriendCode,
+  randomOwnerId,
+  readFriendKey,
+  readInviteName,
+  readJsonObject,
+  reserveGuess,
+  unknownFields,
+  validCourseName,
+  validPlayedOn,
+};
