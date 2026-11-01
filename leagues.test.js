@@ -1,7 +1,8 @@
 // Leagues PR 1: create, preview/join by code, members, standings. Made-up data only.
 import { DatabaseSync } from "node:sqlite";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import entry, { FriendGuessLimiter, LeagueRoster } from "./entry.js";
+import { FRIEND_GUESS_WINDOW_MS } from "./friends.js";
 import { LEAGUE_MAX_PLAYERS, leagueStandings, pointsForPosition, roundPoints } from "./leagues.js";
 
 const ORIGIN = "https://shottrax-share.bcbaird.workers.dev";
@@ -284,6 +285,43 @@ describe("leagues", () => {
       expect((await call("/v1/leagues/preview", { friend: guest.friend, body: { code: "AAAABBBB" } })).status).toBe(404);
     }
     expect((await call("/v1/leagues/preview", { friend: guest.friend, body: { code: "AAAABBBB" } })).status).toBe(429);
+  });
+
+  describe("only bad or unknown codes use up a guess", () => {
+    afterEach(() => vi.restoreAllMocks());
+
+    it("a successful preview and join leave all 8 guesses", async () => {
+      const owner = await player(1);
+      const { code } = await created(owner);
+      const guest = await player(2);
+      const ip = "203.0.113.9";
+      expect((await call("/v1/leagues/preview", { friend: guest.friend, ip, body: { code } })).status).toBe(200);
+      expect((await call("/v1/leagues/join", { friend: guest.friend, ip, body: { code, name: "Player K" } })).status).toBe(200);
+      for (let i = 0; i < 8; i += 1) {
+        expect((await call("/v1/leagues/preview", { friend: guest.friend, ip, body: { code: "AAAABBBB" } })).status).toBe(404);
+      }
+      expect((await call("/v1/leagues/preview", { friend: guest.friend, ip, body: { code: "AAAABBBB" } })).status).toBe(429);
+    });
+
+    it("8 bad codes block, and a valid code stays blocked until the window resets", async () => {
+      let now = Date.UTC(2026, 10, 1, 20, 0, 0);
+      vi.spyOn(Date, "now").mockImplementation(() => now);
+      const owner = await player(1);
+      const { code } = await created(owner);
+      const guest = await player(2);
+      for (let i = 0; i < 8; i += 1) {
+        expect((await call("/v1/leagues/preview", { friend: guest.friend, body: { code: "AAAABBBB" } })).status).toBe(404);
+      }
+      expect((await call("/v1/leagues/preview", { friend: guest.friend, body: { code: "AAAABBBB" } })).status).toBe(429);
+      expect((await call("/v1/leagues/preview", { friend: guest.friend, body: { code } })).status).toBe(429);
+      expect((await call("/v1/leagues/join", { friend: guest.friend, body: { code, name: "Player K" } })).status).toBe(429);
+      now += FRIEND_GUESS_WINDOW_MS - 1000;
+      expect((await call("/v1/leagues/join", { friend: guest.friend, body: { code, name: "Player K" } })).status).toBe(429);
+      now += 1000;
+      const joined = await call("/v1/leagues/join", { friend: guest.friend, body: { code, name: "Player K" } });
+      expect(joined.status).toBe(200);
+      expect(joined.json.joined).toBe(true);
+    });
   });
 
   it("members and standings are for members only; any member sees the code", async () => {

@@ -17,7 +17,6 @@
  */
 import {
   boardsBinding,
-  consumeGuess,
   consumeIpAction,
   consumeReadLimit,
   friendGet,
@@ -33,6 +32,7 @@ import {
   readFriendKey,
   readInviteName,
   readJsonObject,
+  reserveGuess,
   unknownFields,
   validCourseName,
   validPlayedOn,
@@ -168,6 +168,7 @@ async function previewLeague(request, url, env, cors) {
   if (found.response) return found.response;
   const answer = await rosterCall(env, found.leagueId, { op: "preview", callerId: found.caller.ownerId });
   if (!answer.ok) return friendJson(404, { error: "code_not_found" }, cors);
+  await found.refundGuess();
   return friendJson(200, { league: answer.league }, cors);
 }
 
@@ -191,6 +192,7 @@ async function joinLeague(request, url, env, cors) {
     return friendJson(404, { error: "code_not_found" }, cors);
   }
   await saveOwnName(found.boards, found.caller, name);
+  await found.refundGuess();
   return friendJson(200, { league: answer.league, joined: answer.joined }, cors);
 }
 
@@ -503,8 +505,10 @@ async function leagueForCode(request, env, cors, allowed) {
   if (unknownFields(parsed.value, allowed)) return { response: friendJson(400, { error: "invalid_body" }, cors) };
   const code = normalizeFriendCode(parsed.value.code);
   if (!code) return { response: friendJson(400, { error: "invalid_body" }, cors) };
-  const limited = await consumeGuess(request, env, ready.friendKey, cors);
-  if (limited) return { response: limited };
+  // Only bad or unknown codes use up a guess (ShotTraxx Lead, Nov 1): the slot is
+  // held now and given back by the caller when the preview or join succeeds.
+  const guess = await reserveGuess(request, env, ready.friendKey, cors);
+  if (guess.response) return guess;
   const leagueId = await leagueGet(ready.boards, leagueKvKey("code", code));
   if (typeof leagueId !== "string" || !LEAGUE_ID_RE.test(leagueId)) {
     return { response: friendJson(404, { error: "code_not_found" }, cors) };
@@ -515,7 +519,7 @@ async function leagueForCode(request, env, cors, allowed) {
   if (await hasBlock(ready.boards, owner.ownerId, ready.caller.ownerId)) {
     return { response: friendJson(404, { error: "code_not_found" }, cors) };
   }
-  return { ...ready, body: parsed.value, code, leagueId };
+  return { ...ready, body: parsed.value, code, leagueId, refundGuess: guess.refund };
 }
 
 function rosterNamespace(env) {

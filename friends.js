@@ -1751,6 +1751,31 @@ async function consumeGuess(request, env, friendKey, cors) {
   return null;
 }
 
+/**
+ * Like consumeGuess, but the slot is only held: the caller gives it back with
+ * refund() when the code turned out good. A caller already at the limit is still
+ * refused here, so a good code cannot get past a block.
+ */
+async function reserveGuess(request, env, friendKey, cors) {
+  const now = Date.now();
+  const held = [];
+  const refund = async () => {
+    for (const { name, windowStart } of held) await guessRefund(env, name, 1, windowStart);
+  };
+  const keyName = await limiterNameForFriendKey(friendKey);
+  const keyAttempt = await guessAttempt(env, keyName, now, 1);
+  if (!keyAttempt.ok) return { response: rateLimited(cors, keyAttempt.retryAfterSec) };
+  held.push({ name: keyName, windowStart: keyAttempt.windowStart });
+  const ipHash = await friendIpHash(request);
+  if (ipHash) {
+    const ipName = `ip:${ipHash}`;
+    const ipAttempt = await guessAttempt(env, ipName, now, 1);
+    if (!ipAttempt.ok) return { response: rateLimited(cors, ipAttempt.retryAfterSec) };
+    held.push({ name: ipName, windowStart: ipAttempt.windowStart });
+  }
+  return { refund };
+}
+
 async function guessAttempt(env, name, now, count = 0) {
   const ns = guessNamespace(env);
   const stub = ns.get(ns.idFromName(name));
@@ -1928,6 +1953,7 @@ export {
   readFriendKey,
   readInviteName,
   readJsonObject,
+  reserveGuess,
   unknownFields,
   validCourseName,
   validPlayedOn,

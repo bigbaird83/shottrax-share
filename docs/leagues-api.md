@@ -16,7 +16,7 @@ Every call uses the friends `X-Friend-Key`. The caller needs a friend code alrea
 - Names: 1-24 characters, spaces collapsed. `yourName` and the join `name` also set the caller's Friends name (one name per player).
 - League name: 1-32 characters (placeholder limit; the mockups give none).
 - Season dates are `YYYY-MM-DD`, start on or before end.
-- Codes: friend-code alphabet and validator, 8 characters, never expire. Preview and join use the friend code guess limit (8 per key, 24 per IP per hour).
+- Codes: friend-code alphabet and validator, 8 characters, never expire. Preview and join use the friend code guess limit (8 per key, 24 per IP per hour), but only failed or unknown-code attempts count: a successful preview or join (200) gives its guess back. A caller already at the limit gets 429 even with a valid code, until the hour window resets.
 - Cap: 20 players including the owner. One SQLite Durable Object per league (`LeagueRoster`) checks the cap and inserts in one transaction. Over the cap: 409 `league_full`. A repeat join is a no-op.
 - A caller the owner blocked gets 404 `code_not_found`, the same as a bad code.
 - Members and standings: members only; anyone else gets 404.
