@@ -381,6 +381,60 @@ describe("scramble info on live and shared rounds", () => {
     expect(res.json.rounds.find((r) => r.id === "p_mock_scr").scramble).toEqual({ size: 3, ownerIds: [mate.ownerId], guests: 1 });
     expectNoCodes(res.text, [mate, outsider, golfer, pal]);
   });
+
+  it("board: shared round keeps scramble.board true, stores it and serves it to friends", async () => {
+    const { golfer, pal, mate } = await crew("scr-board");
+    const team = { size: 3, codes: [mate.code], guests: 1, board: true };
+    expect((await shareRound(golfer, round("r_mock_brd", "2026-10-30", { scramble: team }))).status).toBe(200);
+    expect((await shareRound(golfer, round("r_mock_nob", "2026-10-29", { scramble: { size: 2, codes: [], guests: 1 } }))).status).toBe(200);
+    const stored = JSON.parse(kv.get(`fr:rounds:${golfer.ownerId}`).value);
+    expect(stored.find((r) => r.id === "r_mock_brd").scramble.board).toBe(true);
+    expect(Object.hasOwn(stored.find((r) => r.id === "r_mock_nob").scramble, "board")).toBe(false);
+    for (const viewer of [pal, golfer]) {
+      const res = await invoke("/v1/friends/rounds", { method: "GET", friend: viewer.key });
+      const byId = Object.fromEntries(res.json.rounds.map((r) => [r.id, r]));
+      expect(byId.r_mock_brd.scramble).toEqual({ size: 3, ownerIds: [mate.ownerId], guests: 1, board: true });
+      expect(byId.r_mock_nob.scramble).toEqual({ size: 2, ownerIds: [], guests: 1 });
+    }
+  });
+
+  it("board: past rounds keep scramble.board true", async () => {
+    const { golfer, pal } = await crew("scr-board-past");
+    const team = { size: 2, codes: [], guests: 1, board: true };
+    expect((await setPast(golfer, pal, "10", [round("p_mock_brd", "2025-06-01", { scramble: team })])).status).toBe(200);
+    const res = await invoke("/v1/friends/rounds", { method: "GET", friend: pal.key });
+    expect(res.json.rounds.find((r) => r.id === "p_mock_brd").scramble).toEqual({ size: 2, ownerIds: [], guests: 1, board: true });
+  });
+
+  for (const board of [false, "true", 1, null, {}, []]) {
+    it(`board: refuses scramble.board ${JSON.stringify(board)} on shared and past rounds`, async () => {
+      const { golfer, pal } = await crew(`scr-board-bad-${String(JSON.stringify(board)).replace(/\W/g, "x")}`);
+      const team = { size: 2, codes: [], guests: 1, board };
+      expect((await shareRound(golfer, round("r_mock_bb", "2026-10-30", { scramble: team }))).status).toBe(400);
+      expect((await setPast(golfer, pal, "10", [round("p_mock_bb", "2025-06-01", { scramble: team })])).status).toBe(400);
+      const res = await invoke("/v1/friends/rounds", { method: "GET", friend: pal.key });
+      expect(res.json.rounds.some((r) => r.id === "r_mock_bb" || r.id === "p_mock_bb")).toBe(false);
+    });
+  }
+
+  it("board: a stored round with a bad board value is served without scramble", async () => {
+    const { golfer, pal } = await crew("scr-board-stored");
+    expect((await shareRound(golfer, round("r_mock_sb", "2026-10-30", { scramble: { size: 2, codes: [], guests: 1 } }))).status).toBe(200);
+    const key = `fr:rounds:${golfer.ownerId}`;
+    const rows = JSON.parse(kv.get(key).value);
+    rows[0].scramble = { size: 2, ownerIds: [], guests: 1, board: "yes" };
+    kv.set(key, { value: JSON.stringify(rows) });
+    const res = await invoke("/v1/friends/rounds", { method: "GET", friend: pal.key });
+    expect(Object.hasOwn(res.json.rounds[0], "scramble")).toBe(false);
+  });
+
+  it("board: live updates accept board but never store or serve it", async () => {
+    const { golfer, pal } = await crew("scr-board-live");
+    expect((await putLive(golfer, { ...LIVE, scramble: { size: 2, codes: [], guests: 1, board: true } })).json).toEqual({ ok: true });
+    expect(Object.hasOwn(JSON.parse(kv.get(`fr:live:${golfer.ownerId}`).value).scramble, "board")).toBe(false);
+    expect((await getLive(pal)).json.live[0].scramble).toEqual({ size: 2, ownerIds: [], guests: 1 });
+    expect((await putLive(golfer, { ...LIVE, scramble: { size: 2, codes: [], guests: 1, board: false } })).status).toBe(400);
+  });
   // Made-up codes from the code alphabet; none of them exist.
   const FAKE = ["MKPQRS23", "TVWXYZ45", "HJKLMN67", "ABCDEF89", "GHJKLM23", "NPQRST45", "UVWXYZ67", "BCDFGH89", "JKLMNP23"];
   const lookup = (who, code) => invoke("/v1/friends/codes/lookup", { friend: who.key, body: { code } });
