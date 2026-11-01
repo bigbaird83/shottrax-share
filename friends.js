@@ -35,6 +35,8 @@ export const FRIEND_READ_KEY_LIMIT = 60;
 export const FRIEND_READ_IP_LIMIT = 60;
 export const FRIEND_GUESS_WINDOW_MS = 60 * 60 * 1000;
 export const FRIEND_CAP = 50;
+/** New leagues per IP per hour. Same number as friend code mints. */
+export const LEAGUE_CREATE_IP_LIMIT = 30;
 export const ROUND_CAP = 100;
 // Live rounds for friends (approved 2026-10-21 11:10 CT). A row is gone 30 minutes after its last update.
 export const FRIEND_LIVE_TTL_MS = 30 * 60 * 1000;
@@ -110,6 +112,10 @@ function limitForDurableObjectName(name) {
   if (name.startsWith("ip:")) return FRIEND_IP_GUESS_LIMIT;
   if (name.startsWith("keyreq:")) return FRIEND_READ_KEY_LIMIT;
   if (name.startsWith("keylist:")) return FRIEND_READ_KEY_LIMIT;
+  // Leagues (leagues.js): creates per IP, and member/standings reads per key and per IP.
+  if (name.startsWith("iplgnew:")) return LEAGUE_CREATE_IP_LIMIT;
+  if (name.startsWith("iplgread:")) return FRIEND_READ_IP_LIMIT;
+  if (name.startsWith("keylgread:")) return FRIEND_READ_KEY_LIMIT;
   return FRIEND_CODE_GUESS_LIMIT;
 }
 
@@ -1902,3 +1908,27 @@ function doJson(body, status = 200) {
     headers: { "Content-Type": "application/json" },
   });
 }
+
+// Shared with leagues.js so league calls use the same auth, body, name and limit rules.
+export {
+  boardsBinding,
+  consumeGuess,
+  consumeIpAction,
+  consumeReadLimit,
+  friendGet,
+  friendJson,
+  friendKvKey,
+  friendPut,
+  guessNamespace,
+  hasBlock,
+  loadCaller,
+  normalizeFriendCode,
+  randomFriendCode,
+  randomOwnerId,
+  readFriendKey,
+  readInviteName,
+  readJsonObject,
+  unknownFields,
+  validCourseName,
+  validPlayedOn,
+};

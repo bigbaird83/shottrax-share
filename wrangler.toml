@@ -26,6 +26,12 @@ class_name = "GolfapiCounter"
 name = "FRIEND_GUESSES"
 class_name = "FriendGuessLimiter"
 
+# Leagues: one SQLite Durable Object per league holds its roster and results,
+# so a join checks the 20-player cap and inserts in one transaction.
+[[durable_objects.bindings]]
+name = "LEAGUES"
+class_name = "LeagueRoster"
+
 [[migrations]]
 tag = "v1-golfapi-counter"
 new_sqlite_classes = ["GolfapiCounter"]
@@ -33,6 +39,10 @@ new_sqlite_classes = ["GolfapiCounter"]
 [[migrations]]
 tag = "v2-friend-guesses"
 new_sqlite_classes = ["FriendGuessLimiter"]
+
+[[migrations]]
+tag = "v3-league-roster"
+new_sqlite_classes = ["LeagueRoster"]
 
 [[send_email]]
 name = "ALERT_EMAIL"
