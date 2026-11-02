@@ -966,7 +966,11 @@ async function putLive(request, env, cors) {
   if (typeof body.roundStats === "boolean") row.roundStats = body.roundStats;
   if (typeof body.clubAverages === "boolean") row.clubAverages = body.clubAverages;
   if (skippedHoles && skippedHoles.length > 0) row.skippedHoles = skippedHoles;
-  if (team) row.scramble = team;
+  if (team) {
+    // Show on Friends Board is for shared and past rounds only; a live row never keeps it.
+    const { board: _board, ...liveTeam } = team;
+    row.scramble = liveTeam;
+  }
   if (codesHash && charged) row.scrambleCodesHash = codesHash;
   await friendPut(boards, friendKvKey("live", caller.ownerId), JSON.stringify(row), {
     expirationTtl: Math.ceil(FRIEND_LIVE_TTL_MS / 1000),
@@ -1053,7 +1057,10 @@ function readLiveRow(raw, now) {
   if (shots) out.shots = shots;
   if (Object.hasOwn(value, "scramble")) {
     const scramble = sanitizeStoredScramble(value.scramble);
-    if (scramble) out.scramble = scramble;
+    if (scramble) {
+      const { board: _board, ...liveTeam } = scramble;
+      out.scramble = liveTeam;
+    }
   }
   if (Object.hasOwn(value, "skippedHoles")) {
     const scored = new Set(holes.map((hole) => hole.hole));
@@ -1331,12 +1338,14 @@ function sanitizeRound(round, callerOwnerId, stored = false) {
  * friend codes of teammates who are friends (no repeats). guests counts everyone else.
  * codes plus guests is at most size - 1 (the owner is the other player). Names, notes
  * and any other field are refused: null, and the caller answers invalid_body.
- * Same shape as SharedScramble in ShotTraxx src/domain/scramble.ts. The Worker keeps no
- * Board; the app leaves scramble rounds off it.
+ * Same shape as SharedScramble in ShotTraxx src/domain/scramble.ts. Optional board: true
+ * (Show on Friends Board, shared and past rounds) is stored and served back; any other
+ * board value is refused. Older clients never send it. Live rounds never keep it.
  */
 function sanitizeScramble(value) {
   if (value == null || typeof value !== "object" || Array.isArray(value)) return null;
-  if (unknownFields(value, ["size", "codes", "guests"])) return null;
+  if (unknownFields(value, ["size", "codes", "guests", "board"])) return null;
+  if (Object.hasOwn(value, "board") && value.board !== true) return null;
   if (!SCRAMBLE_SIZES.includes(value.size)) return null;
   if (!Array.isArray(value.codes) || value.codes.length > value.size - 1) return null;
   const codes = [];
@@ -1346,7 +1355,7 @@ function sanitizeScramble(value) {
   }
   if (!Number.isInteger(value.guests) || value.guests < 0) return null;
   if (codes.length + value.guests > value.size - 1) return null;
-  return { size: value.size, codes, guests: value.guests };
+  return { size: value.size, codes, guests: value.guests, ...(value.board === true ? { board: true } : {}) };
 }
 
 /**
@@ -1372,7 +1381,7 @@ async function resolveScramble(boards, ownerId, clean) {
     if (valid && other !== ownerId && !ownerIds.includes(other) && ab && ba && !blockAb && !blockBa) ownerIds.push(other);
     else guests += 1;
   }
-  return { size: clean.size, ownerIds, guests };
+  return { size: clean.size, ownerIds, guests, ...(clean.board === true ? { board: true } : {}) };
 }
 
 /** Private hash of a team's codes (plus the round id for shared and past rounds). Never served. */
@@ -1407,7 +1416,7 @@ async function chargeScrambleLookups(request, env, friendKey, count) {
 
 /** Every code counted as a guest. No code lookup at all. */
 function scrambleAllGuests(clean) {
-  return { size: clean.size, ownerIds: [], guests: clean.guests + clean.codes.length };
+  return { size: clean.size, ownerIds: [], guests: clean.guests + clean.codes.length, ...(clean.board === true ? { board: true } : {}) };
 }
 
 /**
@@ -1451,7 +1460,8 @@ async function chargeAndResolveRounds(request, env, friendKey, boards, ownerId, 
 /** A stored scramble: { size, ownerIds, guests }. Null (served without it) on anything else, including codes. */
 function sanitizeStoredScramble(value) {
   if (value == null || typeof value !== "object" || Array.isArray(value)) return null;
-  if (unknownFields(value, ["size", "ownerIds", "guests"])) return null;
+  if (unknownFields(value, ["size", "ownerIds", "guests", "board"])) return null;
+  if (Object.hasOwn(value, "board") && value.board !== true) return null;
   if (!SCRAMBLE_SIZES.includes(value.size)) return null;
   if (!Array.isArray(value.ownerIds) || value.ownerIds.length > value.size - 1) return null;
   const ownerIds = [];
@@ -1461,7 +1471,7 @@ function sanitizeStoredScramble(value) {
   }
   if (!Number.isInteger(value.guests) || value.guests < 0) return null;
   if (ownerIds.length + value.guests > value.size - 1) return null;
-  return { size: value.size, ownerIds, guests: value.guests };
+  return { size: value.size, ownerIds, guests: value.guests, ...(value.board === true ? { board: true } : {}) };
 }
 
 function sanitizeHole(hole) {
