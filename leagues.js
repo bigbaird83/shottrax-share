@@ -66,7 +66,8 @@ const ROSTER_SCHEMA = [
     home_course TEXT,
     season_starts TEXT NOT NULL,
     season_ends TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    round_day INTEGER
   )`,
   `CREATE TABLE IF NOT EXISTS member (
     member_id TEXT PRIMARY KEY,
@@ -110,7 +111,8 @@ export async function handleLeagues(request, url, env, cors) {
 }
 
 /**
- * Body { name, yourName, game, scoring, carryOver, homeCourse, seasonStarts, seasonEnds }.
+ * Body { name, yourName, game, scoring, carryOver, homeCourse, seasonStarts, seasonEnds, roundDay? }.
+ * roundDay is the weekly round day the organizer picks, 0 (Sunday) to 6 (Saturday); missing or null = none.
  * Answers { league, code }. The caller is the owner and the first member (1 / 20).
  */
 async function createLeague(request, url, env, cors) {
@@ -120,7 +122,7 @@ async function createLeague(request, url, env, cors) {
   const parsed = await readJsonObject(request, LEAGUE_BODY_LIMIT, false);
   if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
   const body = parsed.value;
-  if (unknownFields(body, ["name", "yourName", "game", "scoring", "carryOver", "homeCourse", "seasonStarts", "seasonEnds"])) {
+  if (unknownFields(body, ["name", "yourName", "game", "scoring", "carryOver", "homeCourse", "seasonStarts", "seasonEnds", "roundDay"])) {
     return friendJson(400, { error: "invalid_body" }, cors);
   }
   const name = cleanLeagueName(body.name);
@@ -135,6 +137,8 @@ async function createLeague(request, url, env, cors) {
   }
   if (body.homeCourse !== null && !validCourseName(body.homeCourse)) return friendJson(400, { error: "invalid_body" }, cors);
   if (!validSeason(body.seasonStarts, body.seasonEnds)) return friendJson(400, { error: "invalid_body" }, cors);
+  const roundDay = body.roundDay ?? null;
+  if (roundDay !== null && !validRoundDay(roundDay)) return friendJson(400, { error: "invalid_body" }, cors);
   const limited = await consumeIpAction(request, env, "iplgnew:", cors);
   if (limited) return limited;
   const leagueId = randomOwnerId();
@@ -153,6 +157,7 @@ async function createLeague(request, url, env, cors) {
       homeCourse: body.homeCourse,
       seasonStarts: body.seasonStarts,
       seasonEnds: body.seasonEnds,
+      roundDay,
     },
     owner: { memberId: caller.ownerId, name: yourName },
   });
@@ -349,6 +354,9 @@ export class LeagueRoster {
 
   #ensure() {
     for (const statement of ROSTER_SCHEMA) this.ctx.storage.sql.exec(statement);
+    // Leagues made before round days: add the column (null = no round set). Additive only.
+    const columns = this.#sql("SELECT name FROM pragma_table_info('league')").map((c) => c.name);
+    if (!columns.includes("round_day")) this.ctx.storage.sql.exec("ALTER TABLE league ADD COLUMN round_day INTEGER");
   }
 
   #sql(query, ...bindings) {
@@ -381,6 +389,7 @@ export class LeagueRoster {
       homeCourse: row.home_course ?? null,
       seasonStarts: row.season_starts,
       seasonEnds: row.season_ends,
+      roundDay: validRoundDay(row.round_day) ? Number(row.round_day) : null,
       players: this.#count(),
       maxPlayers: LEAGUE_MAX_PLAYERS,
     };
@@ -389,8 +398,8 @@ export class LeagueRoster {
   #create({ league, owner, now }) {
     if (this.#league()) return { ok: false, error: "league_exists" };
     this.ctx.storage.sql.exec(
-      `INSERT INTO league (id, league_id, name, owner_id, code, game, scoring, carry_over, home_course, season_starts, season_ends, created_at)
-       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO league (id, league_id, name, owner_id, code, game, scoring, carry_over, home_course, season_starts, season_ends, created_at, round_day)
+       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       league.leagueId,
       league.name,
       league.ownerId,
@@ -402,6 +411,7 @@ export class LeagueRoster {
       league.seasonStarts,
       league.seasonEnds,
       now,
+      league.roundDay ?? null,
     );
     this.ctx.storage.sql.exec(
       "INSERT INTO member (member_id, name, role, joined_at) VALUES (?, ?, 'owner', ?)",
@@ -561,6 +571,11 @@ function cleanLeagueName(raw) {
   if (name.length < 1 || [...name].length > LEAGUE_NAME_MAX) return null;
   if (/[\u0000-\u001F\u007F]/.test(name)) return null;
   return name;
+}
+
+/** Weekly round day: 0 = Sunday ... 6 = Saturday (JavaScript getDay order). */
+function validRoundDay(value) {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 6;
 }
 
 function validSeason(starts, ends) {
