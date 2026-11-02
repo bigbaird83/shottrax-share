@@ -6,7 +6,7 @@ Every call uses the friends `X-Friend-Key`. The caller needs a friend code alrea
 
 | Call | Body / query | Answer |
 | --- | --- | --- |
-| `POST /v1/leagues` | `{ name, yourName, game, scoring, carryOver, homeCourse, seasonStarts, seasonEnds }` | `{ league, code }` |
+| `POST /v1/leagues` | `{ name, yourName, game, scoring, carryOver, homeCourse, seasonStarts, seasonEnds, roundDay? }` | `{ league, code }` |
 | `POST /v1/leagues/preview` | `{ code }` | `{ league }` (no member list, no owner id) |
 | `POST /v1/leagues/join` | `{ code, name }` | `{ league, joined }` |
 | `GET /v1/leagues/members` | `?league=<id>` | `{ league, code, members: [{ memberId, name, role, joinedAt }] }` |
@@ -16,6 +16,7 @@ Every call uses the friends `X-Friend-Key`. The caller needs a friend code alrea
 - Names: 1-24 characters, spaces collapsed. `yourName` and the join `name` also set the caller's Friends name (one name per player).
 - League name: 1-32 characters (placeholder limit; the mockups give none).
 - Season dates are `YYYY-MM-DD`, start on or before end.
+- `roundDay` (optional): the weekly round day the organizer picks, an integer 0 (Sunday) to 6 (Saturday). Missing or `null` means no round day. Every `league` answer carries `roundDay` (`null` when none, including leagues made before this field). The app works out the next date in the course's local calendar.
 - Codes: friend-code alphabet and validator, 8 characters, never expire. Preview and join use the friend code guess limit (8 per key, 24 per IP per hour), but only failed or unknown-code attempts count: a successful preview or join (200) gives its guess back. A caller already at the limit gets 429 even with a valid code, until the hour window resets. If the per-IP limit refuses, the per-key slot is given back.
 - Cap: 20 players including the owner. One SQLite Durable Object per league (`LeagueRoster`) checks the cap and inserts in one transaction. Over the cap: 409 `league_full`. A repeat join is a no-op.
 - A block either way between the caller and the owner: preview and join get 404 `code_not_found`, the same as a bad code, and the guess still counts. Members and standings get 404 `not_found`, even for someone who joined before the block.

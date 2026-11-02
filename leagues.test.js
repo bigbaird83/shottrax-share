@@ -190,6 +190,55 @@ describe("leagues", () => {
     expect([...kv.keys()].some((k) => k.startsWith("lg:"))).toBe(false);
   });
 
+  it("stores the organizer's weekly round day and reads it back", async () => {
+    const owner = await player(1);
+    const out = await created(owner, { roundDay: 6 });
+    expect(out.league.roundDay).toBe(6);
+    const members = await call(`/v1/leagues/members?league=${out.league.id}`, { method: "GET", friend: owner.friend });
+    expect(members.status).toBe(200);
+    expect(members.json.league.roundDay).toBe(6);
+    const joiner = await player(2);
+    const preview = await call("/v1/leagues/preview", { friend: joiner.friend, body: { code: out.code } });
+    expect(preview.json.league.roundDay).toBe(6);
+    const join = await call("/v1/leagues/join", { friend: joiner.friend, body: { code: out.code, name: "Player B" } });
+    expect(join.json.league.roundDay).toBe(6);
+    expect((await created(owner, { roundDay: 0 })).league.roundDay).toBe(0);
+  });
+
+  it("treats a missing or null round day as none", async () => {
+    const owner = await player(1);
+    expect((await created(owner)).league.roundDay).toBeNull();
+    expect((await created(owner, { roundDay: null })).league.roundDay).toBeNull();
+  });
+
+  it("refuses a round day outside 0-6", async () => {
+    const owner = await player(1);
+    for (const roundDay of [7, -1, 1.5, "6", true, [6], {}]) {
+      const res = await call("/v1/leagues", { friend: owner.friend, body: newLeague({ roundDay }) });
+      expect(res.status, JSON.stringify(roundDay)).toBe(400);
+      expect(res.json.error).toBe("invalid_body");
+    }
+    expect([...kv.keys()].some((k) => k.startsWith("lg:"))).toBe(false);
+  });
+
+  it("adds the round day column to a league made before round days", async () => {
+    const state = sqliteState("old");
+    state.db.exec(`CREATE TABLE league (
+      id INTEGER PRIMARY KEY CHECK (id = 1), league_id TEXT NOT NULL, name TEXT NOT NULL, owner_id TEXT NOT NULL,
+      code TEXT NOT NULL, game TEXT NOT NULL, scoring TEXT NOT NULL, carry_over INTEGER NOT NULL, home_course TEXT,
+      season_starts TEXT NOT NULL, season_ends TEXT NOT NULL, created_at INTEGER NOT NULL)`);
+    state.db.exec(`CREATE TABLE member (member_id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, joined_at INTEGER NOT NULL)`);
+    state.db.exec(`INSERT INTO league VALUES (1, 'L${"a".repeat(21)}', 'Old League', 'o1', 'ABCDEFGH', 'skins', 'net', 1, NULL, '2026-11-01', '2027-03-31', 1)`);
+    state.db.exec(`INSERT INTO member VALUES ('o1', 'Player A', 'owner', 1)`);
+    const roster = new LeagueRoster(state, {});
+    const res = await roster.fetch(new Request("https://roster/", { method: "POST", body: JSON.stringify({ op: "preview", callerId: "x" }) }));
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.league.roundDay).toBeNull();
+    const cols = state.db.prepare("SELECT name FROM pragma_table_info('league')").all().map((c) => c.name);
+    expect(cols).toContain("round_day");
+  });
+
   it("allows a league with no home course", async () => {
     const owner = await player(1);
     const out = await created(owner, { homeCourse: null, game: "stableford", carryOver: false });
