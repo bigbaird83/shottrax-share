@@ -257,11 +257,26 @@ describe("friend live-round alerts", () => {
     })]);
 
     await putLive(golfer, { ...TEE, roundId: "r1" });
-    await putLive(golfer, { courseName: "Pine Hollow GC", hole: 2, holes: [{ hole: 1, score: 4, par: 4 }], roundId: "r1" });
+    await putLive(golfer, { courseName: "Pine Hollow GC", hole: 2, holes: [{ hole: 1, score: 4, par: 4, shots: [{ n: 1, club: "Dr", yd: 250 }] }], roundId: "r1" });
     expect(sends).toHaveLength(1);
 
     await putLive(golfer, { ...TEE, roundId: "r2" });
     expect(sends).toHaveLength(2);
+  });
+
+  it("a scored hole with no marked shot, or a later shot only, does not send", async () => {
+    const golfer = await mint("golfer");
+    const pal = await mint("pal");
+    await befriend(golfer, pal);
+    await register(pal, TOKEN_A);
+    expect((await putLive(golfer, { courseName: "Pine Hollow GC", hole: 2, holes: [{ hole: 1, score: 4, par: 4 }], roundId: "r1" })).status).toBe(200);
+    expect((await putLive(golfer, { ...OPEN, shots: [{ n: 2, club: "7i", yd: 150 }], roundId: "r1" })).status).toBe(200);
+    expect(sends).toEqual([]);
+    expect(kv.has(`fr:pushsent:${golfer.ownerId}:r1`)).toBe(false);
+    // A tee shot on a sent hole counts too, once.
+    await putLive(golfer, { courseName: "Pine Hollow GC", hole: 2, holes: [{ hole: 1, score: 4, par: 4, shots: [{ n: 1, club: "Dr", yd: 240 }] }], roundId: "r1" });
+    await putLive(golfer, { ...TEE, hole: 2, holes: [{ hole: 1, score: 4, par: 4 }], roundId: "r1" });
+    expect(sends).toHaveLength(1);
   });
 
   it("skips opted-out, blocked and non-friend players", async () => {

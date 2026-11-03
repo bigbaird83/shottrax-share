@@ -980,11 +980,19 @@ async function putLive(request, env, cors) {
   await friendPut(boards, friendKvKey("live", caller.ownerId), JSON.stringify(row), {
     expirationTtl: Math.ceil(FRIEND_LIVE_TTL_MS / 1000),
   });
-  // First tee shot of a round: one alert to friends, never on round open (no shot yet).
-  if (typeof body.roundId === "string" && ((currentShots && currentShots.length > 0) || holes.length > 0)) {
+  // Only once a tee shot is marked (shot n 1 on any hole), never on round open and never for a
+  // scored hole with no marked shot (Brian, Oct 31 2026). One alert per round.
+  if (typeof body.roundId === "string" && hasMarkedTeeShot(currentShots, holes)) {
     await sendLiveRoundAlertOnce(env, boards, caller.ownerId, body.roundId, body.courseName);
   }
   return friendJson(200, { ok: true }, cors);
+}
+
+/** A marked tee shot: shot number 1 on the current hole or on any sent hole. */
+function hasMarkedTeeShot(currentShots, holes) {
+  const isTee = (shot) => shot && shot.n === 1;
+  if (Array.isArray(currentShots) && currentShots.some(isTee)) return true;
+  return holes.some((hole) => Array.isArray(hole.shots) && hole.shots.some(isTee));
 }
 
 /**
