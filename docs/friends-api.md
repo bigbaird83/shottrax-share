@@ -110,6 +110,14 @@ Stored at `fr:live:<ownerId>` with `updatedAt`, and replaced on every update. KV
 
 `POST /v1/friends/live/stop` (empty body) deletes your row, including every shot location: at round finish, when the switch is turned off, or when "Friends can follow" is tapped. `PUT` with `{ "finished": true }` does the same delete. `200` `{ "ok": true }`.
 
+### registerPushToken / removePushToken (friend live-round alerts)
+
+`PUT /v1/friends/push` with `{ "token": "ExponentPushToken[...]" }` stores the caller's Expo push token, linked to the caller's `ownerId` (friend code). The phone sends it only when notifications are allowed and "Friend live-round alerts" is on. Any other field, or a token that is not an Expo push token, is `400` `{ "error": "invalid_body" }`. A second PUT replaces the token. `200` `{ "ok": true }`.
+
+`POST /v1/friends/push/remove` (empty body) deletes the caller's token. The phone calls it when "Friend live-round alerts" is turned off. A friend with no stored token has opted out and gets no alert. `200` `{ "ok": true }`.
+
+`putLive` may carry an optional `roundId` (1–64 of `A-Z a-z 0-9 _ -`). The first `PUT` for a `roundId` that has a shot or a scored hole (the first tee shot, never round open) sends one alert through Expo's push service (`https://exp.host/--/api/v2/push/send`) to each accepted friend both ways, not blocked either way, who has a token: title "<name> is live on the course", body "Started a round at <course>. Tap to follow along." `<name>` is the owner's invite name, or "A friend". A `fr:pushsent:<ownerId>:<roundId>` marker is written before the send, so later `PUT`s for that round never send again. Practice and Test rounds are refused before this step. A send failure does not fail the live `PUT`. An `EXPO_ACCESS_TOKEN` secret, when set, is sent as a bearer token.
+
 ### setPastRounds
 
 `PUT /v1/friends/past`
@@ -449,6 +457,9 @@ Friend rows use the `fr:` prefix only. The keys this API writes are:
 - `fr:invname:<CODE>` — the invite name for that code, a plain string of 1–24 characters. `resetCode` deletes it with the old code.
 - `fr:ownname:<ownerId>` — the same invite name keyed by owner, written and cleared by setInviteName, deleted by resetCode. listFriends and listRequests return it as optional `name`. Names set before this key existed appear once the owner saves their invite name again.
 - `fr:live:<ownerId>` — that owner's live round, one JSON value, `expirationTtl` of 30 minutes from the last `PUT`. Shot lat/lon live only inside this value. Deleted by `POST /v1/friends/live/stop`, by `PUT` with `finished: true`, and by a follower read that finds the row older than 30 minutes.
+
+- `fr:push:<ownerId>` — that owner's Expo push token, a plain string. Deleted by `POST /v1/friends/push/remove`.
+- `fr:pushsent:<ownerId>:<roundId>` — `sent`, the one-alert-per-round marker, `expirationTtl` of 7 days.
 
 None of these routes read or write `id:`, `name:`, `osm:`, `gq:`, `gapi:`, `gqueue:`, `gca:`, or `cr:`. `GET /v1/friends/requests` and `GET /v1/friends/list` do not `put` or `delete` any KV key. The only mutation on those calls is the Durable Object attempt counter. Board `GET`, `PUT`, and `DELETE` reserve the `fr:` prefix and return `400` with no KV read or write. That includes a percent-encoded path (`fr%3A` and `fr%3a`), so a board path cannot read, replace, or forge a friend row. Guess counts live in the Durable Object, not in KV.
 
