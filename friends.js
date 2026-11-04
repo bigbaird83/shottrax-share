@@ -266,7 +266,91 @@ const FRIEND_ROUTES = {
   "/v1/friends/rounds": { PUT: publishRound, GET: fetchRounds },
   "/v1/friends/rounds/delete": { POST: deleteRounds },
   "/v1/friends/past": { PUT: setPastRounds },
+  "/v1/friends/device/claim": { POST: claimDevice },
+  "/v1/friends/device": { GET: readDevice },
 };
+
+/**
+ * Two-phone guard (iCloud backup restore). One friend key (the identity an
+ * iCloud backup carries with the install ID) has at most one active device.
+ * The phone makes a random device token and claims it; the last claim wins
+ * ("Move it to this iPhone"). Only a SHA-256 hash of the token is stored, at
+ * fr:device:<ownerId>. Until a key claims, nothing is checked, so phones on
+ * older builds keep working. Once claimed, every live-round write (PUT live,
+ * finished, stop) must carry X-Device-Token with the active token, or it is
+ * 409 { "error": "device_not_active" } and nothing is written or deleted.
+ */
+export const DEVICE_TOKEN_RE = /^[A-Za-z0-9_-]{32,128}$/;
+const DEVICE_TOKEN_HASH_PREFIX = "shottrax-device-token-v1:";
+
+function readDeviceToken(request) {
+  const raw = request.headers.get("X-Device-Token");
+  if (typeof raw !== "string") return null;
+  const token = raw.trim();
+  return DEVICE_TOKEN_RE.test(token) ? token : null;
+}
+
+async function loadActiveDevice(boards, ownerId) {
+  const raw = await friendGet(boards, friendKvKey("device", ownerId));
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  try {
+    const row = JSON.parse(raw);
+    if (row && typeof row.tokenHash === "string" && Number.isFinite(row.claimedAt)) return row;
+  } catch {
+    // A bad row fails closed below: no token can match it.
+  }
+  return { tokenHash: "", claimedAt: 0 };
+}
+
+/**
+ * Null when this request may write for ownerId, else the 409 response.
+ * Exported for other per-owner writes (push tokens) to share one rule.
+ */
+export async function activeDeviceRefusal(request, boards, ownerId, cors) {
+  const active = await loadActiveDevice(boards, ownerId);
+  if (!active) return null;
+  const token = readDeviceToken(request);
+  if (token && (await sha256Hex(DEVICE_TOKEN_HASH_PREFIX + token)) === active.tokenHash) return null;
+  return friendJson(409, { error: "device_not_active", claimedAt: active.claimedAt }, cors);
+}
+
+async function claimDevice(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const parsed = await readJsonObject(request, FRIEND_BODY_LIMIT, true);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (!parsed.empty && unknownFields(parsed.value, [])) return friendJson(400, { error: "invalid_body" }, cors);
+  const token = readDeviceToken(request);
+  if (!token) return friendJson(400, { error: "device_token_required" }, cors);
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const limited = await consumeIpAction(request, env, "iplive:", cors);
+  if (limited) return limited;
+  const tokenHash = await sha256Hex(DEVICE_TOKEN_HASH_PREFIX + token);
+  const prior = await loadActiveDevice(boards, caller.ownerId);
+  if (prior && prior.tokenHash === tokenHash) return friendJson(200, { ok: true, active: true, moved: false, claimedAt: prior.claimedAt }, cors);
+  const claimedAt = Date.now();
+  await friendPut(boards, friendKvKey("device", caller.ownerId), JSON.stringify({ tokenHash, claimedAt }));
+  // A move drops the other phone's live row, so friends never see two rounds.
+  if (prior) await deleteIfPresent(boards, friendKvKey("live", caller.ownerId));
+  return friendJson(200, { ok: true, active: true, moved: Boolean(prior), claimedAt }, cors);
+}
+
+async function readDevice(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const active = await loadActiveDevice(boards, caller.ownerId);
+  if (!active) return friendJson(200, { claimed: false, active: true }, cors);
+  const token = readDeviceToken(request);
+  const mine = Boolean(token) && (await sha256Hex(DEVICE_TOKEN_HASH_PREFIX + token)) === active.tokenHash;
+  return friendJson(200, { claimed: true, active: mine, claimedAt: active.claimedAt }, cors);
+}
 
 async function getCode(request, env, cors) {
   const friendKey = readFriendKey(request);
@@ -909,7 +993,7 @@ async function putLive(request, env, cors) {
   const body = parsed.value;
   if (unknownFields(body, LIVE_ROUND_FIELDS)) return friendJson(400, { error: "invalid_body" }, cors);
   if (!validLiveFlags(body)) return friendJson(400, { error: "invalid_body" }, cors);
-  if (body.finished === true) return finishLive(env, cors, friendKey);
+  if (body.finished === true) return finishLive(request, env, cors, friendKey);
   if (isPracticeOrTest(body)) return friendJson(400, { error: "practice_or_test" }, cors);
   if (!validCourseName(body.courseName)) return friendJson(400, { error: "invalid_body" }, cors);
   if (!Number.isInteger(body.hole) || body.hole < 1 || body.hole > 18) return friendJson(400, { error: "invalid_body" }, cors);
@@ -943,6 +1027,8 @@ async function putLive(request, env, cors) {
   if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
   const caller = await loadCaller(boards, friendKey);
   if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const notActive = await activeDeviceRefusal(request, boards, caller.ownerId, cors);
+  if (notActive) return notActive;
   const limited = await consumeIpAction(request, env, "iplive:", cors);
   if (limited) return limited;
   const row = { courseName: body.courseName, hole: body.hole, holes, updatedAt: Date.now() };
@@ -979,11 +1065,13 @@ async function putLive(request, env, cors) {
 }
 
 /** Round finished: drop the live row and every shot location stored on it. */
-async function finishLive(env, cors, friendKey) {
+async function finishLive(request, env, cors, friendKey) {
   const boards = boardsBinding(env);
   if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
   const caller = await loadCaller(boards, friendKey);
   if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const notActive = await activeDeviceRefusal(request, boards, caller.ownerId, cors);
+  if (notActive) return notActive;
   await deleteIfPresent(boards, friendKvKey("live", caller.ownerId));
   return friendJson(200, { ok: true }, cors);
 }
@@ -999,6 +1087,8 @@ async function stopLive(request, env, cors) {
   if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
   const caller = await loadCaller(boards, friendKey);
   if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const notActive = await activeDeviceRefusal(request, boards, caller.ownerId, cors);
+  if (notActive) return notActive;
   await deleteIfPresent(boards, friendKvKey("live", caller.ownerId));
   return friendJson(200, { ok: true }, cors);
 }
@@ -1829,7 +1919,8 @@ function friendKvKey(kind, id) {
     kind !== "invname" &&
     kind !== "invphoto" &&
     kind !== "ownname" &&
-    kind !== "live"
+    kind !== "live" &&
+    kind !== "device"
   ) {
     throw new Error("friend_namespace");
   }

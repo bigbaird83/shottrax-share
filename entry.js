@@ -16,7 +16,7 @@ function friendCors() {
   return {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET,POST,PUT,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, X-Friend-Key, X-Install-Id",
+    "Access-Control-Allow-Headers": "Content-Type, X-Friend-Key, X-Install-Id, X-Device-Token",
   };
 }
 
