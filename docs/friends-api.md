@@ -124,7 +124,7 @@ Stored at `fr:live:<ownerId>` with `updatedAt`, and replaced on every update. KV
 
 `GET /v1/friends/device` with `X-Friend-Key` and optional `X-Device-Token`: `200` `{ "claimed": false, "active": true }` when the key never claimed, otherwise `{ "claimed": true, "active": <this token is the active one>, "claimedAt": <ms> }`.
 
-Once a key has claimed, `PUT /v1/friends/live` (including `finished: true`) and `POST /v1/friends/live/stop` need `X-Device-Token` equal to the active token. Any other or missing token is `409` `{ "error": "device_not_active", "claimedAt": <ms> }` and nothing is written or deleted. A key that never claimed is not checked, so older apps keep working.
+Once a key has claimed, `PUT /v1/friends/live` (including `finished: true`), `POST /v1/friends/live/stop`, `PUT /v1/friends/push` and `POST /v1/friends/push/remove` need `X-Device-Token` equal to the active token. Any other or missing token is `409` `{ "error": "device_not_active", "claimedAt": <ms> }` and nothing is written or deleted. A key that never claimed is not checked, so older apps keep working.
 
 ### setPastRounds
 

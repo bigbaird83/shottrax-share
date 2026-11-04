@@ -124,9 +124,10 @@ describe("friend live-round alerts", () => {
   });
 
   const bodies = [];
-  async function invoke(pathname, { method = "POST", body, friend } = {}) {
+  async function invoke(pathname, { method = "POST", body, friend, device } = {}) {
     const headers = {};
     if (friend) headers["X-Friend-Key"] = friend;
+    if (device !== undefined) headers["X-Device-Token"] = device;
     if (body !== undefined) headers["Content-Type"] = "application/json";
     const response = await entry.fetch(new Request(`${ORIGIN}${pathname}`, {
       method,
@@ -225,6 +226,28 @@ describe("friend live-round alerts", () => {
     await register(me, TOKEN_B);
     expect(kv.get(`fr:push:${me.ownerId}`).value).toBe(TOKEN_B);
     expect((await unregister(me)).json).toEqual({ ok: true });
+    expect(kv.has(`fr:push:${me.ownerId}`)).toBe(false);
+  });
+
+  it("after a device claim only the active phone may set or remove the push token", async () => {
+    // Made-up device tokens only.
+    const PHONE_A = "phoneA".padEnd(40, "a");
+    const PHONE_B = "phoneB".padEnd(40, "b");
+    const me = await mint("me");
+    expect((await invoke("/v1/friends/device/claim", { friend: me.key, device: PHONE_A, body: {} })).status).toBe(200);
+    for (const device of [undefined, PHONE_B]) {
+      const put = await invoke("/v1/friends/push", { method: "PUT", friend: me.key, device, body: { token: TOKEN_A } });
+      expect(put.status).toBe(409);
+      expect(put.json.error).toBe("device_not_active");
+      expect(kv.has(`fr:push:${me.ownerId}`)).toBe(false);
+    }
+    expect((await invoke("/v1/friends/push", { method: "PUT", friend: me.key, device: PHONE_A, body: { token: TOKEN_A } })).json).toEqual({ ok: true });
+    for (const device of [undefined, PHONE_B]) {
+      const removed = await invoke("/v1/friends/push/remove", { friend: me.key, device, body: {} });
+      expect(removed.status).toBe(409);
+      expect(kv.get(`fr:push:${me.ownerId}`).value).toBe(TOKEN_A);
+    }
+    expect((await invoke("/v1/friends/push/remove", { friend: me.key, device: PHONE_A, body: {} })).json).toEqual({ ok: true });
     expect(kv.has(`fr:push:${me.ownerId}`)).toBe(false);
   });
 

@@ -292,6 +292,15 @@ function readDeviceToken(request) {
   return DEVICE_TOKEN_RE.test(token) ? token : null;
 }
 
+/** Constant-time compare of two hex hashes: no early exit on the first differing char. */
+function hashesEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const len = Math.max(a.length, b.length);
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < len; i += 1) diff |= (a.charCodeAt(i) | 0) ^ (b.charCodeAt(i) | 0);
+  return diff === 0 && a.length > 0;
+}
+
 async function loadActiveDevice(boards, ownerId) {
   const raw = await friendGet(boards, friendKvKey("device", ownerId));
   if (typeof raw !== "string" || raw.length === 0) return null;
@@ -312,7 +321,7 @@ export async function activeDeviceRefusal(request, boards, ownerId, cors) {
   const active = await loadActiveDevice(boards, ownerId);
   if (!active) return null;
   const token = readDeviceToken(request);
-  if (token && (await sha256Hex(DEVICE_TOKEN_HASH_PREFIX + token)) === active.tokenHash) return null;
+  if (token && hashesEqual(await sha256Hex(DEVICE_TOKEN_HASH_PREFIX + token), active.tokenHash)) return null;
   return friendJson(409, { error: "device_not_active", claimedAt: active.claimedAt }, cors);
 }
 
@@ -332,7 +341,7 @@ async function claimDevice(request, env, cors) {
   if (limited) return limited;
   const tokenHash = await sha256Hex(DEVICE_TOKEN_HASH_PREFIX + token);
   const prior = await loadActiveDevice(boards, caller.ownerId);
-  if (prior && prior.tokenHash === tokenHash) return friendJson(200, { ok: true, active: true, moved: false, claimedAt: prior.claimedAt }, cors);
+  if (prior && hashesEqual(prior.tokenHash, tokenHash)) return friendJson(200, { ok: true, active: true, moved: false, claimedAt: prior.claimedAt }, cors);
   const claimedAt = Date.now();
   await friendPut(boards, friendKvKey("device", caller.ownerId), JSON.stringify({ tokenHash, claimedAt }));
   // A move drops the other phone's live row, so friends never see two rounds.
@@ -350,7 +359,7 @@ async function readDevice(request, env, cors) {
   const active = await loadActiveDevice(boards, caller.ownerId);
   if (!active) return friendJson(200, { claimed: false, active: true }, cors);
   const token = readDeviceToken(request);
-  const mine = Boolean(token) && (await sha256Hex(DEVICE_TOKEN_HASH_PREFIX + token)) === active.tokenHash;
+  const mine = Boolean(token) && hashesEqual(await sha256Hex(DEVICE_TOKEN_HASH_PREFIX + token), active.tokenHash);
   return friendJson(200, { claimed: true, active: mine, claimedAt: active.claimedAt }, cors);
 }
 
@@ -1103,6 +1112,8 @@ async function registerPushToken(request, env, cors) {
   if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
   const caller = await loadCaller(boards, friendKey);
   if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const refused = await activeDeviceRefusal(request, boards, caller.ownerId, cors);
+  if (refused) return refused;
   await friendPut(boards, friendKvKey("push", caller.ownerId), token);
   return friendJson(200, { ok: true }, cors);
 }
@@ -1117,6 +1128,8 @@ async function removePushToken(request, env, cors) {
   if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
   const caller = await loadCaller(boards, friendKey);
   if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const refused = await activeDeviceRefusal(request, boards, caller.ownerId, cors);
+  if (refused) return refused;
   await deleteIfPresent(boards, friendKvKey("push", caller.ownerId));
   return friendJson(200, { ok: true }, cors);
 }
