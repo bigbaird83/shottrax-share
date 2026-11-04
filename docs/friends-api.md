@@ -110,13 +110,21 @@ Stored at `fr:live:<ownerId>` with `updatedAt`, and replaced on every update. KV
 
 `POST /v1/friends/live/stop` (empty body) deletes your row, including every shot location: at round finish, when the switch is turned off, or when "Friends can follow" is tapped. `PUT` with `{ "finished": true }` does the same delete. `200` `{ "ok": true }`.
 
+### registerPushToken / removePushToken (friend live-round alerts)
+
+`PUT /v1/friends/push` with `{ "token": "ExponentPushToken[...]" }` stores the caller's Expo push token, linked to the caller's `ownerId` (friend code). The phone sends it only when notifications are allowed and "Friend live-round alerts" is on. Any other field, or a token that is not an Expo push token, is `400` `{ "error": "invalid_body" }`. A second PUT replaces the token. `200` `{ "ok": true }`.
+
+`POST /v1/friends/push/remove` (empty body) deletes the caller's token. The phone calls it when "Friend live-round alerts" is turned off. A friend with no stored token has opted out and gets no alert. `200` `{ "ok": true }`.
+
+`putLive` may carry an optional `roundId` (1–64 of `A-Z a-z 0-9 _ -`). The first `PUT` for a `roundId` that has a marked tee shot (shot `n` 1 in top-level `shots` or in any hole's `shots`; never round open, and a scored hole with no marked shot does not count) sends one alert through Expo's push service (`https://exp.host/--/api/v2/push/send`) to each accepted friend both ways, not blocked either way, who has a token: title "<name> is live on the course", body "Started a round at <course>. Tap to follow along." `<name>` is the owner's invite name, or "A friend". A `fr:pushsent:<ownerId>:<roundId>` marker is written before the send, so later `PUT`s for that round never send again. Practice and Test rounds are refused before this step. A send failure does not fail the live `PUT`. An `EXPO_ACCESS_TOKEN` secret, when set, is sent as a bearer token.
+
 ### claimDevice / readDevice (two-phone guard)
 
 `POST /v1/friends/device/claim` with headers `X-Friend-Key` and `X-Device-Token`, body `{}` or empty. The device token is a random string the phone makes, 32–128 characters of `A-Z a-z 0-9 _ -`. The last claim wins ("Move it to this iPhone"). `200` `{ "ok": true, "active": true, "moved": <bool>, "claimedAt": <ms> }`. `moved` is `true` when another token was active; that move deletes `fr:live:<ownerId>`. Claiming the token that is already active changes nothing. A missing or bad token is `400` `{ "error": "device_token_required" }`; any body field is `400` `{ "error": "invalid_body" }`. Rate limited on the `iplive:` IP counter.
 
 `GET /v1/friends/device` with `X-Friend-Key` and optional `X-Device-Token`: `200` `{ "claimed": false, "active": true }` when the key never claimed, otherwise `{ "claimed": true, "active": <this token is the active one>, "claimedAt": <ms> }`.
 
-Once a key has claimed, `PUT /v1/friends/live` (including `finished: true`) and `POST /v1/friends/live/stop` need `X-Device-Token` equal to the active token. Any other or missing token is `409` `{ "error": "device_not_active", "claimedAt": <ms> }` and nothing is written or deleted. A key that never claimed is not checked, so older apps keep working.
+Once a key has claimed, `PUT /v1/friends/live` (including `finished: true`), `POST /v1/friends/live/stop`, `PUT /v1/friends/push` and `POST /v1/friends/push/remove` need `X-Device-Token` equal to the active token. Any other or missing token is `409` `{ "error": "device_not_active", "claimedAt": <ms> }` and nothing is written or deleted. A key that never claimed is not checked, so older apps keep working.
 
 ### setPastRounds
 
@@ -458,6 +466,9 @@ Friend rows use the `fr:` prefix only. The keys this API writes are:
 - `fr:ownname:<ownerId>` — the same invite name keyed by owner, written and cleared by setInviteName, deleted by resetCode. listFriends and listRequests return it as optional `name`. Names set before this key existed appear once the owner saves their invite name again.
 - `fr:device:<ownerId>` — `{ "tokenHash", "claimedAt" }`, the SHA-256 of the active device token. No raw token. No `expirationTtl`.
 - `fr:live:<ownerId>` — that owner's live round, one JSON value, `expirationTtl` of 30 minutes from the last `PUT`. Shot lat/lon live only inside this value. Deleted by `POST /v1/friends/live/stop`, by `PUT` with `finished: true`, and by a follower read that finds the row older than 30 minutes.
+
+- `fr:push:<ownerId>` — that owner's Expo push token, a plain string. Deleted by `POST /v1/friends/push/remove`.
+- `fr:pushsent:<ownerId>:<roundId>` — `sent`, the one-alert-per-round marker, `expirationTtl` of 7 days.
 
 None of these routes read or write `id:`, `name:`, `osm:`, `gq:`, `gapi:`, `gqueue:`, `gca:`, or `cr:`. `GET /v1/friends/requests` and `GET /v1/friends/list` do not `put` or `delete` any KV key. The only mutation on those calls is the Durable Object attempt counter. Board `GET`, `PUT`, and `DELETE` reserve the `fr:` prefix and return `400` with no KV read or write. That includes a percent-encoded path (`fr%3A` and `fr%3a`), so a board path cannot read, replace, or forge a friend row. Guess counts live in the Durable Object, not in KV.
 

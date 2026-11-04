@@ -65,7 +65,7 @@ export const LIVE_SHOT_RESULTS = ["fairway", "rough", "sand", "green", "holed", 
 /** Shot lat/lon are stored and served at 5 decimal places (about 1 m). */
 export const LIVE_COORD_DECIMALS = 5;
 const LIVE_COORD_SCALE = 10 ** LIVE_COORD_DECIMALS;
-const LIVE_ROUND_FIELDS = ["courseName", "hole", "holes", "shots", "skippedHoles", "roundStats", "clubAverages", "roundKind", "finished", "scramble"];
+const LIVE_ROUND_FIELDS = ["roundId", "courseName", "hole", "holes", "shots", "skippedHoles", "roundStats", "clubAverages", "roundKind", "finished", "scramble"];
 const LIVE_PUTT_CLUB = "Putt";
 /** Scramble team sizes (ShotTraxx src/domain/scramble.ts SCRAMBLE_SIZES). */
 export const SCRAMBLE_SIZES = Object.freeze([2, 3, 4]);
@@ -266,6 +266,8 @@ const FRIEND_ROUTES = {
   "/v1/friends/rounds": { PUT: publishRound, GET: fetchRounds },
   "/v1/friends/rounds/delete": { POST: deleteRounds },
   "/v1/friends/past": { PUT: setPastRounds },
+  "/v1/friends/push": { PUT: registerPushToken },
+  "/v1/friends/push/remove": { POST: removePushToken },
   "/v1/friends/device/claim": { POST: claimDevice },
   "/v1/friends/device": { GET: readDevice },
 };
@@ -290,6 +292,15 @@ function readDeviceToken(request) {
   return DEVICE_TOKEN_RE.test(token) ? token : null;
 }
 
+/** Constant-time compare of two hex hashes: no early exit on the first differing char. */
+function hashesEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const len = Math.max(a.length, b.length);
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < len; i += 1) diff |= (a.charCodeAt(i) | 0) ^ (b.charCodeAt(i) | 0);
+  return diff === 0 && a.length > 0;
+}
+
 async function loadActiveDevice(boards, ownerId) {
   const raw = await friendGet(boards, friendKvKey("device", ownerId));
   if (typeof raw !== "string" || raw.length === 0) return null;
@@ -310,7 +321,7 @@ export async function activeDeviceRefusal(request, boards, ownerId, cors) {
   const active = await loadActiveDevice(boards, ownerId);
   if (!active) return null;
   const token = readDeviceToken(request);
-  if (token && (await sha256Hex(DEVICE_TOKEN_HASH_PREFIX + token)) === active.tokenHash) return null;
+  if (token && hashesEqual(await sha256Hex(DEVICE_TOKEN_HASH_PREFIX + token), active.tokenHash)) return null;
   return friendJson(409, { error: "device_not_active", claimedAt: active.claimedAt }, cors);
 }
 
@@ -330,7 +341,7 @@ async function claimDevice(request, env, cors) {
   if (limited) return limited;
   const tokenHash = await sha256Hex(DEVICE_TOKEN_HASH_PREFIX + token);
   const prior = await loadActiveDevice(boards, caller.ownerId);
-  if (prior && prior.tokenHash === tokenHash) return friendJson(200, { ok: true, active: true, moved: false, claimedAt: prior.claimedAt }, cors);
+  if (prior && hashesEqual(prior.tokenHash, tokenHash)) return friendJson(200, { ok: true, active: true, moved: false, claimedAt: prior.claimedAt }, cors);
   const claimedAt = Date.now();
   await friendPut(boards, friendKvKey("device", caller.ownerId), JSON.stringify({ tokenHash, claimedAt }));
   // A move drops the other phone's live row, so friends never see two rounds.
@@ -348,7 +359,7 @@ async function readDevice(request, env, cors) {
   const active = await loadActiveDevice(boards, caller.ownerId);
   if (!active) return friendJson(200, { claimed: false, active: true }, cors);
   const token = readDeviceToken(request);
-  const mine = Boolean(token) && (await sha256Hex(DEVICE_TOKEN_HASH_PREFIX + token)) === active.tokenHash;
+  const mine = Boolean(token) && hashesEqual(await sha256Hex(DEVICE_TOKEN_HASH_PREFIX + token), active.tokenHash);
   return friendJson(200, { claimed: true, active: mine, claimedAt: active.claimedAt }, cors);
 }
 
@@ -997,6 +1008,9 @@ async function putLive(request, env, cors) {
   if (isPracticeOrTest(body)) return friendJson(400, { error: "practice_or_test" }, cors);
   if (!validCourseName(body.courseName)) return friendJson(400, { error: "invalid_body" }, cors);
   if (!Number.isInteger(body.hole) || body.hole < 1 || body.hole > 18) return friendJson(400, { error: "invalid_body" }, cors);
+  if (Object.hasOwn(body, "roundId") && (typeof body.roundId !== "string" || !ROUND_ID_RE.test(body.roundId))) {
+    return friendJson(400, { error: "invalid_body" }, cors);
+  }
   if (!Array.isArray(body.holes) || body.holes.length > 18) return friendJson(400, { error: "invalid_body" }, cors);
   const holes = [];
   const seen = new Set();
@@ -1061,7 +1075,103 @@ async function putLive(request, env, cors) {
   await friendPut(boards, friendKvKey("live", caller.ownerId), JSON.stringify(row), {
     expirationTtl: Math.ceil(FRIEND_LIVE_TTL_MS / 1000),
   });
+  // Only once a tee shot is marked (shot n 1 on any hole), never on round open and never for a
+  // scored hole with no marked shot (Brian, Oct 31 2026). One alert per round.
+  if (typeof body.roundId === "string" && hasMarkedTeeShot(currentShots, holes)) {
+    await sendLiveRoundAlertOnce(env, boards, caller.ownerId, body.roundId, body.courseName);
+  }
   return friendJson(200, { ok: true }, cors);
+}
+
+/** A marked tee shot: shot number 1 on the current hole or on any sent hole. */
+function hasMarkedTeeShot(currentShots, holes) {
+  const isTee = (shot) => shot && shot.n === 1;
+  if (Array.isArray(currentShots) && currentShots.some(isTee)) return true;
+  return holes.some((hole) => Array.isArray(hole.shots) && hole.shots.some(isTee));
+}
+
+/**
+ * Friend live-round alerts. A phone stores one Expo push token, linked to its
+ * ownerId (friend code), while notifications are allowed and the switch is on.
+ * Turning the switch off removes it, so a friend with no token has opted out.
+ */
+export const EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send";
+export const PUSH_SENT_TTL_SECONDS = 7 * 24 * 60 * 60;
+const EXPO_PUSH_BATCH = 100;
+const PUSH_TOKEN_RE = /^(ExponentPushToken|ExpoPushToken)\[[A-Za-z0-9_-]{1,128}\]$/;
+
+async function registerPushToken(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const parsed = await readJsonObject(request, FRIEND_BODY_LIMIT, false);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (unknownFields(parsed.value, ["token"])) return friendJson(400, { error: "invalid_body" }, cors);
+  const token = parsed.value.token;
+  if (typeof token !== "string" || !PUSH_TOKEN_RE.test(token)) return friendJson(400, { error: "invalid_body" }, cors);
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const refused = await activeDeviceRefusal(request, boards, caller.ownerId, cors);
+  if (refused) return refused;
+  await friendPut(boards, friendKvKey("push", caller.ownerId), token);
+  return friendJson(200, { ok: true }, cors);
+}
+
+async function removePushToken(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const parsed = await readJsonObject(request, FRIEND_BODY_LIMIT, true);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (!parsed.empty && unknownFields(parsed.value, [])) return friendJson(400, { error: "invalid_body" }, cors);
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const refused = await activeDeviceRefusal(request, boards, caller.ownerId, cors);
+  if (refused) return refused;
+  await deleteIfPresent(boards, friendKvKey("push", caller.ownerId));
+  return friendJson(200, { ok: true }, cors);
+}
+
+/**
+ * One alert per round: the sent marker is written before the send, so a repeat
+ * PUT for the same roundId never sends again. Blocked either way, not friends,
+ * or no token (opted out) is skipped. A send failure never fails the live PUT.
+ */
+async function sendLiveRoundAlertOnce(env, boards, ownerId, roundId, courseName) {
+  const sentKey = friendKvKey("pushsent", `${ownerId}:${roundId}`);
+  const already = await friendGet(boards, sentKey);
+  if (typeof already === "string" && already.length > 0) return;
+  await friendPut(boards, sentKey, "sent", { expirationTtl: PUSH_SENT_TTL_SECONDS });
+  const me = await withOwnerName(boards, ownerId);
+  const name = me.name || "A friend";
+  const messages = [];
+  for (const friendId of await loadFriendIds(boards, ownerId)) {
+    if (!(await areFriends(boards, friendId, ownerId))) continue;
+    if (await hasBlock(boards, friendId, ownerId)) continue;
+    if (await hasBlock(boards, ownerId, friendId)) continue;
+    const token = await friendGet(boards, friendKvKey("push", friendId));
+    if (typeof token !== "string" || !PUSH_TOKEN_RE.test(token)) continue;
+    messages.push({
+      to: token,
+      title: `${name} is live on the course`,
+      body: `Started a round at ${courseName}. Tap to follow along.`,
+      sound: "default",
+      data: { kind: "friend_live", ownerId },
+    });
+  }
+  const headers = { "Content-Type": "application/json", Accept: "application/json" };
+  if (typeof env.EXPO_ACCESS_TOKEN === "string" && env.EXPO_ACCESS_TOKEN.length > 0) {
+    headers.Authorization = `Bearer ${env.EXPO_ACCESS_TOKEN}`;
+  }
+  for (let i = 0; i < messages.length; i += EXPO_PUSH_BATCH) {
+    try {
+      await fetch(EXPO_PUSH_URL, { method: "POST", headers, body: JSON.stringify(messages.slice(i, i + EXPO_PUSH_BATCH)) });
+    } catch {
+      // Best effort: the live row is already stored.
+    }
+  }
 }
 
 /** Round finished: drop the live row and every shot location stored on it. */
@@ -1920,6 +2030,8 @@ function friendKvKey(kind, id) {
     kind !== "invphoto" &&
     kind !== "ownname" &&
     kind !== "live" &&
+    kind !== "push" &&
+    kind !== "pushsent" &&
     kind !== "device"
   ) {
     throw new Error("friend_namespace");
