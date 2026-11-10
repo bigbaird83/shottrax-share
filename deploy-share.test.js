@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { describe, test } from 'vitest';
 import { GolfapiCounter, pinsFromUrl, terrainPinHash } from './golf-proxy.js';
+import { resetCourseCardInflightForTests } from './course-card.js';
 import { stockpileKeys } from './golf-stockpile.js';
 import worker from './entry.js';
 import live from './live-shottrax-share.js';
@@ -151,7 +152,7 @@ function baseEnv(extra = {}) {
       GOLFAPI_INSTALL_DAILY_CALL_BACKSTOP: '20',
       GOLFAPI_DAILY_CAP: '150',
       GOLFAPI_MONTHLY_CAP: '450',
-      GOLFAPI_CREDIT_FLOOR: '50',
+      GOLFAPI_CREDIT_FLOOR: '156',
       TERRAIN_INSTALL_DAILY_CAP: '54',
       TERRAIN_MAX_GRID_POINTS: '6000',
       ...extra,
@@ -229,10 +230,10 @@ describe('shottrax-share deploy wrapper', { concurrency: 1 }, () => {
     }
   });
 
-  test('migrated gq:balance is the key the module uses for the 50-credit floor', async () => {
+  test('migrated gq:balance is the key the module uses for the 156-credit floor', async () => {
     const recorder = installFetchRecorder();
     const { env, kv } = baseEnv();
-    kv.store.set('gq:balance', { value: JSON.stringify({ left: 50 }) });
+    kv.store.set('gq:balance', { value: JSON.stringify({ left: 156 }) });
     try {
       const blocked = await entryFetch(`/golfapi/v2.3/courses/${COURSE_ID}`, env, {
         headers: { 'X-Install-Id': 'id_phone', 'X-ShotTraxx-Storefront': 'US' },
@@ -242,7 +243,7 @@ describe('shottrax-share deploy wrapper', { concurrency: 1 }, () => {
       assert.equal(body.error, 'golfapi_limited');
       assert.equal(body.reason, 'floor');
       assert.equal(recorder.calls.some((call) => call.url.includes('golfapi.io')), false);
-      kv.store.set('gq:balance', { value: JSON.stringify({ left: 51 }) });
+      kv.store.set('gq:balance', { value: JSON.stringify({ left: 157 }) });
       recorder.calls.length = 0;
       const allowed = await entryFetch('/golfapi/v2.3/courses?country=US&name=Augusta', env, {
         headers: { 'X-Install-Id': 'id_phone', 'X-ShotTraxx-Storefront': 'US' },
@@ -715,6 +716,58 @@ describe('shottrax-share deploy wrapper', { concurrency: 1 }, () => {
     } finally {
       recorder.restore();
     }
+  });
+
+  test('course-card route stores a fixture course and the digest requires the admin key', async () => {
+    resetCourseCardInflightForTests();
+    const { env } = baseEnv({ ALERT_ADMIN_TOKEN: 'test-admin-key' });
+    const card = {
+      source: 'golfapi',
+      count: 1,
+      holes: [
+        {
+          hole: 1,
+          tee: { lat: 35.523295, lng: -92.04 },
+          green: { lat: 35.52, lng: -92.04 },
+          par: 4,
+          yards: 401,
+        },
+      ],
+      outline: [
+        [35.51, -92.05],
+        [35.51, -92.03],
+        [35.53, -92.03],
+        [35.53, -92.05],
+      ],
+    };
+    const put = await entryFetch('/course-card/v1/fixture-course', env, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(card),
+    });
+    assert.equal(put.status, 200);
+    const published = await put.json();
+    assert.equal(published.published, true);
+    assert.equal(published.credits, 0);
+    const got = await entryFetch('/course-card/v1/fixture-course', env);
+    assert.equal(got.status, 200);
+    const body = await got.json();
+    assert.equal(body.credits, 0);
+    assert.equal(body.mapped, true);
+    assert.equal(body.card.holes[0].tee.lat, 35.523295);
+    assert.equal(body.card.holes[0].green.lat, 35.52);
+    assert.equal(body.card.holes[0].par, 4);
+    assert.equal(body.card.holes[0].yards, 401);
+    const denied = await entryFetch('/admin/greens-no-tees-digest', env);
+    assert.equal(denied.status, 401);
+    const digest = await entryFetch('/admin/greens-no-tees-digest', env, {
+      headers: { 'X-Admin-Token': 'test-admin-key' },
+    });
+    assert.equal(digest.status, 200);
+    const listed = await digest.json();
+    assert.equal(listed.credits, 0);
+    assert.equal(listed.published, 1);
+    assert.deepEqual(listed.courses, ['fixture-course']);
   });
 
 

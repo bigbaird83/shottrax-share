@@ -1297,6 +1297,52 @@ describe('golf proxy worker', { concurrency: 1 }, () => {
     }
   });
 
+  test('the credit floor keeps 156 after a course pull and a search', async () => {
+    const fake = installFakes();
+    try {
+      const env = baseEnv(fake);
+      const course = '/golfapi/v2.3/courses/floor-course';
+      const search = '/golfapi/v2.3/courses?name=Floor&country=US';
+      async function attempt(path, left) {
+        await fake.kv.put('gq:balance', JSON.stringify({ left, at: 1, lastStatus: 200 }));
+        fake.calls.length = 0;
+        let fetched = false;
+        globalThis.fetch = async () => {
+          fetched = true;
+          throw new Error('floor must not fetch');
+        };
+        const response = await proxy(path, env, usHeaders());
+        return { status: response.status, reason: (await bodyOf(response)).reason, fetched };
+      }
+      for (const path of [course, search]) {
+        const atFloor = await attempt(path, 156);
+        assert.equal(atFloor.status, 429, path);
+        assert.equal(atFloor.reason, 'floor', path);
+        assert.equal(atFloor.fetched, false, path);
+      }
+      const under = await attempt(course, 156.4);
+      assert.equal(under.status, 429);
+      assert.equal(under.reason, 'floor');
+      assert.equal(under.fetched, false);
+
+      await fake.kv.put('gq:balance', JSON.stringify({ left: 157, at: 1, lastStatus: 200 }));
+      fake.calls.length = 0;
+      golfJson(fake, { courseID: 'floor-course', country: 'US', apiRequestsLeft: 156 });
+      const courseOk = await proxy(course, env, usHeaders());
+      assert.equal(courseOk.status, 200);
+      assert.equal(fake.calls.length, 1);
+
+      await fake.kv.put('gq:balance', JSON.stringify({ left: 157, at: 1, lastStatus: 200 }));
+      fake.calls.length = 0;
+      golfJson(fake, { courses: [{ courseID: 'floor-search', courseName: 'Floor', country: 'US' }], apiRequestsLeft: 156.9 });
+      const searchOk = await proxy(search, env, usHeaders());
+      assert.equal(searchOk.status, 200);
+      assert.equal(fake.calls.length, 1);
+    } finally {
+      fake.restore();
+    }
+  });
+
   test('an unknown golfapi balance allows the paid call', async () => {
     const fake = installFakes();
     try {
@@ -1371,11 +1417,11 @@ describe('golf proxy worker', { concurrency: 1 }, () => {
   test('the last-seen balance updates from a golfapi reply', async () => {
     const fake = installFakes();
     try {
-      golfJson(fake, { courseID: 'c1', country: 'US', apiRequestsLeft: '80' });
+      golfJson(fake, { courseID: 'c1', country: 'US', apiRequestsLeft: '200' });
       const response = await proxy('/golfapi/v2.3/courses/c1', baseEnv(fake), usHeaders());
       assert.equal(response.status, 200);
       const stored = JSON.parse(fake.kv.store.get('gq:balance').value);
-      assert.equal(stored.left, 80);
+      assert.equal(stored.left, 200);
       assert.equal(stored.lastStatus, 200);
       assert.equal(typeof stored.at, 'number');
       const put = fake.kv.puts.find((row) => row.key === 'gq:balance');
@@ -1724,7 +1770,9 @@ describe('golf proxy worker', { concurrency: 1 }, () => {
     assert.match(src, /const DEFAULT_APP_MONTHLY = 450/);
     assert.match(src, /const DEFAULT_TERRAIN_DAILY = 54/);
     assert.match(src, /export const MAX_GRID_POINTS = 6000/);
-    assert.match(src, /const DEFAULT_CREDIT_FLOOR = 50/);
+    assert.match(src, /golfApiSpendBreaksFloor\(balance\.left, callCost, floor\)/);
+    const floorSrc = readFileSync(new URL('./src/course/golfApiCreditFloor.mjs', import.meta.url), 'utf8');
+    assert.match(floorSrc, /export const GOLFAPI_CREDIT_FLOOR = 156/);
     assert.match(src, /GOLFAPI_DAILY_CAP=300/);
     assert.match(src, /GOLFAPI_MONTHLY_CAP=1800/);
     assert.match(src, /GOLFAPI_CREDIT_FLOOR/);
@@ -2343,7 +2391,7 @@ describe('terrain route', { concurrency: 1 }, () => {
       assert.match(box.sent[0].raw, /apiRequestsLeft 281/);
       assert.match(box.sent[0].raw, /Worker count this cycle: 0\.1\/450/);
       assert.match(box.sent[0].raw, /Today: 0\.1\/150/);
-      assert.match(box.sent[0].raw, /Credits left before the floor: 231/);
+      assert.match(box.sent[0].raw, /Credits left before the floor: 125/);
       assert.equal(box.sent[0].to, 'shottraxx@gmail.com');
       assert.equal(box.sent[0].from, 'alerts@shottraxx.com');
       assert.equal(fake.calls.length, 1);

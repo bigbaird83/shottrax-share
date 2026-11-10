@@ -28,7 +28,9 @@ function isPrPath(p) {
     p.startsWith("/terrain/") ||
     p === "/admin/alert-test" ||
     p === "/admin/demand" ||
-    p === "/admin/stockpile"
+    p === "/admin/stockpile" ||
+    p.startsWith("/course-card/") ||
+    p === "/admin/greens-no-tees-digest"
   );
 }
 

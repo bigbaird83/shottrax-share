@@ -71,7 +71,11 @@ GOLFAPI_INSTALL_DAILY_SEARCHES = "30"
 GOLFAPI_INSTALL_DAILY_CALL_BACKSTOP = "20"
 GOLFAPI_DAILY_CAP = "500"
 GOLFAPI_MONTHLY_CAP = "3500"
-GOLFAPI_CREDIT_FLOOR = "50"
+# Never-expire reserve. A paid call is refused when it would leave
+# apiRequestsLeft below this, including allowlisted installs. Landing on
+# 156 is allowed. The allowlist still skips the per-phone limits and the
+# 500/3500 caps. Unknown balance does not block. KV and edge hits ignore it.
+GOLFAPI_CREDIT_FLOOR = "156"
 GOLFAPI_PLAN_MONTHLY = "4000"
 GOLFAPI_CYCLE_DAY = "5"
 GOLFAPI_ROLLOVER_CREDITS = "156"

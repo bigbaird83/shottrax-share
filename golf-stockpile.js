@@ -3,9 +3,9 @@
  * OSM does not already cover. Disabled until GOLFAPI_STOCKPILE_ENABLED is true.
  *
  * golfapi spends the monthly allowance before the never-expire balance, so the
- * stop line is GOLFAPI_ROLLOVER_CREDITS (the never-expire balance). The 50-credit
- * floor sits under that balance; this job does not treat the floor as extra
- * headroom on top of the rollover. The window is the last 7 nights before
+ * stop line is GOLFAPI_ROLLOVER_CREDITS (the never-expire balance, 156).
+ * Golfer spend uses that same 156 and must leave it unspent. This job does
+ * not treat a lower floor as extra headroom on top of the rollover. The window is the last 7 nights before
  * renewal at 23:00 UTC. GOLFAPI_STOCKPILE_MAX_DAYS is 7 and is clamped
  * there. Each of those nights spends
  * (live balance - rollover) / nights still left in the window, including
