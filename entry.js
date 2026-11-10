@@ -7,10 +7,12 @@ import live from "./live-shottrax-share.js";
 import { coverageFromOverlayResponse, handleGolfProxy, GolfapiCounter, runGolfapiStockpile, STOCKPILE_CRON } from "./golf-proxy.js";
 import { FriendGuessLimiter, handleFriends, isFriendPath } from "./friends.js";
 import { LeagueRoster, handleLeagues, isLeaguePath } from "./leagues.js";
+import { SharedGame, handleSharedGames, isSharedGamePath } from "./shared-games.js";
 
 export { GolfapiCounter };
 export { FriendGuessLimiter };
 export { LeagueRoster };
+export { SharedGame };
 
 function friendCors() {
   return {
@@ -153,6 +155,11 @@ export default {
       const cors = friendCors();
       if (request.method === "OPTIONS") return new Response(null, { headers: cors });
       return handleLeagues(request, url, env, cors);
+    }
+    if (isSharedGamePath(pathname)) {
+      const cors = friendCors();
+      if (request.method === "OPTIONS") return new Response(null, { headers: cors });
+      return handleSharedGames(request, url, env, cors);
     }
     if (request.method !== "OPTIONS" && friendGolfapiBlocked(pathname, url)) {
       return withLiveCors(new Response(JSON.stringify({ error: "unknown_route" }), {

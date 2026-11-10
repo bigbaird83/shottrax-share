@@ -32,6 +32,14 @@ class_name = "FriendGuessLimiter"
 name = "LEAGUES"
 class_name = "LeagueRoster"
 
+# Shared scorecard: one SQLite Durable Object per game holds the roster,
+# the score cells, and every edit. A score write compare-and-sets rev in
+# one transaction, so parallel writes to one cell cannot both win.
+# Not deployed until Brian approves it. No new secrets and no new vars.
+[[durable_objects.bindings]]
+name = "SHARED_GAMES"
+class_name = "SharedGame"
+
 [[migrations]]
 tag = "v1-golfapi-counter"
 new_sqlite_classes = ["GolfapiCounter"]
@@ -43,6 +51,10 @@ new_sqlite_classes = ["FriendGuessLimiter"]
 [[migrations]]
 tag = "v3-league-roster"
 new_sqlite_classes = ["LeagueRoster"]
+
+[[migrations]]
+tag = "v4-shared-game"
+new_sqlite_classes = ["SharedGame"]
 
 [[send_email]]
 name = "ALERT_EMAIL"
