@@ -28,9 +28,9 @@ Lookup allows 8 guesses per friend key and 24 per IP hash per 60 minutes. The 8-
 
 ## Shared scorecard
 
-`POST /v1/shared-games`, `GET /v1/shared-games/:gameId`, and `POST /v1/shared-games/:gameId/scores` serve the shared card. Auth is the same `X-Friend-Key`. One SQLite Durable Object per game (`SharedGame`, binding `SHARED_GAMES`) holds the roster, the cells, and every edit. A score write compare-and-sets `rev` in that object. The card is not stored in `BOARDS`. Responses never include a wager key. The route list, the caps, and the error names are in `docs/shared-games-api.md`.
+`POST /v1/shared-games`, `GET /v1/shared-games/:gameId`, and `POST /v1/shared-games/:gameId/scores` serve the shared card. Auth is the same `X-Friend-Key`. One SQLite Durable Object per game (`SharedGame`, binding `SHARED_GAMES`) holds the roster, the cells, every edit, and the wager rows. A score write compare-and-sets `rev` in that object. The card is not stored in `BOARDS`. Wager fields are returned only to a caller whose install id is on the game's allowlist. That table stores install ids only. Everyone else who can read the card gets it with no wager keys at all. Friends Board, the group feed, live follow, share image, share page, league standings, league members, and exports follow the same exclusion. The route list, the caps, and the error names are in `docs/shared-games-api.md`.
 
-This is not deployed. A deploy is still a manual `npx wrangler deploy` approved by Brian. The change adds the `v4-shared-game` migration only. It does not add a secret or a `[vars]` entry.
+This is not deployed. A deploy is still a manual `npx wrangler deploy` approved by Brian. The shared card added the `v4-shared-game` migration only. Wagers add tables inside that existing class. They do not add a migration, a secret, or a `[vars]` entry.
 
 ## Live board web page
 

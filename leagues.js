@@ -37,6 +37,7 @@ import {
   validCourseName,
   validPlayedOn,
 } from "./friends.js";
+import { stripWagerKeys } from "./wager-keys.js";
 
 /** Screens 2, 8, 9, 14: "Up to 20 players", "14 / 20". Owner included. */
 export const LEAGUE_MAX_PLAYERS = 20;
@@ -213,7 +214,7 @@ async function listMembers(request, url, env, cors) {
     const current = readInviteName(await friendGet(ready.boards, friendKvKey("ownname", member.memberId)));
     members.push({ ...member, name: current || member.name });
   }
-  return friendJson(200, { league: answer.league, code: answer.code, members }, cors);
+  return friendJson(200, stripWagerKeys({ league: answer.league, code: answer.code, members }), cors);
 }
 
 /** GET ?league=<id>. Members only. Derived from finished round results; never stored. */
@@ -232,7 +233,7 @@ async function getStandings(request, url, env, cors) {
     rounds: answer.rounds,
   });
   const rows = table.rows.map((row) => ({ ...row, name: names.get(row.memberId) || null }));
-  return friendJson(200, { season: table.season, rounds: table.rounds, rows }, cors);
+  return friendJson(200, stripWagerKeys({ season: table.season, rounds: table.rounds, rows }), cors);
 }
 
 /**

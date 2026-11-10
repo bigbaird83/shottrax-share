@@ -22,7 +22,12 @@
  * code lookup returns it and resetCode deletes it. setPastRounds gives one
  * friend a pick of the caller's past rounds (private "to" audience inside
  * fr:rounds:); fetchRounds never returns a choice or an audience.
+ *
+ * SG-2: Friends Board and the group feed strip wager keys before they rank or
+ * list, and they reject a post that carries those keys. The live follow stream
+ * never returns wager data. Deleting a round also deletes wagers linked to it.
  */
+import { carriesWagerKeys, stripWagerKeys } from "./wager-keys.js";
 
 export const FRIEND_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 export const FRIEND_CODE_GUESS_LIMIT = 8;
@@ -281,6 +286,8 @@ const FRIEND_ROUTES = {
   "/v1/friends/remove": { POST: removeFriend },
   "/v1/friends/rounds": { PUT: publishRound, GET: fetchRounds },
   "/v1/friends/rounds/delete": { POST: deleteRounds },
+  "/v1/friends/board": { GET: fetchBoard, POST: rejectWagerPost },
+  "/v1/friends/feed": { GET: fetchFeed, POST: rejectWagerPost },
   "/v1/friends/past": { PUT: setPastRounds },
   "/v1/friends/push": { PUT: registerPushToken },
   "/v1/friends/push/remove": { POST: removePushToken },
@@ -837,6 +844,7 @@ async function publishRound(request, env, cors) {
   if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
   const parsed = await readJsonObject(request, PUBLISH_BODY_LIMIT, false);
   if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (carriesWagerKeys(parsed.value)) return friendJson(400, { error: "wager_rejected" }, cors);
   if (unknownFields(parsed.value, ["share", "round"])) return friendJson(400, { error: "invalid_body" }, cors);
   if (!Object.hasOwn(parsed.value, "share") || !Object.hasOwn(parsed.value, "round")) {
     return friendJson(400, { error: "invalid_body" }, cors);
@@ -849,6 +857,8 @@ async function publishRound(request, env, cors) {
   if (share === false && round === null) {
     const limited = await consumeIpAction(request, env, "ippub:", cors);
     if (limited) return limited;
+    const existing = await loadOwnedRounds(boards, caller.ownerId);
+    await deleteWagersForRoundIds(env, existing.map((item) => item.id));
     await deleteOwnedRounds(boards, caller.ownerId);
     return friendJson(200, { ok: true }, cors);
   }
@@ -896,10 +906,13 @@ async function deleteRounds(request, env, cors) {
   if (limited) return limited;
   const drop = new Set(body.ids);
   const existing = await loadOwnedRounds(boards, caller.ownerId);
+  const removedRounds = existing.filter((round) => drop.has(round.id));
   const kept = existing.filter((round) => !drop.has(round.id));
-  const removed = existing.length - kept.length;
-  if (removed > 0) await saveOwnedRounds(boards, caller.ownerId, kept);
-  return friendJson(200, { ok: true, removed }, cors);
+  if (removedRounds.length > 0) {
+    await deleteWagersForRoundIds(env, removedRounds.map((round) => round.id));
+    await saveOwnedRounds(boards, caller.ownerId, kept);
+  }
+  return friendJson(200, { ok: true, removed: removedRounds.length }, cors);
 }
 
 async function listRequests(request, env, cors) {
@@ -1000,6 +1013,120 @@ async function fetchRounds(request, env, cors) {
 }
 
 /**
+ * Friends Board. Wager keys are stripped before the rounds are ranked.
+ * A post that carries them is rejected and stored nowhere.
+ */
+async function fetchBoard(request, env, cors) {
+  const ready = await readyReadCall(request, env, cors);
+  if (ready.error) return ready.error;
+  const raw = await collectRawRounds(ready.boards, ready.caller.ownerId);
+  return friendJson(200, { board: rankFriendsBoard(raw, ready.caller.ownerId) }, cors);
+}
+
+/** Group feed. Same strip-before-list rule, and the same rejection of a wager post. */
+async function fetchFeed(request, env, cors) {
+  const ready = await readyReadCall(request, env, cors);
+  if (ready.error) return ready.error;
+  const raw = await collectRawRounds(ready.boards, ready.caller.ownerId);
+  return friendJson(200, { feed: buildGroupFeed(raw, ready.caller.ownerId) }, cors);
+}
+
+async function rejectWagerPost(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const parsed = await readJsonObject(request, PUBLISH_BODY_LIMIT, false);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (carriesWagerKeys(parsed.value)) return friendJson(400, { error: "wager_rejected" }, cors);
+  return friendJson(400, { error: "invalid_body" }, cors);
+}
+
+async function collectRawRounds(boards, callerId) {
+  const raw = [...(await loadRawRounds(boards, callerId))];
+  for (const otherId of await loadFriendIds(boards, callerId)) {
+    if (!(await areFriends(boards, otherId, callerId))) continue;
+    if ((await hasBlock(boards, callerId, otherId)) || (await hasBlock(boards, otherId, callerId))) continue;
+    raw.push(...(await loadRawRounds(boards, otherId)));
+  }
+  return raw;
+}
+
+async function loadRawRounds(boards, ownerId) {
+  const raw = await friendGet(boards, friendKvKey("rounds", ownerId));
+  if (typeof raw !== "string" || raw.length === 0) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((item) => item && typeof item === "object" && !Array.isArray(item)) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Strip wager keys first, then keep board rounds and rank them by gross.
+ * A stored round that still has a wager key would not survive sanitizeRound,
+ * so this strip is what lets the round stay on the board without those keys.
+ */
+export function rankFriendsBoard(rawRounds, viewerId) {
+  // SG-2 exclusion: strip wager keys before the Friends Board is ranked.
+  const stripped = rawRounds.map((round) => stripWagerKeys(round));
+  const clean = [];
+  for (const round of stripped) {
+    const sanitized = sanitizeSharedRound(round, viewerId);
+    if (!sanitized || !sanitized.scramble || sanitized.scramble.board !== true) continue;
+    clean.push(sanitized);
+  }
+  clean.sort((a, b) => a.gross - b.gross || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  return clean.map((round, index) => {
+    const { to: _to, scrambleHash: _hash, ...rest } = round;
+    return { rank: index + 1, ...rest };
+  });
+}
+
+/** Strip wager keys first, then list the group feed. */
+export function buildGroupFeed(rawRounds, viewerId) {
+  const stripped = rawRounds.map((round) => stripWagerKeys(round));
+  const clean = [];
+  for (const round of stripped) {
+    const sanitized = sanitizeSharedRound(round, viewerId);
+    if (sanitized) clean.push(sanitized);
+  }
+  clean.sort(compareRounds);
+  return clean.map((round) => {
+    const { to: _to, scrambleHash: _hash, ...rest } = round;
+    return rest;
+  });
+}
+
+function sanitizeSharedRound(round, viewerId) {
+  if (!round || typeof round !== "object" || Array.isArray(round)) return null;
+  const ownerId = typeof round.ownerId === "string" ? round.ownerId : "";
+  const { to, scrambleHash, ...body } = round;
+  const sanitized = sanitizeRound(body, ownerId, true);
+  if (!sanitized) return null;
+  if (sanitized.scramble && typeof scrambleHash === "string" && /^[0-9a-f]{64}$/.test(scrambleHash)) {
+    sanitized.scrambleHash = scrambleHash;
+  }
+  if (Object.hasOwn(round, "to")) {
+    if (!Array.isArray(to)) return null;
+    const audience = [...new Set(to.filter((id) => typeof id === "string" && OWNER_ID_RE.test(id)))];
+    if (audience.length === 0) return null;
+    sanitized.to = audience;
+    if (ownerId !== viewerId && !audience.includes(viewerId)) return null;
+  }
+  return sanitized;
+}
+
+async function deleteWagersForRoundIds(env, roundIds) {
+  if (!roundIds || roundIds.length === 0) return;
+  const { deleteWagersForRounds } = await import("./shared-games.js");
+  await deleteWagersForRounds(env, roundIds);
+}
+
+/**
  * Your live round for friends. Body { courseName, hole, holes, shots? }.
  * Per-shot club, yards, s/e lat/lon, and the hole clubs list are kept for
  * followers even when clubAverages is false. fir, gir, and putts are omitted when roundStats is
@@ -1017,6 +1144,7 @@ async function putLive(request, env, cors) {
   if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
   const parsed = await readJsonObject(request, LIVE_BODY_LIMIT, false);
   if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (carriesWagerKeys(parsed.value)) return friendJson(400, { error: "wager_rejected" }, cors);
   const body = parsed.value;
   if (unknownFields(body, LIVE_ROUND_FIELDS)) return friendJson(400, { error: "invalid_body" }, cors);
   if (!validLiveFlags(body)) return friendJson(400, { error: "invalid_body" }, cors);
@@ -1256,6 +1384,7 @@ function readLiveRow(raw, now) {
     return null;
   }
   if (!value || typeof value !== "object") return null;
+  value = stripWagerKeys(value);
   if (!Number.isFinite(value.updatedAt) || now - value.updatedAt > FRIEND_LIVE_TTL_MS || value.updatedAt > now + 60_000) return null;
   if (!validCourseName(value.courseName) || !Number.isInteger(value.hole)) return null;
   const holes = Array.isArray(value.holes)

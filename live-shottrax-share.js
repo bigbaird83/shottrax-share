@@ -313,6 +313,13 @@ function str(value) {
 __name(str, "str");
 __name2(str, "str");
 function parseBoard(raw) {
+  function withoutMoney(text) {
+    if (typeof text !== "string") return text;
+    return text.split(String.fromCharCode(36)).join("");
+  }
+  function hidesSideGame(text) {
+    return typeof text === "string" && /wager|side[\s_-]?games?|\btally\b|settle/i.test(text);
+  }
   let value = raw;
   for (let depth = 0; depth < 6; depth += 1) {
     if (typeof value === "string") {
@@ -342,7 +349,7 @@ function parseBoard(raw) {
   let group = null;
   if (value.group && typeof value.group === "object" && Array.isArray(value.group.players)) {
     const players = value.group.players.filter((p) => p && typeof p === "object" && str(p.name)).map((p) => ({
-      name: p.name,
+      name: withoutMoney(p.name),
       handicap: num(p.handicap),
       holes: Array.isArray(p.holes) ? p.holes.filter((h) => h && num(h.hole) != null).map((h) => ({ hole: h.hole, score: num(h.score) })) : [],
       out: num(p.out),
@@ -352,10 +359,16 @@ function parseBoard(raw) {
     const results = Array.isArray(value.group.results) ? value.group.results.filter((r) => r && str(r.title) && Array.isArray(r.lines)).map((r) => ({ title: r.title, lines: r.lines.filter((line) => typeof line === "string") })) : [];
     if (players.length > 0) group = { players, results };
   }
+  if (group && Array.isArray(group.results)) {
+    group.results = group.results.map((block) => ({
+      title: withoutMoney(block.title),
+      lines: block.lines.map((line) => withoutMoney(line)).filter((line) => line.length > 0 && !hidesSideGame(line))
+    })).filter((block) => block.title && !hidesSideGame(block.title) && block.lines.length > 0);
+  }
   return {
-    courseName: str(value.courseName),
+    courseName: withoutMoney(str(value.courseName)),
     finished: value.finished === true,
-    live,
+    live: live ? { hole: live.hole, lastClubYards: live.lastClubYards ? withoutMoney(live.lastClubYards) : null } : null,
     holes,
     updatedAt: str(value.updatedAt),
     group

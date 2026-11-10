@@ -12,7 +12,14 @@
  * BOARDS stays the friend auth and block rows only, so a board GET cannot
  * read a score or a wager.
  *
- * Not deployed. A deploy needs Brian's OK. No new secrets and no new vars.
+ * SG-2 keeps wagers in this same object, in their own tables, keyed by the
+ * game. The allowlist table stores install ids only. A player whose install
+ * id is on that list gets wager fields. Anyone else who can read the card
+ * gets the scorecard with those keys removed, not emptied. Deleting the game
+ * deletes the wagers. Deleting the linked round deletes the wagers and leaves
+ * the card. No new Durable Object class, no new secret, and no new var.
+ *
+ * Not deployed. A deploy needs Brian's OK.
  */
 import {
   boardsBinding,
@@ -28,6 +35,9 @@ import {
   readJsonObject,
   unknownFields,
 } from "./friends.js";
+import { carriesWagerKeys, scrubMoney, stripWagerKeys } from "./wager-keys.js";
+
+export { carriesWagerKeys, stripWagerKeys, WAGER_KEYS } from "./wager-keys.js";
 
 export const SHARED_MAX_PLAYERS = 8;
 export const SHARED_MAX_TEAMS = 2;
@@ -43,20 +53,14 @@ export const SHARED_FORMATS = Object.freeze([
   "shamble",
   "wolf",
 ]);
-/** Keys that must never appear on a shared-card response, empty or not. */
-export const WAGER_KEYS = Object.freeze([
-  "wager",
-  "wagers",
-  "sidegame",
-  "sidegames",
-  "side_game",
-  "side_games",
-  "bet",
-  "bets",
-]);
-
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
-const WAGER_KEY_RE = /^(wagers?|sidegames?|side_games?|bets?)$/i;
+const AMOUNT_RE = /^(?:0|[1-9]\d{0,11})(?:\.\d{1,2})?$/;
+const WAGER_UNITS = Object.freeze(["$", "Points", "Beers", "custom"]);
+const WAGER_WHO = Object.freeze(["player", "team"]);
+const WAGER_PAYS = Object.freeze(["hole", "skin", "nine", "round"]);
+const CUSTOM_UNIT_MAX = 24;
+/** Same class, separate object. Not a game id, so it cannot collide with `shared:<gameId>`. */
+const ROUND_INDEX_NAME = "wager-round-index";
 const CREATE_BODY_LIMIT = 8192;
 const STROKE_MIN = 1;
 const STROKE_MAX = 25;
@@ -70,7 +74,8 @@ const GAME_SCHEMA = [
     format TEXT NOT NULL,
     scoring TEXT NOT NULL,
     options_json TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    round_id TEXT
   )`,
   `CREATE TABLE IF NOT EXISTS team (
     number INTEGER PRIMARY KEY,
@@ -99,27 +104,33 @@ const GAME_SCHEMA = [
     player_id TEXT NOT NULL,
     hole INTEGER NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS wager (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    unit TEXT NOT NULL,
+    custom_unit TEXT,
+    who TEXT NOT NULL,
+    pays TEXT NOT NULL,
+    amount TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS wager_player (
+    player_id TEXT PRIMARY KEY,
+    opted_in INTEGER NOT NULL,
+    confirmed INTEGER NOT NULL,
+    amount TEXT
+  )`,
+  /** Install ids only. No player id, name, or amount. */
+  `CREATE TABLE IF NOT EXISTS wager_allow (
+    install_id TEXT PRIMARY KEY
+  )`,
+  `CREATE TABLE IF NOT EXISTS round_link (
+    round_id TEXT PRIMARY KEY,
+    game_id TEXT NOT NULL
+  )`,
 ];
 
 export function isSharedGamePath(pathname) {
   return pathname === "/v1/shared-games" || pathname.startsWith("/v1/shared-games/");
-}
-
-/**
- * Drop wager keys at every level. An empty object or array is removed with the key,
- * not returned as `wagers: []`.
- */
-export function stripWagerKeys(value) {
-  if (Array.isArray(value)) return value.map((item) => stripWagerKeys(item));
-  if (value && typeof value === "object") {
-    const out = {};
-    for (const key of Object.keys(value)) {
-      if (WAGER_KEY_RE.test(key)) continue;
-      out[key] = stripWagerKeys(value[key]);
-    }
-    return out;
-  }
-  return value;
 }
 
 /**
@@ -165,6 +176,22 @@ export async function handleSharedGames(request, url, env, cors) {
     if (request.method !== "GET") return reply(405, { error: "method_not_allowed" }, cors);
     return readGame(request, env, cors, route.gameId);
   }
+  if (route.kind === "wager") {
+    if (request.method !== "POST") return reply(405, { error: "method_not_allowed" }, cors);
+    return putWager(request, env, cors, route.gameId);
+  }
+  if (route.kind === "export") {
+    if (request.method !== "GET") return reply(405, { error: "method_not_allowed" }, cors);
+    return exportWager(request, env, cors, route.gameId);
+  }
+  if (route.kind === "share") {
+    if (request.method !== "GET") return reply(405, { error: "method_not_allowed" }, cors);
+    return shareCard(request, env, cors, route.gameId);
+  }
+  if (route.kind === "delete") {
+    if (request.method !== "POST") return reply(405, { error: "method_not_allowed" }, cors);
+    return deleteGame(request, env, cors, route.gameId);
+  }
   if (request.method !== "POST") return reply(405, { error: "method_not_allowed" }, cors);
   return postScore(request, env, cors, route.gameId);
 }
@@ -185,6 +212,10 @@ function routeOf(pathname) {
   if (parts.length === 2 && parts[1] === "scores") {
     if (!ID_RE.test(parts[0])) return { kind: "bad" };
     return { kind: "scores", gameId: parts[0] };
+  }
+  if (parts.length === 2 && (parts[1] === "wager" || parts[1] === "export" || parts[1] === "share" || parts[1] === "delete")) {
+    if (!ID_RE.test(parts[0])) return { kind: "bad" };
+    return { kind: parts[1], gameId: parts[0] };
   }
   return { kind: "unknown" };
 }
@@ -237,6 +268,118 @@ async function postScore(request, env, cors, gameId) {
   return mapScore(answer, cors);
 }
 
+async function putWager(request, env, cors, gameId) {
+  const ready = await readyCaller(request, env, cors);
+  if (ready.response) return ready.response;
+  const limited = await consumeReadLimit(request, env, ready.friendKey, "keysgwrite:", "ipsgwrite:", cors);
+  if (limited) return limited;
+  const parsed = await readJsonObject(request, CREATE_BODY_LIMIT, false);
+  if (parsed.error) return bodyError(parsed, cors);
+  if (carriesWagerKeys(parsed.value)) return reply(400, { error: "wager_rejected" }, cors);
+  const wager = normalizeWager(parsed.value);
+  if (wager.error) return reply(400, { error: "invalid_body" }, cors);
+  const access = await accessGame(ready, env, cors, gameId);
+  if (access.response) return access.response;
+  const answer = await gameCall(env, gameId, {
+    op: "wager",
+    callerId: ready.caller.ownerId,
+    now: Date.now(),
+    wager: wager.wager,
+  });
+  return mapWager(answer, cors);
+}
+
+async function exportWager(request, env, cors, gameId) {
+  const ready = await readyCaller(request, env, cors);
+  if (ready.response) return ready.response;
+  const rejected = await rejectGetBody(request, cors);
+  if (rejected) return rejected;
+  const limited = await consumeReadLimit(request, env, ready.friendKey, "keysgread:", "ipsgread:", cors);
+  if (limited) return limited;
+  const access = await accessGame(ready, env, cors, gameId);
+  if (access.response) return access.response;
+  const answer = await gameCall(env, gameId, { op: "export", callerId: ready.caller.ownerId });
+  if (!answer.ok) return mapRead(answer, cors);
+  const body = { gameId: answer.gameId };
+  if (answer.wager) body.wager = answer.wager;
+  return friendJson(200, body, cors);
+}
+
+async function shareCard(request, env, cors, gameId) {
+  const ready = await readyCaller(request, env, cors);
+  if (ready.response) return ready.response;
+  const rejected = await rejectGetBody(request, cors);
+  if (rejected) return rejected;
+  const limited = await consumeReadLimit(request, env, ready.friendKey, "keysgread:", "ipsgread:", cors);
+  if (limited) return limited;
+  const access = await accessGame(ready, env, cors, gameId);
+  if (access.response) return access.response;
+  const answer = await gameCall(env, gameId, { op: "read", callerId: ready.caller.ownerId });
+  if (!answer.ok) return mapRead(answer, cors);
+  return friendJson(200, scorecardSharePayload(answer.game, answer.scores), cors);
+}
+
+async function deleteGame(request, env, cors, gameId) {
+  const ready = await readyCaller(request, env, cors);
+  if (ready.response) return ready.response;
+  const parsed = await readJsonObject(request, CREATE_BODY_LIMIT, true);
+  if (parsed.error) return bodyError(parsed, cors);
+  if (!parsed.empty && unknownFields(parsed.value, [])) return reply(400, { error: "invalid_body" }, cors);
+  const limited = await consumeReadLimit(request, env, ready.friendKey, "keysgwrite:", "ipsgwrite:", cors);
+  if (limited) return limited;
+  const access = await accessGame(ready, env, cors, gameId);
+  if (access.response) return access.response;
+  if (access.members.organizerId !== ready.caller.ownerId) return reply(403, { error: "forbidden" }, cors);
+  const answer = await gameCall(env, gameId, { op: "deleteGame" });
+  if (!answer.ok) return mapRead(answer, cors);
+  if (access.members.roundId) await indexCall(env, { op: "unlinkRound", roundId: access.members.roundId });
+  return reply(200, { ok: true }, cors);
+}
+
+function mapWager(answer, cors) {
+  if (answer.ok) return friendJson(200, { wager: answer.wager }, cors);
+  if (answer.error === "locked") return reply(409, { error: "locked" }, cors);
+  if (answer.error === "forbidden") return reply(403, { error: "forbidden" }, cors);
+  if (answer.error === "not_found") return reply(404, { error: "not_found" }, cors);
+  if (answer.error === "invalid_body") return reply(400, { error: "invalid_body" }, cors);
+  return reply(503, { error: "unavailable" }, cors);
+}
+
+/** Share image and share page. Scores only: no wager fields and no "$". */
+export function scorecardSharePayload(game, scores) {
+  const safeGame = scrubMoney(stripWagerKeys(game || {}));
+  const safeScores = scrubMoney(stripWagerKeys(scores || []));
+  const players = (safeGame.players || []).map((player) => ({
+    playerId: player.playerId,
+    name: player.name ?? null,
+    guest: player.guest,
+    team: player.team ?? null,
+  }));
+  const cardScores = (Array.isArray(safeScores) ? safeScores : []).map((cell) => ({
+    playerId: cell.playerId,
+    hole: cell.hole,
+    strokes: cell.strokes,
+  }));
+  const image = {
+    gameId: safeGame.gameId,
+    format: safeGame.format,
+    scoring: safeGame.scoring,
+    teams: safeGame.teams || [],
+    players,
+    scores: cardScores,
+  };
+  const page = {
+    title: "Shared scorecard",
+    gameId: image.gameId,
+    format: image.format,
+    scoring: image.scoring,
+    teams: image.teams,
+    players,
+    scores: cardScores,
+  };
+  return { image, page };
+}
+
 async function storeNewGame(ready, env, cors, game) {
   let gameId = game.gameId;
   const clientId = typeof gameId === "string";
@@ -247,7 +390,10 @@ async function storeNewGame(ready, env, cors, game) {
       now: Date.now(),
       game: { ...game, gameId },
     });
-    if (answer.ok) return reply(200, { game: answer.game }, cors);
+    if (answer.ok) {
+      if (game.roundId) await linkRound(env, game.roundId, gameId);
+      return reply(200, { game: answer.game }, cors);
+    }
     if (answer.error === "cap" || answer.error === "wolf") return reply(409, { error: answer.error }, cors);
     if (answer.error === "exists") {
       const current = await gameCall(env, gameId, { op: "read", callerId: ready.caller.ownerId });
@@ -267,7 +413,14 @@ async function storeNewGame(ready, env, cors, game) {
 }
 
 function mapRead(answer, cors) {
-  if (answer.ok) return reply(200, { game: answer.game, scores: answer.scores }, cors);
+  if (answer.ok) {
+    const body = { game: answer.game, scores: answer.scores };
+    if (answer.wager) body.wager = answer.wager;
+    // SG-2 exclusion: a caller who is not on the install-id allowlist gets this
+    // scorecard only after wager keys are removed. The keys are absent, not empty.
+    if (!answer.seesWagers) return friendJson(200, stripWagerKeys(body), cors);
+    return friendJson(200, body, cors);
+  }
   if (answer.error === "forbidden") return reply(403, { error: "forbidden" }, cors);
   if (answer.error === "not_found") return reply(404, { error: "not_found" }, cors);
   return reply(503, { error: "unavailable" }, cors);
@@ -336,6 +489,39 @@ function sharedNamespace(env) {
   return ns;
 }
 
+async function linkRound(env, roundId, gameId) {
+  await indexCall(env, { op: "linkRound", roundId, gameId });
+}
+
+/** Drop wagers for rounds that were just deleted. No-op when the shared-game binding is absent. */
+export async function deleteWagersForRounds(env, roundIds) {
+  if (!Array.isArray(roundIds) || !sharedNamespace(env)) return;
+  for (const roundId of roundIds) {
+    if (typeof roundId !== "string" || !ID_RE.test(roundId)) continue;
+    const found = await indexCall(env, { op: "gamesForRound", roundId });
+    for (const gameId of found.gameIds || []) {
+      await gameCall(env, gameId, { op: "deleteWagers" });
+    }
+    await indexCall(env, { op: "unlinkRound", roundId });
+  }
+}
+
+async function indexCall(env, op) {
+  const ns = sharedNamespace(env);
+  if (!ns) return { ok: false, error: "unavailable" };
+  try {
+    const stub = ns.get(ns.idFromName(ROUND_INDEX_NAME));
+    const res = await stub.fetch("https://shared-game.internal/index", {
+      method: "POST",
+      body: JSON.stringify(op),
+    });
+    const body = await res.json();
+    return body && typeof body === "object" ? body : { ok: false, error: "unavailable" };
+  } catch {
+    return { ok: false, error: "unavailable" };
+  }
+}
+
 async function gameCall(env, gameId, op) {
   const ns = sharedNamespace(env);
   if (!ns) return { ok: false, error: "unavailable" };
@@ -354,13 +540,18 @@ async function gameCall(env, gameId, op) {
 
 function normalizeCreate(body, organizerId) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return { error: "invalid_body" };
-  if (unknownFields(body, ["gameId", "format", "scoring", "options", "teams", "players"])) {
+  if (unknownFields(body, ["gameId", "format", "scoring", "options", "teams", "players", "roundId"])) {
     return { error: "invalid_body" };
   }
   let gameId = null;
   if (body.gameId != null) {
     if (typeof body.gameId !== "string" || !ID_RE.test(body.gameId)) return { error: "invalid_body" };
     gameId = body.gameId;
+  }
+  let roundId = null;
+  if (body.roundId != null) {
+    if (typeof body.roundId !== "string" || !ID_RE.test(body.roundId)) return { error: "invalid_body" };
+    roundId = body.roundId;
   }
   if (!SHARED_FORMATS.includes(body.format)) return { error: "invalid_body" };
   if (body.scoring !== "gross" && body.scoring !== "net") return { error: "invalid_body" };
@@ -377,6 +568,7 @@ function normalizeCreate(body, organizerId) {
   return {
     game: {
       gameId,
+      roundId,
       organizerId,
       format: body.format,
       scoring: body.scoring,
@@ -500,6 +692,52 @@ function rosterCap(format, teams, players) {
   return null;
 }
 
+function normalizeWager(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return { error: "invalid_body" };
+  if (unknownFields(body, ["unit", "customUnit", "who", "pays", "amount", "players"])) return { error: "invalid_body" };
+  if (!WAGER_UNITS.includes(body.unit)) return { error: "invalid_body" };
+  if (!WAGER_WHO.includes(body.who)) return { error: "invalid_body" };
+  if (!WAGER_PAYS.includes(body.pays)) return { error: "invalid_body" };
+  if (typeof body.amount !== "string" || !AMOUNT_RE.test(body.amount)) return { error: "invalid_body" };
+  let customUnit = null;
+  if (body.unit === "custom") {
+    customUnit = cleanCustomUnit(body.customUnit);
+    if (!customUnit) return { error: "invalid_body" };
+  } else if (body.customUnit != null) {
+    return { error: "invalid_body" };
+  }
+  let players = null;
+  if (body.players != null) {
+    if (!Array.isArray(body.players)) return { error: "invalid_body" };
+    players = [];
+    const seen = new Set();
+    for (const player of body.players) {
+      if (!player || typeof player !== "object" || Array.isArray(player)) return { error: "invalid_body" };
+      if (unknownFields(player, ["playerId", "optedIn", "confirmed", "amount"])) return { error: "invalid_body" };
+      if (typeof player.playerId !== "string" || !ID_RE.test(player.playerId) || seen.has(player.playerId)) {
+        return { error: "invalid_body" };
+      }
+      seen.add(player.playerId);
+      if (typeof player.optedIn !== "boolean" || typeof player.confirmed !== "boolean") return { error: "invalid_body" };
+      let amount = null;
+      if (player.amount != null) {
+        if (typeof player.amount !== "string" || !AMOUNT_RE.test(player.amount)) return { error: "invalid_body" };
+        amount = player.amount;
+      }
+      players.push({ playerId: player.playerId, optedIn: player.optedIn, confirmed: player.confirmed, amount });
+    }
+  }
+  return { wager: { unit: body.unit, customUnit, who: body.who, pays: body.pays, amount: body.amount, players } };
+}
+
+function cleanCustomUnit(raw) {
+  if (typeof raw !== "string") return null;
+  const text = raw.replace(/\s+/g, " ").trim();
+  if (text.length < 1 || [...text].length > CUSTOM_UNIT_MAX) return null;
+  if (/[\u0000-\u001F\u007F]/.test(text)) return null;
+  return text;
+}
+
 function normalizeScore(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return { error: "invalid_body" };
   if (unknownFields(body, ["playerId", "hole", "strokes", "rev", "clientWriteId"])) return { error: "invalid_body" };
@@ -545,6 +783,7 @@ function canonical(game) {
     scoring: game.scoring,
     options: game.options,
     organizerId: game.organizerId,
+    roundId: game.roundId ?? null,
     teams: game.teams.map((team) => ({
       number: team.number,
       name: team.name,
@@ -612,6 +851,13 @@ export class SharedGame {
       if (op === "members") return gameJson(this.#members());
       if (op === "read") return gameJson(this.#read(body));
       if (op === "score") return gameJson(this.ctx.storage.transactionSync(() => this.#score(body)));
+      if (op === "wager") return gameJson(this.ctx.storage.transactionSync(() => this.#wager(body)));
+      if (op === "export") return gameJson(this.#export(body));
+      if (op === "deleteGame") return gameJson(this.ctx.storage.transactionSync(() => this.#deleteGame()));
+      if (op === "deleteWagers") return gameJson(this.ctx.storage.transactionSync(() => this.#deleteWagers()));
+      if (op === "linkRound") return gameJson(this.ctx.storage.transactionSync(() => this.#linkRound(body)));
+      if (op === "unlinkRound") return gameJson(this.ctx.storage.transactionSync(() => this.#unlinkRound(body)));
+      if (op === "gamesForRound") return gameJson(this.#gamesForRound(body));
     } catch {
       return gameJson({ ok: false, error: "unavailable" });
     }
@@ -620,6 +866,11 @@ export class SharedGame {
 
   #ensure() {
     for (const statement of GAME_SCHEMA) this.ctx.storage.sql.exec(statement);
+    try {
+      this.#run("ALTER TABLE game ADD COLUMN round_id TEXT");
+    } catch {
+      // The column is already in the CREATE TABLE for new objects.
+    }
   }
 
   #sql(query, ...bindings) {
@@ -657,14 +908,15 @@ export class SharedGame {
     const cap = rosterCap(game.format, game.teams, game.players);
     if (cap) return { ok: false, error: cap };
     this.#run(
-      `INSERT INTO game (id, game_id, organizer_id, format, scoring, options_json, created_at)
-       VALUES (1, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO game (id, game_id, organizer_id, format, scoring, options_json, created_at, round_id)
+       VALUES (1, ?, ?, ?, ?, ?, ?, ?)`,
       game.gameId,
       game.organizerId,
       game.format,
       game.scoring,
       JSON.stringify(game.options ?? {}),
       now,
+      game.roundId ?? null,
     );
     for (const team of game.teams) {
       this.#run("INSERT INTO team (number, name) VALUES (?, ?)", team.number, team.name);
@@ -678,6 +930,9 @@ export class SharedGame {
         player.team,
         player.name,
       );
+      if (typeof player.installId === "string" && player.installId.length > 0) {
+        this.#run("INSERT OR IGNORE INTO wager_allow (install_id) VALUES (?)", player.installId);
+      }
     }
     return { ok: true, game: this.#publicGame(this.#gameRow()) };
   }
@@ -689,14 +944,157 @@ export class SharedGame {
       playerId: player.player_id,
       guest: Number(player.guest) === 1,
     }));
-    return { ok: true, organizerId: row.organizer_id, players };
+    return { ok: true, organizerId: row.organizer_id, roundId: row.round_id ?? null, players };
   }
 
   #read({ callerId }) {
     const row = this.#gameRow();
     if (!row) return { ok: false, error: "not_found" };
     if (!this.#isPlayer(callerId)) return { ok: false, error: "forbidden" };
-    return { ok: true, game: this.#publicGame(row), scores: this.#scores() };
+    const wager = this.#publicWager();
+    return {
+      ok: true,
+      game: this.#publicGame(row),
+      scores: this.#scores(),
+      wager,
+      seesWagers: this.#allowlisted(callerId),
+    };
+  }
+
+  #allowlisted(callerId) {
+    const player = this.#player(callerId);
+    if (!player || player.install_id == null || player.install_id === "") return false;
+    const rows = this.#sql("SELECT install_id FROM wager_allow WHERE install_id = ?", player.install_id);
+    return rows.length === 1;
+  }
+
+  #holeOneScored() {
+    return this.#sql("SELECT 1 AS n FROM score_history WHERE hole = 1 LIMIT 1").length > 0;
+  }
+
+  #wager({ callerId, wager, now }) {
+    const row = this.#gameRow();
+    if (!row) return { ok: false, error: "not_found" };
+    if (!this.#isPlayer(callerId) || callerId !== row.organizer_id) return { ok: false, error: "forbidden" };
+    if (this.#holeOneScored()) return { ok: false, error: "locked" };
+    const roster = this.#sql("SELECT player_id FROM player").map((player) => player.player_id);
+    const sent = new Map();
+    for (const player of wager.players || []) {
+      if (!roster.includes(player.playerId)) return { ok: false, error: "invalid_body" };
+      sent.set(player.playerId, player);
+    }
+    this.#run("DELETE FROM wager_player");
+    this.#run("DELETE FROM wager");
+    this.#run(
+      "INSERT INTO wager (id, unit, custom_unit, who, pays, amount, updated_at) VALUES (1, ?, ?, ?, ?, ?, ?)",
+      wager.unit,
+      wager.customUnit,
+      wager.who,
+      wager.pays,
+      wager.amount,
+      now,
+    );
+    for (const playerId of roster) {
+      const player = sent.get(playerId);
+      this.#run(
+        "INSERT INTO wager_player (player_id, opted_in, confirmed, amount) VALUES (?, ?, ?, ?)",
+        playerId,
+        player && player.optedIn ? 1 : 0,
+        player && player.confirmed ? 1 : 0,
+        player ? player.amount : null,
+      );
+    }
+    return { ok: true, wager: this.#publicWager() };
+  }
+
+  #export({ callerId }) {
+    const row = this.#gameRow();
+    if (!row) return { ok: false, error: "not_found" };
+    if (!this.#isPlayer(callerId)) return { ok: false, error: "forbidden" };
+    const wager = this.#publicWager();
+    if (!wager) return { ok: true, gameId: row.game_id, wager: null };
+    const self = wager.players.find((player) => player.playerId === callerId) || {
+      playerId: callerId,
+      optedIn: false,
+      confirmed: false,
+      amount: null,
+    };
+    return {
+      ok: true,
+      gameId: row.game_id,
+      wager: {
+        unit: wager.unit,
+        customUnit: wager.customUnit,
+        who: wager.who,
+        pays: wager.pays,
+        self: {
+          playerId: self.playerId,
+          optedIn: self.optedIn,
+          confirmed: self.confirmed,
+          amount: self.amount,
+        },
+      },
+    };
+  }
+
+  #deleteGame() {
+    if (!this.#gameRow()) return { ok: false, error: "not_found" };
+    for (const table of ["wager_player", "wager", "wager_allow", "score_history", "write_id", "player", "team", "game"]) {
+      this.#run(`DELETE FROM ${table}`);
+    }
+    return { ok: true };
+  }
+
+  #deleteWagers() {
+    if (!this.#gameRow()) return { ok: false, error: "not_found" };
+    this.#run("DELETE FROM wager_player");
+    this.#run("DELETE FROM wager");
+    return { ok: true };
+  }
+
+  #linkRound({ roundId, gameId }) {
+    if (typeof roundId !== "string" || typeof gameId !== "string") return { ok: false, error: "invalid_body" };
+    this.#run(
+      "INSERT INTO round_link (round_id, game_id) VALUES (?, ?) ON CONFLICT(round_id) DO UPDATE SET game_id = excluded.game_id",
+      roundId,
+      gameId,
+    );
+    return { ok: true };
+  }
+
+  #unlinkRound({ roundId }) {
+    if (typeof roundId !== "string") return { ok: false, error: "invalid_body" };
+    this.#run("DELETE FROM round_link WHERE round_id = ?", roundId);
+    return { ok: true };
+  }
+
+  #gamesForRound({ roundId }) {
+    if (typeof roundId !== "string") return { ok: false, error: "invalid_body" };
+    const rows = this.#sql("SELECT game_id FROM round_link WHERE round_id = ?", roundId);
+    return { ok: true, gameIds: rows.map((row) => row.game_id) };
+  }
+
+  #publicWager() {
+    const rows = this.#sql("SELECT unit, custom_unit, who, pays, amount FROM wager WHERE id = 1");
+    if (rows.length !== 1) return null;
+    const row = rows[0];
+    const players = this.#sql(
+      "SELECT player_id, opted_in, confirmed, amount FROM wager_player ORDER BY player_id",
+    ).map((player) => ({
+      playerId: player.player_id,
+      optedIn: Number(player.opted_in) === 1,
+      confirmed: Number(player.confirmed) === 1,
+      amount: player.amount ?? null,
+    }));
+    return {
+      unit: row.unit,
+      customUnit: row.custom_unit ?? null,
+      who: row.who,
+      pays: row.pays,
+      amount: row.amount,
+      locked: this.#holeOneScored(),
+      players,
+    };
   }
 
   #score({ callerId, playerId, hole, strokes, rev, clientWriteId, now }) {
@@ -782,6 +1180,7 @@ export class SharedGame {
     }
     return {
       gameId: row.game_id,
+      roundId: row.round_id ?? null,
       organizerId: row.organizer_id,
       format: row.format,
       scoring: row.scoring,

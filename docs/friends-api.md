@@ -106,9 +106,19 @@ Round-level or hole-level GPS (`lat`, `lng`, `lon`, `position`, and any other ke
 
 Stored at `fr:live:<ownerId>` with `updatedAt`, and replaced on every update. KV `expirationTtl` is 30 minutes (1800 seconds), from the last update. The phone sends it only while "Share live rounds with friends" is on and that round is shared. That switch is on by default for players who never chose, and stays off for anyone who turned it off; the phone shows the notice. The Worker keeps no share flag: the PUT itself is the opt-in, and a missing `roundStats`, `clubAverages`, or `roundKind` never refuses or strips it. Rate limited on the `iplive:` IP counter (240 per hour, shared with fetchLive). A practice/test refusal and a finish delete do not take a slot on that counter. `200` `{ "ok": true }`.
 
+A live `PUT` whose body carries a wager key (`wager`, `wagers`, `sidegame`, `sidegames`, `side_game`, `side_games`, `bet`, `bets`, at any depth) is `400` `{ "error": "wager_rejected" }` and does not write. `GET /v1/friends/live` never returns those keys, including when the stored row has them and including when the player is in a shared game that has a wager. The same rejection applies to `PUT /v1/friends/rounds`.
+
 `GET /v1/friends/live` returns `200` `{ "live": [ { "ownerId", "courseName", "hole", "toPar", "holes", "updatedAt" } ] }`, plus `skippedHoles` when the golfer skipped an unscored hole, and top-level `shots` when the current hole has them: only accepted friends both ways, not blocked either way, whose row was updated in the last 30 minutes. `toPar` is worked out from `holes`. Your own row, non-friends' rows and anything older than 30 minutes are never returned. A follower read that finds a row older than 30 minutes deletes that key, so the shot locations are gone, and a later read still returns nothing. `fir`, `gir`, and `putts` are left out of each hole when the stored `roundStats` is `false`. The hole `clubs` array, per-shot club, yards, and the rounded lat/lon stay even when `clubAverages` is `false`. The setting flags themselves are not returned.
 
 `POST /v1/friends/live/stop` (empty body) deletes your row, including every shot location: at round finish, when the switch is turned off, or when "Friends can follow" is tapped. `PUT` with `{ "finished": true }` does the same delete. `200` `{ "ok": true }`.
+
+### Friends Board and group feed
+
+`GET /v1/friends/board` returns `{ "board": [ { "rank", "id", "ownerId", "courseName", "playedOn", "gross", "toPar", "holes", "scramble" } ] }`. Only rounds with `scramble.board: true`, from the caller and from accepted friends both ways who are not blocked either way. Wager keys are stripped before the list is ranked. Rank is by gross, lower first, then id.
+
+`GET /v1/friends/feed` returns `{ "feed": [ ...rounds ] }` for that same set of people, every shared round, after the same strip. Past rounds still honor their audience.
+
+`POST /v1/friends/board` and `POST /v1/friends/feed` reject a body that carries a wager key with `400` `{ "error": "wager_rejected" }` and write nothing. A body without those keys is `400` `{ "error": "invalid_body" }`. Publishing a round is still `PUT /v1/friends/rounds`.
 
 ### registerPushToken / removePushToken (friend live-round alerts)
 

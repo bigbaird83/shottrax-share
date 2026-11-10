@@ -20,6 +20,8 @@
  * so a tap on the web link opens Safari even for people who have the app.
  */
 
+import { scrubMoney, stripWagerKeys } from "./wager-keys.js";
+
 export const APP_STORE_ID = "6812944398";
 /** Same as LIVE_BOARD_POLL_MS in ShotTraxx src/domain/liveBoard.ts. */
 export const LIVE_BOARD_POLL_MS = 8000;
@@ -78,6 +80,13 @@ function str(value) {
  * Anything without a `holes` array → null.
  */
 function parseBoard(raw) {
+  function withoutMoney(text) {
+    if (typeof text !== "string") return text;
+    return text.split(String.fromCharCode(36)).join("");
+  }
+  function hidesSideGame(text) {
+    return typeof text === "string" && /wager|side[\s_-]?games?|\btally\b|settle/i.test(text);
+  }
   let value = raw;
   for (let depth = 0; depth < 6; depth += 1) {
     if (typeof value === "string") {
@@ -115,7 +124,7 @@ function parseBoard(raw) {
     const players = value.group.players
       .filter((p) => p && typeof p === "object" && str(p.name))
       .map((p) => ({
-        name: p.name,
+        name: withoutMoney(p.name),
         handicap: num(p.handicap),
         holes: Array.isArray(p.holes)
           ? p.holes.filter((h) => h && num(h.hole) != null).map((h) => ({ hole: h.hole, score: num(h.score) }))
@@ -131,10 +140,18 @@ function parseBoard(raw) {
       : [];
     if (players.length > 0) group = { players, results };
   }
+  if (group && Array.isArray(group.results)) {
+    group.results = group.results
+      .map((block) => ({
+        title: withoutMoney(block.title),
+        lines: block.lines.map((line) => withoutMoney(line)).filter((line) => line.length > 0 && !hidesSideGame(line)),
+      }))
+      .filter((block) => block.title && !hidesSideGame(block.title) && block.lines.length > 0);
+  }
   return {
-    courseName: str(value.courseName),
+    courseName: withoutMoney(str(value.courseName)),
     finished: value.finished === true,
-    live,
+    live: live ? { hole: live.hole, lastClubYards: live.lastClubYards ? withoutMoney(live.lastClubYards) : null } : null,
     holes,
     updatedAt: str(value.updatedAt),
     group,
@@ -471,6 +488,7 @@ export function storeLive(env) {
 
 /** Full HTML page. `board` is parsed (parseBoard) or null for a code with nothing stored yet. */
 export function renderLivePage({ code, board, nowMs, storeLive = false, appStoreId = APP_STORE_ID, nonce }) {
+  board = board ? scrubMoney(stripWagerKeys(board)) : board;
   const view = planView(board, nowMs);
   const title = view ? view.kicker + " · " + view.courseName : "Live board · ShotTraxx™";
   const description = previewLine(view);
