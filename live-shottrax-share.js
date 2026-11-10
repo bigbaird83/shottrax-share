@@ -1,3 +1,5 @@
+import { GOLFAPI_CREDIT_FLOOR } from "./src/course/golfApiCreditFloor.mjs";
+
 var __defProp = Object.defineProperty;
 var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
 
@@ -930,7 +932,7 @@ var GOLFAPI_DEFAULTS = {
   globalDay: 100,
   monthBudget: 450,
   billingDay: 5,
-  floor: 50,
+  floor: GOLFAPI_CREDIT_FLOOR,
   // Saved course/coordinates copies; 7-day marker for a clean 200 with no data.
   storeTtlDays: 365,
   emptyTtlDays: 7,
@@ -955,7 +957,7 @@ function readGolfapiLimits(env) {
     globalDay: readConfigInt(source.GOLFAPI_GLOBAL_DAY) ?? GOLFAPI_DEFAULTS.globalDay,
     monthBudget: readConfigInt(source.GOLFAPI_MONTHLY_BUDGET) ?? GOLFAPI_DEFAULTS.monthBudget,
     billingDay: Math.min(28, Math.max(1, billingDay)),
-    floor: readConfigInt(source.GOLFAPI_FLOOR) ?? GOLFAPI_DEFAULTS.floor,
+    floor: readConfigInt(source.GOLFAPI_FLOOR) ?? GOLFAPI_CREDIT_FLOOR,
     storeTtlDays: readConfigInt(source.GOLFAPI_STORE_TTL_DAYS) ?? GOLFAPI_DEFAULTS.storeTtlDays,
     emptyTtlDays: readConfigInt(source.GOLFAPI_EMPTY_TTL_DAYS) ?? GOLFAPI_DEFAULTS.emptyTtlDays,
     openCalls: Math.max(1, readConfigInt(source.GOLFAPI_OPEN_CALLS) ?? GOLFAPI_DEFAULTS.openCalls),

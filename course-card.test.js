@@ -155,6 +155,56 @@ test('two PUTs of one MOCK course share one write', async () => {
   assert.equal(stored.versions.length, 1);
 });
 
+test('a 64-character course id is stored and a 65-character id is rejected', async () => {
+  resetCourseCardInflightForTests();
+  const live = env();
+  const init = (id) => ({
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(mockCard()),
+  });
+  const okId = 'a'.repeat(64);
+  const put = await call(`/course-card/v1/${okId}`, init(okId), live);
+  assert.equal(put.status, 200);
+  assert.equal(put.body.published, true);
+  assert.equal(live.GOLFAPI_KV.store.has(`course-card:v1:${okId}`), true);
+  const badId = 'b'.repeat(65);
+  const rejected = await call(`/course-card/v1/${badId}`, init(badId), live);
+  assert.equal(rejected.status, 400);
+  assert.deepEqual(rejected.body, { error: 'bad_id' });
+  assert.equal(live.GOLFAPI_KV.store.has(`course-card:v1:${badId}`), false);
+});
+
+function countedHoles(n) {
+  return Array.from({ length: n }, (_, i) => ({
+    hole: i + 1,
+    tee: { lat: 35.523295, lng: -92.04 + i * 0.0001 },
+    green: { lat: 35.52, lng: -92.04 + i * 0.0001 },
+    par: 4,
+    yards: 401,
+  }));
+}
+
+test('a card count of 36 is published and 37 is rejected', async () => {
+  resetCourseCardInflightForTests();
+  const live = env();
+  const put = await call('/course-card/v1/count-36', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(mockCard({ count: 36, holes: countedHoles(36) })),
+  }, live);
+  assert.equal(put.status, 200);
+  assert.equal(put.body.published, true);
+  const over = await call('/course-card/v1/count-37', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(mockCard({ count: 37, holes: countedHoles(1) })),
+  }, live);
+  assert.equal(over.status, 400);
+  assert.deepEqual(over.body, { error: 'bad_count' });
+  assert.equal(live.GOLFAPI_KV.store.has('course-card:v1:count-37'), false);
+});
+
 test('the digest lists the MOCK course published in this window', async () => {
   resetCourseCardInflightForTests();
   const live = env();

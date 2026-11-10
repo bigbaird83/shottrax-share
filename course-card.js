@@ -14,6 +14,7 @@ import {
 
 const PREFIX = 'course-card:v1:';
 const DIGEST_KEY = 'course-card:digest';
+const COURSE_ID = /^[A-Za-z0-9_-]{1,64}$/;
 const inflight = new Map();
 
 export function resetCourseCardInflightForTests() {
@@ -93,6 +94,7 @@ export async function handleCourseCard(request, env) {
   }
   const match = courseIdFrom(pathname);
   if (!match) return null;
+  if (!COURSE_ID.test(match.id)) return json(400, { error: 'bad_id' });
   const kv = kvOf(env);
   if (!kv) return json(503, { error: 'not_configured' });
   if (match.flag) {
@@ -152,6 +154,9 @@ async function publish(request, env, kv, id) {
     outline: Array.isArray(body?.outline) ? body.outline : null,
   };
   const verdict = liveCardPublishVerdict(card);
+  if (!verdict.ok && verdict.reason === 'bad_count') {
+    return { status: 400, body: { error: 'bad_count' } };
+  }
   if (!verdict.ok) {
     return {
       status: verdict.reason === 'hash-ok' ? 409 : 422,

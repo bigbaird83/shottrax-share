@@ -43,6 +43,7 @@ export const PAR_LENGTH_YARDS = Object.freeze({
 export const SCORECARD_TOLERANCE = 0.15;
 export const OUTLINE_BUFFER_M = 30;
 export const NEIGHBOR_GAP_M = 600;
+export const MAX_CARD_HOLES = 36;
 const METERS_PER_YARD = 0.9144;
 
 export function golfApiCreditsForPull({ fromSharedCard = false, knownCourseId = false } = {}) {
@@ -249,14 +250,17 @@ function distanceToSegmentM(point, a, b) {
  * guarded courses are refused (hash-OK stays on the committed file).
  */
 export function liveCardPublishVerdict(card) {
+  const holes = [...(card?.holes ?? [])].sort((a, b) => a.hole - b.hole);
+  const count = card?.count ?? (holes.length > 0 ? Math.max(...holes.map((hole) => hole.hole)) : 0);
+  if (Number(count) > MAX_CARD_HOLES) {
+    return { ok: false, reason: 'bad_count', fails: [], flags: [] };
+  }
   if (!card || card.bundled || card.handPinned || card.guarded) {
     return { ok: false, reason: 'hash-ok', fails: [], flags: [] };
   }
   if (card.blocklisted || card.sisterCourse) {
     return { ok: false, reason: 'wrong-course', fails: [{ reason: 'wrong-course' }], flags: [] };
   }
-  const holes = [...(card.holes ?? [])].sort((a, b) => a.hole - b.hole);
-  const count = card.count ?? (holes.length > 0 ? Math.max(...holes.map((hole) => hole.hole)) : 0);
   const fails = [];
   const flags = [];
   const byHole = new Map(holes.map((hole) => [hole.hole, hole]));
