@@ -143,7 +143,17 @@ describe("shottrax-share worker", () => {
     delete globalThis.caches;
   });
 
-  async function invoke(url, { method = "GET", body, env: envOverride, ctx, headers, cf } = {}) {
+  async function invoke(url, { method = "GET", body, env: envOverride, ctx, headers, cf, seedBalance = true } = {}) {
+    if (
+      seedBalance
+      && method === "GET"
+      && String(url).includes("/golfapi/")
+      && headers
+      && headers["X-Install-Id"]
+      && !kv.has("gq:balance")
+    ) {
+      kv.set("gq:balance", { value: JSON.stringify({ left: 400, at: 1, lastStatus: 200 }) });
+    }
     const waits = [];
     const execCtx = ctx === undefined ? { waitUntil(promise) { waits.push(promise); } } : ctx;
     const request = new Request(url, { method, body, headers });
@@ -1846,8 +1856,12 @@ describe("shottrax-share worker", () => {
 
       kv.set("gq:balance", { value: JSON.stringify({ left: floor + 0.5, at: 1, lastStatus: 200 }) });
       kv.delete("gqueue:floor");
-      expect((await golfGet("/golfapi/v2.3/courses/floor", { env: floorEnv })).status, `floor ${floor} plus a half`).toBe(200);
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const half = await golfGet("/golfapi/v2.3/courses/floor", { env: floorEnv });
+      const halfBody = await half.json();
+      expect(half.status, `floor ${floor} plus a half`).toBe(429);
+      expect(halfBody.reason, `floor ${floor} plus a half`).toBe("floor");
+      expect(fetchMock, `floor ${floor} plus a half`).not.toHaveBeenCalled();
+      kv.delete("gqueue:floor");
 
       fetchMock.mockClear();
       kv.set("gq:balance", { value: JSON.stringify({ left: floor === 10 ? 9 : floor - 1, at: 1, lastStatus: 200 }) });
@@ -1861,6 +1875,76 @@ describe("shottrax-share worker", () => {
       expect(queuedSearch).toHaveLength(1);
       expect(queuedSearch[0].startsWith("gqueue:q:")).toBe(true);
     }
+  });
+
+  function openCourseSet(courseId) {
+    kv.set(`gq:set:dev:${INSTALL}`, {
+      value: JSON.stringify({ at: Date.now(), courseId, calls: 1 }),
+    });
+  }
+
+  it("blocks a course GET at 156.9 because that 1-credit spend would leave less than the floor", async () => {
+    expect(readGolfapiLimits({}).floor).toBe(156);
+    expect(readGolfapiLimits({}).openCalls).toBe(3);
+    openCourseSet("fraction");
+    kv.set("gq:balance", { value: JSON.stringify({ left: 156.9, at: 1, lastStatus: 200 }) });
+    mockGolfApi(async () => jsonResponse(coursePayload("fraction", 156)));
+    const blocked = await golfGet("/golfapi/v2.3/courses/fraction");
+    const body = await blocked.json();
+    expect(blocked.status).toBe(429);
+    expect(body.reason).toBe("floor");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("allows a 1-credit course GET that lands on 156", async () => {
+    expect(readGolfapiLimits({}).floor).toBe(156);
+    openCourseSet("lands");
+    kv.set("gq:balance", { value: JSON.stringify({ left: 157, at: 1, lastStatus: 200 }) });
+    mockGolfApi(async () => jsonResponse(coursePayload("lands", 156)));
+    const allowed = await golfGet("/golfapi/v2.3/courses/lands");
+    expect(allowed.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(kv.get("gq:balance").value).left).toBe(156);
+  });
+
+  it("a drain blocked by the floor makes no fetch", async () => {
+    expect(readGolfapiLimits({}).floor).toBe(156);
+    kv.set("gqueue:low", { value: JSON.stringify({ attempts: 0, at: 1 }) });
+    kv.set("gq:balance", { value: JSON.stringify({ left: 156.9, at: 1, lastStatus: 200 }) });
+    mockGolfApi(async () => jsonResponse(coursePayload("low", 156)));
+    await runDrain();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(kv.has("gqueue:low")).toBe(true);
+  });
+
+  it("fails closed when the balance is missing or not finite", async () => {
+    mockGolfApi(async () => jsonResponse(coursePayload("closed", 400)));
+    const missing = await invoke(`${ORIGIN}/golfapi/v2.3/courses/closed`, {
+      headers: golfHeaders(INSTALL),
+      seedBalance: false,
+    });
+    expect(missing.status).toBe(429);
+    expect((await missing.json()).reason).toBe("floor");
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    kv.set("gq:balance", { value: JSON.stringify({ at: 1, lastStatus: 200 }) });
+    const blank = await golfGet("/golfapi/v2.3/courses/closed");
+    expect(blank.status).toBe(429);
+    expect((await blank.json()).reason).toBe("floor");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("a drain search below the floor makes no fetch", async () => {
+    expect(readGolfapiLimits({}).floor).toBe(156);
+    const token = await searchTokenFor("magnolia");
+    kv.set(`gqueue:q:${token}`, {
+      value: JSON.stringify({ attempts: 0, at: 1, q: "magnolia", search: "?q=Magnolia" }),
+    });
+    kv.set("gq:balance", { value: JSON.stringify({ left: 156.01, at: 1, lastStatus: 200 }) });
+    mockGolfApi(async () => jsonResponse(searchPayload("pebble", "Magnolia", "156")));
+    await runDrain();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(kv.has(`gqueue:q:${token}`)).toBe(true);
   });
 
   it("counts searches inside one open as a single lookup and blocks the next course at the device day", async () => {
