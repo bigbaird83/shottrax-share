@@ -58,7 +58,7 @@ const AMOUNT_RE = /^(?:0|[1-9]\d{0,11})(?:\.\d{1,2})?$/;
 const WAGER_UNITS = Object.freeze(["$", "Points", "Beers", "custom"]);
 const WAGER_WHO = Object.freeze(["player", "team"]);
 const WAGER_PAYS = Object.freeze(["hole", "skin", "nine", "round"]);
-const CUSTOM_UNIT_MAX = 24;
+const CUSTOM_UNIT_MAX = 12;
 /** Same class, separate object. Not a game id, so it cannot collide with `shared:<gameId>`. */
 const ROUND_INDEX_NAME = "wager-round-index";
 const CREATE_BODY_LIMIT = 8192;
@@ -733,7 +733,8 @@ function normalizeWager(body) {
 function cleanCustomUnit(raw) {
   if (typeof raw !== "string") return null;
   const text = raw.replace(/\s+/g, " ").trim();
-  if (text.length < 1 || [...text].length > CUSTOM_UNIT_MAX) return null;
+  const points = [...text];
+  if (points.length < 1 || points.length > CUSTOM_UNIT_MAX) return null;
   if (/[\u0000-\u001F\u007F]/.test(text)) return null;
   return text;
 }

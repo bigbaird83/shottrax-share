@@ -225,6 +225,47 @@ describe("SG-2 wager store and exclusion", () => {
     expect(text).not.toContain("9.99");
   });
 
+  it("accepts a custom unit of 12 code points and refuses 13 or a blank", async () => {
+    const host = await player(1);
+    const made = await call("/v1/shared-games", {
+      friend: host.friend,
+      body: {
+        gameId: "unit_card",
+        format: "strokePlay",
+        scoring: "gross",
+        players: [person(host.ownerId, { installId: "id_host_allow" })],
+      },
+    });
+    expect(made.status).toBe(200);
+    const twelve = "👍".repeat(12);
+    const ok = await call("/v1/shared-games/unit_card/wager", {
+      friend: host.friend,
+      body: { unit: "custom", customUnit: twelve, who: "player", pays: "hole", amount: "1" },
+    });
+    expect(ok.status).toBe(200);
+    expect([...ok.json.wager.customUnit].length).toBe(12);
+    expect(ok.json.wager.customUnit).toBe(twelve);
+
+    const thirteen = await call("/v1/shared-games/unit_card/wager", {
+      friend: host.friend,
+      body: { unit: "custom", customUnit: "👍".repeat(13), who: "player", pays: "hole", amount: "1" },
+    });
+    expect(thirteen.status).toBe(400);
+    expect(thirteen.json).toEqual({ error: "invalid_body" });
+
+    for (const customUnit of ["", "   "]) {
+      const blank = await call("/v1/shared-games/unit_card/wager", {
+        friend: host.friend,
+        body: { unit: "custom", customUnit, who: "player", pays: "hole", amount: "1" },
+      });
+      expect(blank.status, JSON.stringify(customUnit)).toBe(400);
+      expect(blank.json).toEqual({ error: "invalid_body" });
+    }
+
+    const kept = await call("/v1/shared-games/unit_card", { method: "GET", friend: host.friend });
+    expect(kept.json.wager.customUnit).toBe(twelve);
+  });
+
   it("accepts a 1000000 amount and locks the wager after hole 1 is scored", async () => {
     const host = await player(1);
     await call("/v1/shared-games", {

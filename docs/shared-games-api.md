@@ -43,7 +43,7 @@ The card is one SQLite Durable Object per game (`SharedGame`, binding `SHARED_GA
 | Field | Rule |
 | --- | --- |
 | `unit` | `"$"`, `"Points"`, `"Beers"`, or `"custom"` |
-| `customUnit` | Required when `unit` is `"custom"`: 1–24 characters. Otherwise omit it or send `null` |
+| `customUnit` | Required when `unit` is `"custom"`: 1–12 characters, counted as Unicode code points (an emoji counts once). Blank or whitespace-only is refused. Otherwise omit it or send `null` |
 | `who` | `"player"` or `"team"` |
 | `pays` | `"hole"`, `"skin"`, `"nine"`, or `"round"` |
 | `amount` | String. `0` or a number up to 12 digits, optional `.` and 1–2 decimals. `"1000000"` is accepted. No maximum value inside that shape |
