@@ -37,6 +37,15 @@ export const FRIEND_GUESS_WINDOW_MS = 60 * 60 * 1000;
 export const FRIEND_CAP = 50;
 /** New leagues per IP per hour. Same number as friend code mints. */
 export const LEAGUE_CREATE_IP_LIMIT = 30;
+/** Shared scorecard creates per IP per hour (shared-games.js). */
+export const SHARED_GAME_CREATE_IP_LIMIT = 30;
+/** Shared scorecard reads per key and per IP per hour. */
+export const SHARED_GAME_READ_LIMIT = 60;
+/**
+ * Shared scorecard score writes per key and per IP per hour.
+ * A card is 8 players by 18 holes, plus suggestions, retries, and a burst of racing writes.
+ */
+export const SHARED_GAME_WRITE_LIMIT = 240;
 export const ROUND_CAP = 100;
 // Live rounds for friends (approved 2026-10-21 11:10 CT). A row is gone 30 minutes after its last update.
 export const FRIEND_LIVE_TTL_MS = 30 * 60 * 1000;
@@ -116,6 +125,13 @@ function limitForDurableObjectName(name) {
   if (name.startsWith("iplgnew:")) return LEAGUE_CREATE_IP_LIMIT;
   if (name.startsWith("iplgread:")) return FRIEND_READ_IP_LIMIT;
   if (name.startsWith("keylgread:")) return FRIEND_READ_KEY_LIMIT;
+  // Shared scorecard (shared-games.js). These must not fall through to the 8-guess default:
+  // a racing burst of score writes is larger than that.
+  if (name.startsWith("ipsgnew:")) return SHARED_GAME_CREATE_IP_LIMIT;
+  if (name.startsWith("ipsgread:")) return SHARED_GAME_READ_LIMIT;
+  if (name.startsWith("keysgread:")) return SHARED_GAME_READ_LIMIT;
+  if (name.startsWith("ipsgwrite:")) return SHARED_GAME_WRITE_LIMIT;
+  if (name.startsWith("keysgwrite:")) return SHARED_GAME_WRITE_LIMIT;
   return FRIEND_CODE_GUESS_LIMIT;
 }
 

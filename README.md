@@ -26,6 +26,12 @@ Lookup allows 8 guesses per friend key and 24 per IP hash per 60 minutes. The 8-
 
 `GET /v1/friends/requests` returns `{ "incoming", "outgoing" }`. Each entry is the other person's `ownerId` only. The request row is the string `pending`, so there is no display name and no created time. A requester the caller has blocked is omitted from `incoming`. A stored outgoing row stays visible to the sender even when the recipient has a block row. A quiet-block send's `fr:out:<sender>:<recipient>` note is listed in `outgoing` in the same `{ "ownerId" }` shape and `ownerId` order as a real pending request. The note has no TTL, same as `fr:req:`. Decline, `resetCode`, unblock, remove, and a refused block do not delete it. A fresh send after unblock replaces it with `fr:req:`. See `docs/friends-api.md`. `GET /v1/friends/list` returns `{ "friends" }`: accepted friends where both `fr:friend:` rows exist, at most 50, hiding a block in either direction. `since` is omitted because the friendship row is `1`. Both GETs reject a body the same way as `GET /v1/friends/rounds`, allow 60 calls per friend key and 60 per IP hash per hour on their own `FriendGuessLimiter` objects (`keyreq:` / `ipreq:` and `keylist:` / `iplist:`), and do not write KV. Sort order and KV op counts are in `docs/friends-api.md`.
 
+## Shared scorecard
+
+`POST /v1/shared-games`, `GET /v1/shared-games/:gameId`, and `POST /v1/shared-games/:gameId/scores` serve the shared card. Auth is the same `X-Friend-Key`. One SQLite Durable Object per game (`SharedGame`, binding `SHARED_GAMES`) holds the roster, the cells, and every edit. A score write compare-and-sets `rev` in that object. The card is not stored in `BOARDS`. Responses never include a wager key. The route list, the caps, and the error names are in `docs/shared-games-api.md`.
+
+This is not deployed. A deploy is still a manual `npx wrangler deploy` approved by Brian. The change adds the `v4-shared-game` migration only. It does not add a secret or a `[vars]` entry.
+
 ## Live board web page
 
 `GET /s/{code}` is an HTML page anyone can open in a browser, no app needed (`live-page.js`). The ShotTraxx™ app shares this link for a live board. The page renders the board stored at `{code}` in `BOARDS` on the Worker, so Messages and WhatsApp previews show the course and score (`Live · Greystone CC` / `E thru 2 · On hole 3`). Then it polls `GET /{code}` every 8 s until the round is final. Scores only: no map, and the page never asks for location.
