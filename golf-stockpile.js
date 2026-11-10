@@ -3,9 +3,9 @@
  * OSM does not already cover. Disabled until GOLFAPI_STOCKPILE_ENABLED is true.
  *
  * golfapi spends the monthly allowance before the never-expire balance, so the
- * stop line is GOLFAPI_ROLLOVER_CREDITS (the never-expire balance). The 50-credit
- * floor sits under that balance; this job does not treat the floor as extra
- * headroom on top of the rollover. The window is the last 7 nights before
+ * stop line is GOLFAPI_ROLLOVER_CREDITS (the never-expire balance, 156).
+ * Golfer spend uses that same 156 and must leave it unspent. This job does
+ * not treat a lower floor as extra headroom on top of the rollover. The window is the last 7 nights before
  * renewal at 23:00 UTC. GOLFAPI_STOCKPILE_MAX_DAYS is 7 and is clamped
  * there. Each of those nights spends
  * (live balance - rollover) / nights still left in the window, including
@@ -14,13 +14,15 @@
  * GolfapiCounter keys, not on the golfer daily or monthly caps.
  */
 
+import { GOLFAPI_CREDIT_FLOOR, golfApiSpendBreaksFloor } from './src/course/golfApiCreditFloor.mjs';
+
 export const STOCKPILE_CRON = '0 23 * * *';
 export const STOCKPILE_CRONS_TEXT = '["0 23 * * *"]';
 export const BALANCE_PROBE_NAME = '__shottraxx_stockpile_balance';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_ROLLOVER = 156;
-const DEFAULT_FLOOR = 50;
+const DEFAULT_FLOOR = GOLFAPI_CREDIT_FLOOR;
 const DEFAULT_HEADROOM = 30;
 const DEFAULT_MAX_DAYS = 7;
 const MAX_WINDOW_NIGHTS = 7;
@@ -682,6 +684,12 @@ export async function runGolfapiStockpile(env, ctx, event = {}, hooks = {}) {
       if (hooked == null) pullBudget = Number.POSITIVE_INFINITY;
       else if (!applySchedule(hooked)) return finish();
     } else {
+    const known = await readStoredBalance(kv);
+    if (golfApiSpendBreaksFloor(known, SEARCH_TENTHS / 10, floor)) {
+      report.liveLeft = known;
+      report.stopped = 'floor';
+      return finish();
+    }
     const probed = await spend(env, chargeBody, SEARCH_TENTHS, report);
     if (!probed) {
       report.stopped = report.stopped || 'cap';
@@ -760,7 +768,7 @@ export async function runGolfapiStockpile(env, ctx, event = {}, hooks = {}) {
       if (haltPulls()) break;
       const courses = await resolveItem(env, item, cursor, chargeBody, report, () => searchTenths, (n) => {
         searchTenths += n;
-      }, dryRun);
+      }, dryRun, floor);
       if (report.stopped) break;
       for (const course of courses) {
         if (haltPulls()) break;
@@ -793,6 +801,19 @@ async function spend(env, chargeBody, chargeTenths, report) {
 async function refund(env, chargeBody, chargeTenths, report) {
   await counterFetch(env, { op: 'stockpileRefund', ...chargeBody, chargeTenths });
   report.spent = Math.max(0, Math.round((report.spent - chargeTenths / 10) * 10) / 10);
+}
+
+async function readStoredBalance(kv) {
+  if (!kv) return null;
+  const raw = await kv.get('gq:balance');
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    const left = Number(parsed?.left);
+    return Number.isFinite(left) ? left : null;
+  } catch {
+    return null;
+  }
 }
 
 async function readCursor(kv, key) {
@@ -850,7 +871,7 @@ function demandCourse(row) {
   };
 }
 
-async function resolveItem(env, item, cursor, chargeBody, report, searchTenths, addSearch, dryRun) {
+async function resolveItem(env, item, cursor, chargeBody, report, searchTenths, addSearch, dryRun, floor) {
   if (item.source === 'demand') {
     const row = item.row || {};
     if (countryKnownNonUs(row.country)) return [];
@@ -861,7 +882,7 @@ async function resolveItem(env, item, cursor, chargeBody, report, searchTenths, 
     const found = await searchCourses(env, chargeBody, report, searchTenths, addSearch, queryFor({
       name: row.name || '',
       country: 'US',
-    }));
+    }), floor);
     if (found.searched) cursor.searched.demand.push(token);
     return found.courses.filter((course) => !countryKnownNonUs(course.country) && namesMatchCourse(row.name, course)).slice(0, 1);
   }
@@ -869,7 +890,7 @@ async function resolveItem(env, item, cursor, chargeBody, report, searchTenths, 
   if (item.source === 'state') {
     const state = usStateCode(item.state);
     if (!state || cursor.searched.state.includes(state)) return [];
-    const found = await searchCourses(env, chargeBody, report, searchTenths, addSearch, `country=US&state=${encodeURIComponent(state)}`);
+    const found = await searchCourses(env, chargeBody, report, searchTenths, addSearch, `country=US&state=${encodeURIComponent(state)}`, floor);
     if (found.searched) cursor.searched.state.push(state);
     return found.courses.filter((course) => !countryKnownNonUs(course.country));
   }
@@ -882,6 +903,7 @@ async function resolveItem(env, item, cursor, chargeBody, report, searchTenths, 
     searchTenths,
     addSearch,
     `country=US&city=${encodeURIComponent(item.city)}&state=${encodeURIComponent(item.state)}`,
+    floor,
   );
   if (found.searched) cursor.searched.metro.push(metroKey);
   return found.courses.filter((course) => !countryKnownNonUs(course.country));
@@ -896,7 +918,11 @@ function queryFor(parts) {
   return params.toString();
 }
 
-async function searchCourses(env, chargeBody, report, searchTenths, addSearch, query) {
+async function searchCourses(env, chargeBody, report, searchTenths, addSearch, query, floor) {
+  if (golfApiSpendBreaksFloor(report.liveLeft, SEARCH_TENTHS / 10, floor)) {
+    report.stopped = 'floor';
+    return { courses: [], searched: false };
+  }
   if (searchTenths() + SEARCH_TENTHS > SEARCH_CAP_TENTHS) {
     report.stopped = report.stopped || 'search_cap';
     return { courses: [], searched: false };
@@ -1147,7 +1173,7 @@ function paidPayloadKeepable(payload, kind) {
 }
 
 async function pullOne(env, kv, path, kind, id, chargeBody, report, rollover, floor, countPull) {
-  if (report.liveLeft != null && report.liveLeft <= floor) {
+  if (golfApiSpendBreaksFloor(report.liveLeft, PULL_TENTHS / 10, floor)) {
     report.stopped = 'floor';
     return 'stop';
   }

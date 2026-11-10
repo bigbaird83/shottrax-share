@@ -232,6 +232,82 @@ describe('golfapi stockpile', () => {
     }
   });
 
+  test('a missing or unreadable floor is 156, and 156 makes no paid call', async () => {
+    for (const floor of [undefined, 'nope']) {
+      const { env, kv, counter } = baseEnv({ GOLFAPI_CREDIT_FLOOR: floor });
+      const keys = stockpileKeys(new Date(BULK_AT), env);
+      kv.store.set('gq:balance', { value: JSON.stringify({ left: 156 }) });
+      await seedDemand(counter, keys.cycleId, { courseId: 'floor-fallback', name: 'Fallback' });
+      const http = installFetch(() => {
+        throw new Error('a balance on the floor must not call golfapi');
+      });
+      try {
+        const stopped = await runGolfapiStockpile(env, {}, bulkEvent());
+        assert.equal(http.calls.length, 0, String(floor));
+        assert.equal(stopped.stopped, 'floor', String(floor));
+        assert.equal(stopped.spent, 0, String(floor));
+      } finally {
+        http.restore();
+      }
+    }
+  });
+
+  test('the probe and a name search are refused when they would leave the balance under 156', async () => {
+    const floorEnv = { GOLFAPI_CREDIT_FLOOR: '156' };
+
+    const atFloor = baseEnv(floorEnv);
+    const atKeys = stockpileKeys(new Date(BULK_AT), atFloor.env);
+    atFloor.kv.store.set('gq:balance', { value: JSON.stringify({ left: 156 }) });
+    await seedDemand(atFloor.counter, atKeys.cycleId, { name: 'On Floor', country: 'US' });
+    const none = installFetch(() => {
+      throw new Error('156 must not call golfapi');
+    });
+    try {
+      const stopped = await runGolfapiStockpile(atFloor.env, {}, bulkEvent());
+      assert.equal(none.calls.length, 0);
+      assert.equal(stopped.stopped, 'floor');
+    } finally {
+      none.restore();
+    }
+
+    const one = baseEnv(floorEnv);
+    const oneKeys = stockpileKeys(new Date(BULK_AT), one.env);
+    one.kv.store.set('gq:balance', { value: JSON.stringify({ left: 157 }) });
+    await seedDemand(one.counter, oneKeys.cycleId, { courseId: 'one-call', name: 'One Call' });
+    const probeOnly = installFetch((url) => {
+      if (!url.includes(BALANCE_PROBE_NAME)) throw new Error(`only the probe may run ${url}`);
+      return jsonResponse({ courses: [], apiRequestsLeft: 156.9 });
+    });
+    try {
+      const ran = await runGolfapiStockpile(one.env, {}, bulkEvent());
+      assert.equal(probeOnly.calls.length, 1);
+      assert.equal(probeOnly.calls[0].includes(BALANCE_PROBE_NAME), true);
+      assert.equal(ran.liveLeft, 156.9);
+      assert.equal(ran.added, 0);
+    } finally {
+      probeOnly.restore();
+    }
+
+    const searchOk = baseEnv({ ...floorEnv, GOLFAPI_ROLLOVER_CREDITS: '0' });
+    const okKeys = stockpileKeys(new Date(BULK_AT), searchOk.env);
+    searchOk.kv.store.set('gq:balance', { value: JSON.stringify({ left: 400 }) });
+    await seedDemand(searchOk.counter, okKeys.cycleId, { name: 'Lands On Floor', country: 'US' });
+    const oneSearch = installFetch((url) => {
+      if (url.includes(BALANCE_PROBE_NAME)) return jsonResponse({ courses: [], apiRequestsLeft: 156.1 });
+      if (url.includes('name=Lands')) return jsonResponse({ courses: [], apiRequestsLeft: 156 });
+      throw new Error(`a search from 156 would leave 155.9 ${url}`);
+    });
+    try {
+      const ran = await runGolfapiStockpile(searchOk.env, {}, bulkEvent());
+      assert.equal(oneSearch.calls.length, 2);
+      assert.equal(oneSearch.calls.filter((url) => url.includes('name=Lands')).length, 1);
+      assert.equal(ran.liveLeft, 156);
+      assert.equal(ran.stopped, 'floor');
+    } finally {
+      oneSearch.restore();
+    }
+  });
+
   test('a pull stops on the live balance, not the cached one, and the floor sits under the rollover', async () => {
     const { env, kv, counter } = baseEnv({ GOLFAPI_STOCKPILE_RUN_CREDITS: '10' });
     const keys = stockpileKeys(new Date(BULK_AT), env);

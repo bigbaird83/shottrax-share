@@ -1201,7 +1201,7 @@ describe("shottrax-share worker", () => {
   const OTHER_INSTALL = "install-0002";
   const CLIENT_IP = "203.0.113.10";
 
-  function coursePayload(id, left = 80) {
+  function coursePayload(id, left = 400) {
     return JSON.stringify({
       apiRequestsLeft: String(left),
       courseID: id,
@@ -1210,7 +1210,7 @@ describe("shottrax-share worker", () => {
     });
   }
 
-  function coordPayload(id, left = 79) {
+  function coordPayload(id, left = 399) {
     return JSON.stringify({
       apiRequestsLeft: String(left),
       courseID: id,
@@ -1262,8 +1262,8 @@ describe("shottrax-share worker", () => {
 
   it("serves a stored golfapi course for free and does not count it", async () => {
     mockGolfApi(async (url) => {
-      if (url.endsWith("/courses/pebble")) return jsonResponse(coursePayload("pebble", 80));
-      if (url.endsWith("/coordinates/pebble")) return jsonResponse(coordPayload("pebble", 79));
+      if (url.endsWith("/courses/pebble")) return jsonResponse(coursePayload("pebble", 400));
+      if (url.endsWith("/coordinates/pebble")) return jsonResponse(coordPayload("pebble", 399));
       throw new Error(url);
     });
 
@@ -1498,14 +1498,14 @@ describe("shottrax-share worker", () => {
     mockGolfApi(async (url) => {
       if (url.includes("/courses?")) {
         return jsonResponse({
-          apiRequestsLeft: "70",
+          apiRequestsLeft: "400",
           numCourses: 1,
           courses: [{ courseID: "pebble", courseName: "Magnolia" }],
         });
       }
       const id = url.split("/").pop();
-      if (url.includes("/coordinates/")) return jsonResponse(coordPayload(id, 60));
-      return jsonResponse(coursePayload(id, 65));
+      if (url.includes("/coordinates/")) return jsonResponse(coordPayload(id, 399));
+      return jsonResponse(coursePayload(id, 400));
     });
     expect((await golfGet("/golfapi/v2.3/courses?q=Magnolia")).status).toBe(200);
     expect((await golfGet("/golfapi/v2.3/courses?q=magnolia")).status).toBe(200);
@@ -1534,7 +1534,7 @@ describe("shottrax-share worker", () => {
     return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
   }
 
-  function searchPayload(courseID, courseName, left = "70") {
+  function searchPayload(courseID, courseName, left = "400") {
     return {
       apiRequestsLeft: left,
       numCourses: 1,
@@ -1664,9 +1664,9 @@ describe("shottrax-share worker", () => {
 
     mockGolfApi(async (url) => {
       if (url.includes("/courses?")) {
-        return jsonResponse({ apiRequestsLeft: "80", numCourses: 0, courses: [] });
+        return jsonResponse({ apiRequestsLeft: "400", numCourses: 0, courses: [] });
       }
-      return jsonResponse(coursePayload(url.split("/").pop(), 70));
+      return jsonResponse(coursePayload(url.split("/").pop(), 400));
     });
     for (const query of ["one", "two", "three", "four"]) {
       expect((await golfGet(`/golfapi/v2.3/courses?q=${query}`, { install: owner, env: envAllow })).status).toBe(200);
@@ -1725,7 +1725,7 @@ describe("shottrax-share worker", () => {
       globalDay: 100,
       monthBudget: 450,
       billingDay: 5,
-      floor: 50,
+      floor: 156,
       storeTtlDays: 365,
       emptyTtlDays: 7,
       openCalls: 3,
@@ -1740,7 +1740,7 @@ describe("shottrax-share worker", () => {
     let n = 0;
     mockGolfApi(async (url) => {
       n += 1;
-      return jsonResponse(coursePayload(url.split("/").pop(), 100 - n));
+      return jsonResponse(coursePayload(url.split("/").pop(), 400 - n));
     });
     for (let i = 1; i <= limits.deviceDay; i += 1) {
       expect((await golfGet(`/golfapi/v2.3/courses/c${i}`)).status, `c${i}`).toBe(200);
@@ -1779,7 +1779,7 @@ describe("shottrax-share worker", () => {
     const limits = readGolfapiLimits({});
     expect(limits.ipDay).toBe(150);
     expect(limits.globalDay).toBe(100);
-    mockGolfApi(async (url) => jsonResponse(coursePayload(url.split("/").pop(), 80)));
+    mockGolfApi(async (url) => jsonResponse(coursePayload(url.split("/").pop(), 400)));
     expect((await golfGet("/golfapi/v2.3/courses/s1", { install: "spoof-aaa" })).status).toBe(200);
     expect((await golfGet("/golfapi/v2.3/courses/s2", { install: "spoof-bbb" })).status).toBe(200);
     const ipKeys = [...kv.keys()].filter((key) => /^gq:ip:[0-9a-f]{64}$/.test(key));
@@ -1810,7 +1810,7 @@ describe("shottrax-share worker", () => {
     expect(limits.deviceDay).toBe(12);
     expect(limits.ipDay).toBeGreaterThan(limits.globalDay);
     const allowedOpens = limits.globalDay - limits.openCalls + 1;
-    mockGolfApi(async (url) => jsonResponse(coursePayload(url.split("/").pop(), 80)));
+    mockGolfApi(async (url) => jsonResponse(coursePayload(url.split("/").pop(), 400)));
     for (let n = 1; n <= allowedOpens; n += 1) {
       const install = `ginst${String(Math.floor((n - 1) / limits.deviceDay)).padStart(4, "0")}`;
       const response = await golfGet(`/golfapi/v2.3/courses/g${n}`, { install });
@@ -1827,7 +1827,7 @@ describe("shottrax-share worker", () => {
   });
 
   it("refuses fresh golfapi calls at the balance floor of 10", async () => {
-    expect(readGolfapiLimits({}).floor).toBe(50);
+    expect(readGolfapiLimits({}).floor).toBe(156);
     mockGolfApi(async () => jsonResponse(coursePayload("floor", 40)));
     for (const floor of [10, 50]) {
       kv.clear();
@@ -1870,12 +1870,12 @@ describe("shottrax-share worker", () => {
     mockGolfApi(async (url) => {
       if (url.includes("/courses?")) {
         return jsonResponse({
-          apiRequestsLeft: "80",
+          apiRequestsLeft: "400",
           numCourses: 1,
           courses: [{ courseID: "abc", courseName: "Somewhere" }],
         });
       }
-      return jsonResponse(coursePayload(url.split("/").pop(), 80));
+      return jsonResponse(coursePayload(url.split("/").pop(), 400));
     });
     for (const q of ["one", "two", "three"]) {
       expect((await golfGet(`/golfapi/v2.3/courses?q=${q}`)).status).toBe(200);
@@ -1916,7 +1916,7 @@ describe("shottrax-share worker", () => {
         searchCount: limits.searchCap,
       }),
     });
-    mockGolfApi(async () => jsonResponse(searchPayload("abc", "Somewhere", "80")));
+    mockGolfApi(async () => jsonResponse(searchPayload("abc", "Somewhere", "400")));
     const blocked = await golfGet("/golfapi/v2.3/courses?q=four");
     const body = await blocked.json();
     expect(blocked.status).toBe(429);
@@ -1956,12 +1956,12 @@ describe("shottrax-share worker", () => {
     mockGolfApi(async (url) => {
       if (url.includes("/courses?")) {
         return jsonResponse({
-          apiRequestsLeft: "70",
+          apiRequestsLeft: "400",
           numCourses: 1,
           courses: [{ courseID: "abc", courseName: "Somewhere" }],
         });
       }
-      return jsonResponse(coursePayload(url.split("/").pop(), 60));
+      return jsonResponse(coursePayload(url.split("/").pop(), 400));
     });
     const searchEnv = { ...env, GOLFAPI_DEVICE_DAY: "1", GOLFAPI_SEARCH_DEVICE_DAY: "100" };
     expect(readGolfapiLimits(searchEnv).deviceDay).toBe(1);
@@ -1999,7 +1999,7 @@ describe("shottrax-share worker", () => {
     const limits = readGolfapiLimits({});
     expect(limits.deviceDay).toBe(12);
     expect(limits.searchCap).toBe(36);
-    mockGolfApi(async () => jsonResponse(searchPayload("abc", "Somewhere", "80")));
+    mockGolfApi(async () => jsonResponse(searchPayload("abc", "Somewhere", "400")));
     for (let n = 1; n <= limits.searchCap; n += 1) {
       const response = await golfGet(`/golfapi/v2.3/courses?q=search${n}`);
       expect(response.status, `search ${n}`).toBe(200);
@@ -2016,20 +2016,20 @@ describe("shottrax-share worker", () => {
 
   it("does not store an error body or a 200 with no course data", async () => {
     const limits = readGolfapiLimits({});
-    expect(limits.floor).toBe(50);
+    expect(limits.floor).toBe(156);
     mockGolfApi(async (url) => {
       if (url.endsWith("/courses/missing")) {
-        return jsonResponse({ error: "Course not found", apiRequestsLeft: "80" });
+        return jsonResponse({ error: "Course not found", apiRequestsLeft: "400" });
       }
       if (url.endsWith("/coordinates/missing")) {
-        return jsonResponse({ apiRequestsLeft: "80", courseID: "missing", coordinates: [] });
+        return jsonResponse({ apiRequestsLeft: "400", courseID: "missing", coordinates: [] });
       }
       if (url.endsWith("/coordinates/abc")) return jsonResponse({ ok: true });
       throw new Error(url);
     });
     const missing = await golfGet("/golfapi/v2.3/courses/missing");
     expect(missing.status).toBe(200);
-    expect(await missing.json()).toEqual({ error: "Course not found", apiRequestsLeft: "80" });
+    expect(await missing.json()).toEqual({ error: "Course not found", apiRequestsLeft: "400" });
     expect(kv.has("gapi:course:missing")).toBe(false);
     expect(edge.size).toBe(0);
 
@@ -2037,8 +2037,8 @@ describe("shottrax-share worker", () => {
     expect(emptyCoords.status).toBe(200);
     expect(kv.has("gapi:coord:missing")).toBe(false);
     expect(edge.size).toBe(0);
-    expect(JSON.parse(kv.get("gq:balance").value).left).toBe(80);
-    expect(80).toBeGreaterThan(limits.floor);
+    expect(JSON.parse(kv.get("gq:balance").value).left).toBe(400);
+    expect(400).toBeGreaterThan(limits.floor);
 
     fetchMock.mockClear();
     const repeatEmpty = await golfGet("/golfapi/v2.3/coordinates/missing");
@@ -2054,7 +2054,7 @@ describe("shottrax-share worker", () => {
   });
 
   it("a repeat of a golfapi error body is no_course_data", async () => {
-    mockGolfApi(async () => jsonResponse({ error: "Course not found", apiRequestsLeft: "80" }));
+    mockGolfApi(async () => jsonResponse({ error: "Course not found", apiRequestsLeft: "400" }));
     const missing = await golfGet("/golfapi/v2.3/courses/missing");
     expect(missing.status).toBe(200);
     expect(kv.has("gapi:course:missing")).toBe(false);
@@ -2069,8 +2069,8 @@ describe("shottrax-share worker", () => {
     const defaults = readGolfapiLimits({});
     expect(defaults.deviceDay).toBe(12);
     expect(defaults.ipDay).toBe(150);
-    expect(defaults.floor).toBe(50);
-    mockGolfApi(async (url) => jsonResponse(coursePayload(url.split("/").pop(), 80)));
+    expect(defaults.floor).toBe(156);
+    mockGolfApi(async (url) => jsonResponse(coursePayload(url.split("/").pop(), 400)));
     const brokenDay = { ...env, GOLFAPI_DEVICE_DAY: "nope", GOLFAPI_DEVICE_WEEK: "1" };
     expect(readGolfapiLimits(brokenDay).deviceDay).toBe(defaults.deviceDay);
     expect(readGolfapiLimits(brokenDay).deviceWeek).toBe(1);
@@ -2099,25 +2099,25 @@ describe("shottrax-share worker", () => {
     kv.clear();
     edge.clear();
     fetchMock.mockClear();
-    const floorEnv = { ...env, GOLFAPI_FLOOR: "50" };
+    const floorEnv = { ...env, GOLFAPI_FLOOR: "156" };
     expect(readGolfapiLimits(floorEnv).floor).toBe(defaults.floor);
-    kv.set("gq:balance", { value: JSON.stringify({ left: 50, at: 1, lastStatus: 200 }) });
+    kv.set("gq:balance", { value: JSON.stringify({ left: 156, at: 1, lastStatus: 200 }) });
     const floorBlocked = await golfGet("/golfapi/v2.3/courses/cfg5", { env: floorEnv });
     expect((await floorBlocked.json()).reason).toBe("floor");
     expect(fetchMock).not.toHaveBeenCalled();
-    kv.set("gq:balance", { value: JSON.stringify({ left: 53, at: 1, lastStatus: 200 }) });
+    kv.set("gq:balance", { value: JSON.stringify({ left: 159, at: 1, lastStatus: 200 }) });
     expect((await golfGet("/golfapi/v2.3/courses/cfg5", { env: floorEnv })).status).toBe(200);
 
     kv.clear();
     edge.clear();
     fetchMock.mockClear();
-    const stricterFloor = { ...env, GOLFAPI_FLOOR: "80" };
+    const stricterFloor = { ...env, GOLFAPI_FLOOR: "200" };
     expect(readGolfapiLimits(stricterFloor).floor).toBeGreaterThan(defaults.floor);
-    kv.set("gq:balance", { value: JSON.stringify({ left: 80, at: 1, lastStatus: 200 }) });
+    kv.set("gq:balance", { value: JSON.stringify({ left: 200, at: 1, lastStatus: 200 }) });
     const stricterBlocked = await golfGet("/golfapi/v2.3/courses/cfg6", { env: stricterFloor });
     expect((await stricterBlocked.json()).reason).toBe("floor");
     expect(fetchMock).not.toHaveBeenCalled();
-    kv.set("gq:balance", { value: JSON.stringify({ left: 83, at: 1, lastStatus: 200 }) });
+    kv.set("gq:balance", { value: JSON.stringify({ left: 203, at: 1, lastStatus: 200 }) });
     expect((await golfGet("/golfapi/v2.3/courses/cfg6", { env: stricterFloor })).status).toBe(200);
 
     kv.clear();
@@ -2125,16 +2125,16 @@ describe("shottrax-share worker", () => {
     fetchMock.mockClear();
     const invalidFloor = { ...env, GOLFAPI_FLOOR: "nope" };
     expect(readGolfapiLimits(invalidFloor).floor).toBe(defaults.floor);
-    kv.set("gq:balance", { value: JSON.stringify({ left: 50, at: 1, lastStatus: 200 }) });
+    kv.set("gq:balance", { value: JSON.stringify({ left: 156, at: 1, lastStatus: 200 }) });
     expect((await (await golfGet("/golfapi/v2.3/courses/cfg7", { env: invalidFloor })).json()).reason).toBe("floor");
     expect(fetchMock).not.toHaveBeenCalled();
-    kv.set("gq:balance", { value: JSON.stringify({ left: 53, at: 1, lastStatus: 200 }) });
+    kv.set("gq:balance", { value: JSON.stringify({ left: 159, at: 1, lastStatus: 200 }) });
     expect((await golfGet("/golfapi/v2.3/courses/cfg7", { env: invalidFloor })).status).toBe(200);
 
     kv.clear();
     edge.clear();
     fetchMock.mockClear();
-    mockGolfApi(async () => jsonResponse({ apiRequestsLeft: "80", numCourses: 0, courses: [] }));
+    mockGolfApi(async () => jsonResponse({ apiRequestsLeft: "400", numCourses: 0, courses: [] }));
     const ignoredSearchVars = { ...env, GOLFAPI_SEARCH_GLOBAL_DAY: "1", GOLFAPI_SEARCH_DEVICE_DAY: "10" };
     expect(readGolfapiLimits(ignoredSearchVars).searchCap).toBe(defaults.searchCap);
     expect((await golfGet("/golfapi/v2.3/courses?q=one", { env: ignoredSearchVars })).status).toBe(200);
@@ -2159,7 +2159,7 @@ describe("shottrax-share worker", () => {
       value: JSON.stringify({ day: todayKey(), dayCount: limits.deviceDay }),
     });
     await seedSets("pebble", Date.now());
-    mockGolfApi(async () => jsonResponse(coursePayload("pebble", 80)));
+    mockGolfApi(async () => jsonResponse(coursePayload("pebble", 400)));
     expect((await golfGet("/golfapi/v2.3/courses/pebble")).status).toBe(200);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(stats().lookups).toBe(0);
@@ -2187,9 +2187,9 @@ describe("shottrax-share worker", () => {
   it("drains queued courses under the cap and above the floor", async () => {
     const limits = readGolfapiLimits({});
     expect(limits.globalDay).toBe(100);
-    expect(limits.floor).toBe(50);
+    expect(limits.floor).toBe(156);
     expect(limits.openCalls).toBe(3);
-    const aboveFloor = 80;
+    const aboveFloor = 400;
     expect(aboveFloor - limits.openCalls).toBeGreaterThanOrEqual(limits.floor);
     const oneOpen = { ...env, GOLFAPI_GLOBAL_DAY: String(limits.openCalls) };
     expect(readGolfapiLimits(oneOpen).globalDay).toBe(limits.openCalls);
@@ -2201,8 +2201,8 @@ describe("shottrax-share worker", () => {
     const calls = [];
     mockGolfApi(async (url) => {
       calls.push(url);
-      if (url.endsWith("/courses/ready")) return jsonResponse(coursePayload("ready", 78));
-      if (url.endsWith("/coordinates/ready")) return jsonResponse(coordPayload("ready", 77));
+      if (url.endsWith("/courses/ready")) return jsonResponse(coursePayload("ready", 400));
+      if (url.endsWith("/coordinates/ready")) return jsonResponse(coordPayload("ready", 399));
       throw new Error(`should not fetch ${url}`);
     });
     await runDrain(oneOpen);
@@ -2249,7 +2249,7 @@ describe("shottrax-share worker", () => {
   });
 
   it("drops a queued course when the upstream body is an error without storing it", async () => {
-    expect(readGolfapiLimits({}).floor).toBe(50);
+    expect(readGolfapiLimits({}).floor).toBe(156);
     for (const [floor, start, reported] of [[10, 20, 19], [50, 80, 80]]) {
       kv.clear();
       edge.clear();
@@ -2267,7 +2267,7 @@ describe("shottrax-share worker", () => {
   });
 
   it("stops a queue refill before coordinates once balance reaches the floor", async () => {
-    expect(readGolfapiLimits({}).floor).toBe(50);
+    expect(readGolfapiLimits({}).floor).toBe(156);
     for (const [floor, start, reported] of [[10, 11, 10], [50, 51, 50]]) {
       kv.clear();
       edge.clear();
@@ -2301,7 +2301,7 @@ describe("shottrax-share worker", () => {
         searchCount: limits.searchCap,
       }),
     });
-    mockGolfApi(async () => jsonResponse(searchPayload("oak", "Oak Marsh", "80")));
+    mockGolfApi(async () => jsonResponse(searchPayload("oak", "Oak Marsh", "400")));
     const blocked = await golfGet("/golfapi/v2.3/courses?country=US&name=Oak%20Marsh");
     const body = await blocked.json();
     expect(blocked.status).toBe(429);
@@ -2319,9 +2319,9 @@ describe("shottrax-share worker", () => {
     const calls = [];
     mockGolfApi(async (url) => {
       calls.push(url);
-      if (url.includes("/courses?")) return jsonResponse(searchPayload("oak", "Oak Marsh", "80"));
-      if (url.endsWith("/courses/oak")) return jsonResponse(coursePayload("oak", 80));
-      if (url.endsWith("/coordinates/oak")) return jsonResponse(coordPayload("oak", 80));
+      if (url.includes("/courses?")) return jsonResponse(searchPayload("oak", "Oak Marsh", "400"));
+      if (url.endsWith("/courses/oak")) return jsonResponse(coursePayload("oak", 400));
+      if (url.endsWith("/coordinates/oak")) return jsonResponse(coordPayload("oak", 399));
       throw new Error(url);
     });
     await runDrain();
@@ -2338,7 +2338,7 @@ describe("shottrax-share worker", () => {
 
   it("drains a queued search and follows a unique normalized name", async () => {
     const limits = readGolfapiLimits({});
-    expect(limits.floor).toBe(50);
+    expect(limits.floor).toBe(156);
     kv.set("gq:balance", { value: JSON.stringify({ left: limits.floor, at: 1, lastStatus: 200 }) });
     const blocked = await golfGet("/golfapi/v2.3/courses?country=US&q=Magnolia");
     expect(blocked.status).toBe(429);
@@ -2353,19 +2353,19 @@ describe("shottrax-share worker", () => {
     });
     kv.set("gqueue:q:nope", { value: JSON.stringify({ attempts: 0, at: 5, q: "nope", search: "?q=nope" }) });
 
-    kv.set("gq:balance", { value: JSON.stringify({ left: 80, at: 1, lastStatus: 200 }) });
+    kv.set("gq:balance", { value: JSON.stringify({ left: 400, at: 1, lastStatus: 200 }) });
     const calls = [];
     mockGolfApi(async (url) => {
       calls.push(url);
       if (url.includes("/courses?")) {
         return jsonResponse({
-          apiRequestsLeft: "80",
+          apiRequestsLeft: "400",
           numCourses: 1,
           courses: [{ courseID: "pebble", courseName: "Magnolia" }],
         });
       }
-      if (url.endsWith("/courses/pebble")) return jsonResponse(coursePayload("pebble", 80));
-      if (url.endsWith("/coordinates/pebble")) return jsonResponse(coordPayload("pebble", 80));
+      if (url.endsWith("/courses/pebble")) return jsonResponse(coursePayload("pebble", 400));
+      if (url.endsWith("/coordinates/pebble")) return jsonResponse(coordPayload("pebble", 399));
       throw new Error(url);
     });
     await runDrain();
@@ -2390,11 +2390,11 @@ describe("shottrax-share worker", () => {
 
   it("stores only the search when the queued name is not a single match", async () => {
     const limits = readGolfapiLimits({});
-    expect(limits.floor).toBe(50);
+    expect(limits.floor).toBe(156);
     async function enqueue(path) {
       kv.set("gq:balance", { value: JSON.stringify({ left: limits.floor, at: 1, lastStatus: 200 }) });
       expect((await golfGet(path)).status).toBe(429);
-      kv.set("gq:balance", { value: JSON.stringify({ left: 80, at: 1, lastStatus: 200 }) });
+      kv.set("gq:balance", { value: JSON.stringify({ left: 400, at: 1, lastStatus: 200 }) });
     }
 
     await enqueue("/golfapi/v2.3/courses?q=Pine");
@@ -2402,7 +2402,7 @@ describe("shottrax-share worker", () => {
     mockGolfApi(async (url) => {
       calls.push(url);
       return jsonResponse({
-        apiRequestsLeft: "80",
+        apiRequestsLeft: "400",
         numCourses: 2,
         courses: [
           { courseID: "a", courseName: "Pine" },
@@ -2424,7 +2424,7 @@ describe("shottrax-share worker", () => {
     mockGolfApi(async (url) => {
       calls.push(url);
       return jsonResponse({
-        apiRequestsLeft: "80",
+        apiRequestsLeft: "400",
         numCourses: 1,
         courses: [{ courseID: "zzz", courseName: "Other" }],
       });
@@ -2437,7 +2437,7 @@ describe("shottrax-share worker", () => {
   });
 
   it("leaves a queued search in place when the floor hits before course details", async () => {
-    expect(readGolfapiLimits({}).floor).toBe(50);
+    expect(readGolfapiLimits({}).floor).toBe(156);
     for (const [floor, queuedLeft, drainLeft, reported, resumeLeft] of [
       [10, 9, 40, 10, 30],
       [50, 9, 80, 50, 80],
@@ -2540,14 +2540,14 @@ describe("shottrax-share worker", () => {
   it("reports /meta/golfapi without secrets, install ids, or IPs", async () => {
     mockGolfApi(async (url) => {
       if (url.includes("/courses?")) {
-        return jsonResponse({ apiRequestsLeft: "80.5", numCourses: 1, courses: [{ courseID: "m", courseName: "M" }] });
+        return jsonResponse({ apiRequestsLeft: "400.5", numCourses: 1, courses: [{ courseID: "m", courseName: "M" }] });
       }
-      return jsonResponse(coursePayload("meta", 80));
+      return jsonResponse(coursePayload("meta", 400));
     });
     const limited = { ...env, GOLFAPI_DEVICE_DAY: "1" };
-    expect(readGolfapiLimits({}).floor).toBe(50);
+    expect(readGolfapiLimits({}).floor).toBe(156);
     expect(readGolfapiLimits({}).deviceDay).toBe(12);
-    expect(readGolfapiLimits(limited).floor).toBe(50);
+    expect(readGolfapiLimits(limited).floor).toBe(156);
     expect(readGolfapiLimits(limited).deviceDay).toBe(1);
     expect((await golfGet("/golfapi/v2.3/courses/meta", { env: limited })).status).toBe(200);
     expect((await golfGet("/golfapi/v2.3/courses/meta", { env: limited })).status).toBe(200);
@@ -2559,7 +2559,7 @@ describe("shottrax-share worker", () => {
     expect(meta.headers.get("Cache-Control")).toBe("no-store");
     const body = await meta.json();
     expect(body.balance).toEqual({
-      left: 80.5,
+      left: 400.5,
       at: expect.any(Number),
       lastStatus: 200,
       asOf: expect.any(String),

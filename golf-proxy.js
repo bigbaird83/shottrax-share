@@ -61,7 +61,7 @@
  * is exempt. Exact match. Not hardcoded here.
  *
  * Vars: GOLFAPI_INSTALL_DAILY_PULLS (4), GOLFAPI_DAILY_CAP (150),
- * GOLFAPI_MONTHLY_CAP (450), GOLFAPI_CREDIT_FLOOR (50),
+ * GOLFAPI_MONTHLY_CAP (450), GOLFAPI_CREDIT_FLOOR (156),
  * GOLFAPI_PLAN_MONTHLY (500), GOLFAPI_CYCLE_DAY (5),
  * GOLFAPI_INSTALL_DAILY_SEARCHES (30, not returned to the phone),
  * GOLFAPI_INSTALL_DAILY_CALL_BACKSTOP (20 credits, not returned to the phone),
@@ -83,10 +83,10 @@
  *   GOLFAPI_MONTHLY_CAP=1800
  *   GOLFAPI_PLAN_MONTHLY=2000
  *
- * GOLFAPI_CREDIT_FLOOR is the reserve Doc approved with the caps. The live
- * Worker already enforces it (PRs #379, #385–#387). A paid call is refused
- * with golfapi_limited when the last-seen apiRequestsLeft is at or below
- * the floor, including an allowlisted install. The allowlist still skips
+ * GOLFAPI_CREDIT_FLOOR is the never-expire reserve (156). The live Worker
+ * enforces it. A paid call is refused with golfapi_limited when that call
+ * would leave apiRequestsLeft below the floor, including an allowlisted
+ * install. A call that lands on 156 is allowed. The allowlist still skips
  * the per-phone pull limit and the 150/450 caps. A balance that has never been seen does not block.
  * A KV or edge hit is never refused by the floor. The number is read from
  * the JSON field apiRequestsLeft, else the apiRequestsLeft or
@@ -127,7 +127,9 @@
  * TERRAIN_KV falls back to GOLFAPI_KV.
  */
 
+import { GOLFAPI_CREDIT_FLOOR, golfApiSpendBreaksFloor } from './src/course/golfApiCreditFloor.mjs';
 import { handleStockpileAdmin, usStateCode } from './golf-stockpile.js';
+import { handleCourseCard } from './course-card.js';
 
 const VENDORS = {
   gca: {
@@ -166,7 +168,6 @@ const PULL_CREDIT_TENTHS = 10;
 const OPEN_ROOM_TENTHS = SEARCH_CREDIT_TENTHS + PULL_CREDIT_TENTHS + PULL_CREDIT_TENTHS;
 const DEFAULT_APP_DAILY = 150;
 const DEFAULT_APP_MONTHLY = 450;
-const DEFAULT_CREDIT_FLOOR = 50;
 const DEFAULT_PLAN_MONTHLY = 500;
 const DEFAULT_CYCLE_DAY = 5;
 const ALERT_LEVELS = [75, 90, 95];
@@ -803,7 +804,7 @@ function alertText(env, noted, pct) {
   const plan = intEnv(env, 'GOLFAPI_PLAN_MONTHLY', DEFAULT_PLAN_MONTHLY);
   const monthCap = intEnv(env, 'GOLFAPI_MONTHLY_CAP', DEFAULT_APP_MONTHLY);
   const dayCap = intEnv(env, 'GOLFAPI_DAILY_CAP', DEFAULT_APP_DAILY);
-  const floor = intEnv(env, 'GOLFAPI_CREDIT_FLOOR', DEFAULT_CREDIT_FLOOR);
+  const floor = intEnv(env, 'GOLFAPI_CREDIT_FLOOR', GOLFAPI_CREDIT_FLOOR);
   const left = noted.left == null ? null : Number(noted.left);
   const known = left != null && Number.isFinite(left);
   const raw = known ? String(left) : 'unknown';
@@ -1100,8 +1101,9 @@ async function handleGolfApi(request, url, rest, env, exempt, ctx) {
   const now = new Date();
   const pathId = courseIdFromRest(rest);
   const balance = await readBalance(kv);
-  const floor = intEnv(env, 'GOLFAPI_CREDIT_FLOOR', DEFAULT_CREDIT_FLOOR);
-  if (balance && balance.left <= floor) {
+  const floor = intEnv(env, 'GOLFAPI_CREDIT_FLOOR', GOLFAPI_CREDIT_FLOOR);
+  const callCost = (search ? SEARCH_CREDIT_TENTHS : PULL_CREDIT_TENTHS) / 10;
+  if (balance && golfApiSpendBreaksFloor(balance.left, callCost, floor)) {
     await logKnownRefusal(env, now, 'app_cap', pathId);
     return limited('floor', secondsUntilUtcDay(now));
   }
@@ -1722,6 +1724,9 @@ export async function handleGolfProxy(request, env, ctx) {
   if (pathname === '/admin/alert-test') return handleAlertTest(request, env ?? {});
   if (pathname === '/admin/demand') return handleDemand(request, env ?? {});
   if (pathname === '/admin/stockpile') return handleStockpileAdmin(request, env ?? {});
+
+  const courseCard = await handleCourseCard(request, env ?? {});
+  if (courseCard) return courseCard;
 
   if (pathname.startsWith(TERRAIN_PREFIX)) {
     return handleTerrain(request, url, env ?? {});
