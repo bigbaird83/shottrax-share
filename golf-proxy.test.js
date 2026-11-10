@@ -2022,7 +2022,12 @@ describe('golf proxy worker', { concurrency: 1 }, () => {
       assert.equal(raw.includes('ALSOSECRET'), false);
       assert.equal(raw.includes(install), false);
 
-      const nextCycle = await counterOp(fake, { op: 'readDemand', cycleId: '2026-11-05' });
+      const nextStart = new Date(`${cycleId}T00:00:00Z`);
+      nextStart.setUTCMonth(nextStart.getUTCMonth() + 1);
+      const nextCycle = await counterOp(fake, {
+        op: 'readDemand',
+        cycleId: golfapiCycleId(nextStart, 5),
+      });
       assert.deepEqual(nextCycle.pull_candidates, []);
       assert.deepEqual(nextCycle.no_data, []);
 
