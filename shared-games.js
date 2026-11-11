@@ -15,8 +15,13 @@
  * Not deployed. A deploy needs Brian's OK. No new secrets and no new vars.
  */
 import {
+  EXPO_PUSH_URL,
+  PUSH_TOKEN_RE,
+  areFriends,
   boardsBinding,
   consumeIpAction,
+  friendGet,
+  friendKvKey,
   consumeReadLimit,
   friendJson,
   guessNamespace,
@@ -34,6 +39,33 @@ export const SHARED_MAX_TEAMS = 2;
 export const SHARED_MAX_PER_TEAM = 4;
 export const SHARED_WOLF_PLAYERS = 4;
 export const SHARED_TEAM_NAME_MAX = 20;
+/**
+ * Team-name filter, the same list and rule as the app (src/domain/sharedGame.ts
+ * SHARED_TEAM_NAME_BLOCKLIST / nameHitsBlocklist): whole word, any case; a listed
+ * word of 4+ letters also matches inside the letters-only spelling.
+ */
+export const SHARED_TEAM_NAME_BLOCKLIST = Object.freeze([
+  "ass",
+  "asshole",
+  "bastard",
+  "bitch",
+  "cock",
+  "cunt",
+  "dick",
+  "fag",
+  "faggot",
+  "fuck",
+  "nigga",
+  "nigger",
+  "piss",
+  "pussy",
+  "shit",
+  "slut",
+]);
+/** Invite push data kind. The app opens the in-app invite for this game on tap. */
+export const SHARED_INVITE_PUSH_KIND = "shared_game_invite";
+const PUSH_TITLE_MAX = 200;
+const PUSH_BODY_MAX = 500;
 export const SHARED_FORMATS = Object.freeze([
   "strokePlay",
   "matchPlay",
@@ -99,10 +131,47 @@ const GAME_SCHEMA = [
     player_id TEXT NOT NULL,
     hole INTEGER NOT NULL
   )`,
+  // Invites sent by the organizer. A row stays as "sent" until that friend joins.
+  `CREATE TABLE IF NOT EXISTS invite (
+    player_id TEXT PRIMARY KEY,
+    friend_id TEXT NOT NULL,
+    team INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    at INTEGER NOT NULL
+  )`,
+  // Score suggestions. Open until the player accepts or keeps their own score.
+  `CREATE TABLE IF NOT EXISTS suggestion (
+    id TEXT PRIMARY KEY,
+    player_id TEXT NOT NULL,
+    hole INTEGER NOT NULL,
+    strokes INTEGER NOT NULL,
+    suggested_by TEXT NOT NULL,
+    against_rev INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    at INTEGER NOT NULL
+  )`,
+  // First hole a player who joined mid-round plays. Null: from the start.
+  `CREATE TABLE IF NOT EXISTS joined_hole (
+    player_id TEXT PRIMARY KEY,
+    hole INTEGER
+  )`,
 ];
 
 export function isSharedGamePath(pathname) {
   return pathname === "/v1/shared-games" || pathname.startsWith("/v1/shared-games/");
+}
+
+/** Whole word, any case; a listed word of 4+ letters also hits inside the letters-only spelling. */
+export function teamNameHitsBlocklist(name, blocklist = SHARED_TEAM_NAME_BLOCKLIST) {
+  const lower = String(name).toLowerCase();
+  const letters = lower.replace(/[^a-z]/g, "");
+  for (const word of blocklist) {
+    const listed = String(word).toLowerCase();
+    if (!/^[a-z]+$/.test(listed)) continue;
+    if (new RegExp(`(?:^|[^a-z])${listed}(?:[^a-z]|$)`).test(lower)) return true;
+    if (listed.length >= 4 && letters.includes(listed)) return true;
+  }
+  return false;
 }
 
 /**
@@ -166,6 +235,12 @@ export async function handleSharedGames(request, url, env, cors) {
     return readGame(request, env, cors, route.gameId);
   }
   if (request.method !== "POST") return reply(405, { error: "method_not_allowed" }, cors);
+  if (route.kind === "invites") return postInvites(request, env, cors, route.gameId);
+  if (route.kind === "join") return postJoin(request, env, cors, route.gameId);
+  if (route.kind === "decline") return postDecline(request, env, cors, route.gameId);
+  if (route.kind === "team") return postTeamName(request, env, cors, route.gameId, route.team);
+  if (route.kind === "suggestions") return postSuggestion(request, env, cors, route.gameId);
+  if (route.kind === "suggestion") return postSuggestionAction(request, env, cors, route.gameId, route.suggestionId);
   return postScore(request, env, cors, route.gameId);
 }
 
@@ -182,9 +257,19 @@ function routeOf(pathname) {
     if (!ID_RE.test(parts[0])) return { kind: "bad" };
     return { kind: "game", gameId: parts[0] };
   }
-  if (parts.length === 2 && parts[1] === "scores") {
+  if (parts.length === 2 && ["scores", "invites", "join", "decline", "suggestions"].includes(parts[1])) {
     if (!ID_RE.test(parts[0])) return { kind: "bad" };
-    return { kind: "scores", gameId: parts[0] };
+    return { kind: parts[1], gameId: parts[0] };
+  }
+  if (parts.length === 3 && parts[1] === "teams") {
+    if (!ID_RE.test(parts[0])) return { kind: "bad" };
+    const team = /^[1-9][0-9]?$/.test(parts[2]) ? Number(parts[2]) : NaN;
+    if (!Number.isInteger(team) || team < 1 || team > SHARED_MAX_TEAMS) return { kind: "bad" };
+    return { kind: "team", gameId: parts[0], team };
+  }
+  if (parts.length === 3 && parts[1] === "suggestions") {
+    if (!ID_RE.test(parts[0]) || !ID_RE.test(parts[2])) return { kind: "bad" };
+    return { kind: "suggestion", gameId: parts[0], suggestionId: parts[2] };
   }
   return { kind: "unknown" };
 }
@@ -235,6 +320,259 @@ async function postScore(request, env, cors, gameId) {
     ...score.score,
   });
   return mapScore(answer, cors);
+}
+
+/**
+ * POST /v1/shared-games/:gameId/invites (organizer only)
+ *   { invitees: [{ playerId, friendId, team }], push: { title, body? } }
+ *   → { invites: [{ playerId, status: "sent" | "joined" }] }
+ * An invitee's playerId is their friend ownerId (the Worker's player identity).
+ * They must be the organizer's accepted friend both ways and not blocked either
+ * way with anyone on the card. Pending invites count toward the caps. A friend
+ * newly invited gets the push once, as the APNs alert through Expo, with data
+ * { kind: "shared_game_invite", gameId }.
+ */
+async function postInvites(request, env, cors, gameId) {
+  const ready = await readyCaller(request, env, cors);
+  if (ready.response) return ready.response;
+  const limited = await consumeReadLimit(request, env, ready.friendKey, "keysgwrite:", "ipsgwrite:", cors);
+  if (limited) return limited;
+  const parsed = await readJsonObject(request, CREATE_BODY_LIMIT, false);
+  if (parsed.error) return bodyError(parsed, cors);
+  const body = normalizeInvites(stripWagerKeys(parsed.value));
+  if (body.error === "cap") return reply(409, { error: "cap" }, cors);
+  if (body.error) return reply(400, { error: "invalid_body" }, cors);
+  const access = await accessGame(ready, env, cors, gameId);
+  if (access.response) return access.response;
+  if (access.members.organizerId !== ready.caller.ownerId) return reply(403, { error: "forbidden" }, cors);
+  const roster = access.members.players.map((player) => player.playerId);
+  for (const invitee of body.invitees) {
+    if (invitee.friendId === ready.caller.ownerId) return reply(400, { error: "invalid_body" }, cors);
+    const friends =
+      (await areFriends(ready.boards, ready.caller.ownerId, invitee.friendId)) &&
+      (await areFriends(ready.boards, invitee.friendId, ready.caller.ownerId));
+    if (!friends) return reply(403, { error: "forbidden" }, cors);
+    if (await callerBlocked(ready.boards, invitee.friendId, roster)) return reply(409, { error: "blocked" }, cors);
+  }
+  const answer = await gameCall(env, gameId, {
+    op: "invite",
+    callerId: ready.caller.ownerId,
+    now: Date.now(),
+    invitees: body.invitees,
+  });
+  if (!answer.ok) return mapScore(answer, cors);
+  await sendInvitePushes(env, ready.boards, gameId, answer.newlySent, body.push);
+  return reply(200, { invites: answer.invites }, cors);
+}
+
+/**
+ * POST /v1/shared-games/:gameId/join  { playerId, joinedHole } → { game }
+ * Only the invited friend, as themselves. joinedHole is null (from the start)
+ * or 1–18 for a mid-round joiner. Joining again returns the game.
+ */
+async function postJoin(request, env, cors, gameId) {
+  const ready = await readyCaller(request, env, cors);
+  if (ready.response) return ready.response;
+  const limited = await consumeReadLimit(request, env, ready.friendKey, "keysgwrite:", "ipsgwrite:", cors);
+  if (limited) return limited;
+  const parsed = await readJsonObject(request, CREATE_BODY_LIMIT, false);
+  if (parsed.error) return bodyError(parsed, cors);
+  const body = stripWagerKeys(parsed.value);
+  if (!body || typeof body !== "object" || Array.isArray(body) || unknownFields(body, ["playerId", "joinedHole"])) {
+    return reply(400, { error: "invalid_body" }, cors);
+  }
+  if (typeof body.playerId !== "string" || !ID_RE.test(body.playerId)) return reply(400, { error: "invalid_body" }, cors);
+  const joinedHole = body.joinedHole == null ? null : body.joinedHole;
+  if (joinedHole !== null && (!Number.isInteger(joinedHole) || joinedHole < 1 || joinedHole > HOLE_MAX)) {
+    return reply(400, { error: "invalid_body" }, cors);
+  }
+  if (body.playerId !== ready.caller.ownerId) return reply(403, { error: "forbidden" }, cors);
+  const members = await gameCall(env, gameId, { op: "members" });
+  if (!members.ok) return reply(404, { error: "not_found" }, cors);
+  const roster = members.players.map((player) => player.playerId);
+  if (await callerBlocked(ready.boards, ready.caller.ownerId, roster)) return reply(409, { error: "blocked" }, cors);
+  const answer = await gameCall(env, gameId, { op: "join", callerId: ready.caller.ownerId, joinedHole });
+  if (answer.ok) return reply(200, { game: answer.game }, cors);
+  return mapScore(answer, cors);
+}
+
+/** POST /v1/shared-games/:gameId/decline  { playerId } → { ok: true }. Only the invited friend, before joining. */
+async function postDecline(request, env, cors, gameId) {
+  const ready = await readyCaller(request, env, cors);
+  if (ready.response) return ready.response;
+  const limited = await consumeReadLimit(request, env, ready.friendKey, "keysgwrite:", "ipsgwrite:", cors);
+  if (limited) return limited;
+  const parsed = await readJsonObject(request, CREATE_BODY_LIMIT, false);
+  if (parsed.error) return bodyError(parsed, cors);
+  const body = stripWagerKeys(parsed.value);
+  if (!body || typeof body !== "object" || Array.isArray(body) || unknownFields(body, ["playerId"])) {
+    return reply(400, { error: "invalid_body" }, cors);
+  }
+  if (typeof body.playerId !== "string" || !ID_RE.test(body.playerId)) return reply(400, { error: "invalid_body" }, cors);
+  if (body.playerId !== ready.caller.ownerId) return reply(403, { error: "forbidden" }, cors);
+  const answer = await gameCall(env, gameId, { op: "decline", callerId: ready.caller.ownerId });
+  if (answer.ok) return reply(200, { ok: true }, cors);
+  return mapScore(answer, cors);
+}
+
+/**
+ * POST /v1/shared-games/:gameId/teams/:n  { name } → { team: { number, name } }
+ * Any player on team n renames it; anyone else is 403. 1–20 code points after a
+ * trim, no control characters, and not caught by the team-name filter.
+ */
+async function postTeamName(request, env, cors, gameId, team) {
+  const ready = await readyCaller(request, env, cors);
+  if (ready.response) return ready.response;
+  const limited = await consumeReadLimit(request, env, ready.friendKey, "keysgwrite:", "ipsgwrite:", cors);
+  if (limited) return limited;
+  const parsed = await readJsonObject(request, CREATE_BODY_LIMIT, false);
+  if (parsed.error) return bodyError(parsed, cors);
+  const body = stripWagerKeys(parsed.value);
+  if (!body || typeof body !== "object" || Array.isArray(body) || unknownFields(body, ["name"])) {
+    return reply(400, { error: "invalid_body" }, cors);
+  }
+  const name = cleanTeamName(body.name);
+  if (!name || teamNameHitsBlocklist(name)) return reply(400, { error: "invalid_body" }, cors);
+  const access = await accessGame(ready, env, cors, gameId);
+  if (access.response) return access.response;
+  const answer = await gameCall(env, gameId, { op: "rename", callerId: ready.caller.ownerId, team, name });
+  if (answer.ok) return reply(200, { team: answer.team }, cors);
+  return mapScore(answer, cors);
+}
+
+/**
+ * POST /v1/shared-games/:gameId/suggestions
+ *   { suggestionId, playerId, hole, strokes, rev } → { suggestion: { id, status: "open" } }
+ * Another player suggests a fix to a player's standing score. Not for a guest
+ * (the host keeps it) and not for your own score. rev is the cell's current
+ * rev; a stale one is 409 stale_rev with the standing cell. The standing score
+ * does not change until that player accepts.
+ */
+async function postSuggestion(request, env, cors, gameId) {
+  const ready = await readyCaller(request, env, cors);
+  if (ready.response) return ready.response;
+  const limited = await consumeReadLimit(request, env, ready.friendKey, "keysgwrite:", "ipsgwrite:", cors);
+  if (limited) return limited;
+  const parsed = await readJsonObject(request, CREATE_BODY_LIMIT, false);
+  if (parsed.error) return bodyError(parsed, cors);
+  const body = stripWagerKeys(parsed.value);
+  if (!body || typeof body !== "object" || Array.isArray(body)) return reply(400, { error: "invalid_body" }, cors);
+  if (unknownFields(body, ["suggestionId", "playerId", "hole", "strokes", "rev"])) return reply(400, { error: "invalid_body" }, cors);
+  if (typeof body.suggestionId !== "string" || !ID_RE.test(body.suggestionId)) return reply(400, { error: "invalid_body" }, cors);
+  if (typeof body.playerId !== "string" || !ID_RE.test(body.playerId)) return reply(400, { error: "invalid_body" }, cors);
+  if (!Number.isInteger(body.hole) || body.hole < 1 || body.hole > HOLE_MAX) return reply(400, { error: "invalid_body" }, cors);
+  if (!Number.isInteger(body.strokes) || body.strokes < STROKE_MIN || body.strokes > STROKE_MAX) {
+    return reply(400, { error: "invalid_body" }, cors);
+  }
+  if (!Number.isInteger(body.rev) || body.rev < 1 || body.rev > 1_000_000) return reply(400, { error: "invalid_body" }, cors);
+  const access = await accessGame(ready, env, cors, gameId);
+  if (access.response) return access.response;
+  const answer = await gameCall(env, gameId, {
+    op: "suggest",
+    callerId: ready.caller.ownerId,
+    now: Date.now(),
+    suggestionId: body.suggestionId,
+    playerId: body.playerId,
+    hole: body.hole,
+    strokes: body.strokes,
+    rev: body.rev,
+  });
+  if (answer.ok) return reply(200, { suggestion: answer.suggestion }, cors);
+  return mapScore(answer, cors);
+}
+
+/**
+ * POST /v1/shared-games/:gameId/suggestions/:id  { action: "accept" | "keep" }
+ *   → { suggestion: { id, status: "accepted" | "kept" } }
+ * Only the player the suggestion is for. Accept writes it as their own score if
+ * the cell is still at the rev it was made against (else 409 stale_rev with the
+ * cell). Keep closes it and leaves the score as it is.
+ */
+async function postSuggestionAction(request, env, cors, gameId, suggestionId) {
+  const ready = await readyCaller(request, env, cors);
+  if (ready.response) return ready.response;
+  const limited = await consumeReadLimit(request, env, ready.friendKey, "keysgwrite:", "ipsgwrite:", cors);
+  if (limited) return limited;
+  const parsed = await readJsonObject(request, CREATE_BODY_LIMIT, false);
+  if (parsed.error) return bodyError(parsed, cors);
+  const body = stripWagerKeys(parsed.value);
+  if (!body || typeof body !== "object" || Array.isArray(body) || unknownFields(body, ["action"])) {
+    return reply(400, { error: "invalid_body" }, cors);
+  }
+  if (body.action !== "accept" && body.action !== "keep") return reply(400, { error: "invalid_body" }, cors);
+  const access = await accessGame(ready, env, cors, gameId);
+  if (access.response) return access.response;
+  const answer = await gameCall(env, gameId, {
+    op: "resolve",
+    callerId: ready.caller.ownerId,
+    now: Date.now(),
+    suggestionId,
+    action: body.action,
+  });
+  if (answer.ok) return reply(200, { suggestion: answer.suggestion }, cors);
+  return mapScore(answer, cors);
+}
+
+function normalizeInvites(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return { error: "invalid_body" };
+  if (unknownFields(body, ["invitees", "push"])) return { error: "invalid_body" };
+  if (!Array.isArray(body.invitees) || body.invitees.length < 1 || body.invitees.length > SHARED_MAX_PLAYERS) {
+    return { error: "invalid_body" };
+  }
+  const invitees = [];
+  const seen = new Set();
+  let overTeams = false;
+  for (const row of body.invitees) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) return { error: "invalid_body" };
+    if (unknownFields(row, ["playerId", "friendId", "team"])) return { error: "invalid_body" };
+    if (typeof row.playerId !== "string" || !ID_RE.test(row.playerId)) return { error: "invalid_body" };
+    if (typeof row.friendId !== "string" || !ID_RE.test(row.friendId)) return { error: "invalid_body" };
+    // The Worker's player identity: an invited friend plays as their own ownerId.
+    if (row.playerId !== row.friendId || seen.has(row.playerId)) return { error: "invalid_body" };
+    seen.add(row.playerId);
+    if (typeof row.team !== "number" || !Number.isInteger(row.team) || row.team < 1) return { error: "invalid_body" };
+    if (row.team > SHARED_MAX_TEAMS) overTeams = true;
+    invitees.push({ playerId: row.playerId, friendId: row.friendId, team: row.team });
+  }
+  const push = body.push;
+  if (!push || typeof push !== "object" || Array.isArray(push) || unknownFields(push, ["title", "body"])) {
+    return { error: "invalid_body" };
+  }
+  if (typeof push.title !== "string" || push.title.trim().length < 1 || push.title.length > PUSH_TITLE_MAX) {
+    return { error: "invalid_body" };
+  }
+  if (push.body != null && (typeof push.body !== "string" || push.body.trim().length < 1 || push.body.length > PUSH_BODY_MAX)) {
+    return { error: "invalid_body" };
+  }
+  if (overTeams) return { error: "cap" };
+  return { invitees, push: { title: push.title, ...(push.body != null ? { body: push.body } : {}) } };
+}
+
+/** Best effort, after the invites are stored. A friend with no push token has notifications off. */
+async function sendInvitePushes(env, boards, gameId, friendIds, push) {
+  if (!Array.isArray(friendIds) || friendIds.length === 0) return;
+  const messages = [];
+  for (const friendId of friendIds) {
+    const token = await friendGet(boards, friendKvKey("push", friendId));
+    if (typeof token !== "string" || !PUSH_TOKEN_RE.test(token)) continue;
+    messages.push({
+      to: token,
+      title: push.title,
+      ...(push.body ? { body: push.body } : {}),
+      sound: "default",
+      data: { kind: SHARED_INVITE_PUSH_KIND, gameId },
+    });
+  }
+  if (messages.length === 0) return;
+  const headers = { "Content-Type": "application/json", Accept: "application/json" };
+  if (env && typeof env.EXPO_ACCESS_TOKEN === "string" && env.EXPO_ACCESS_TOKEN.length > 0) {
+    headers.Authorization = `Bearer ${env.EXPO_ACCESS_TOKEN}`;
+  }
+  try {
+    await fetch(EXPO_PUSH_URL, { method: "POST", headers, body: JSON.stringify(stripWagerKeys(messages)) });
+  } catch {
+    // Best effort: the invites are already stored.
+  }
 }
 
 async function storeNewGame(ready, env, cors, game) {
@@ -612,6 +950,12 @@ export class SharedGame {
       if (op === "members") return gameJson(this.#members());
       if (op === "read") return gameJson(this.#read(body));
       if (op === "score") return gameJson(this.ctx.storage.transactionSync(() => this.#score(body)));
+      if (op === "invite") return gameJson(this.ctx.storage.transactionSync(() => this.#invite(body)));
+      if (op === "join") return gameJson(this.ctx.storage.transactionSync(() => this.#join(body)));
+      if (op === "decline") return gameJson(this.ctx.storage.transactionSync(() => this.#decline(body)));
+      if (op === "rename") return gameJson(this.ctx.storage.transactionSync(() => this.#rename(body)));
+      if (op === "suggest") return gameJson(this.ctx.storage.transactionSync(() => this.#suggest(body)));
+      if (op === "resolve") return gameJson(this.ctx.storage.transactionSync(() => this.#resolve(body)));
     } catch {
       return gameJson({ ok: false, error: "unavailable" });
     }
@@ -726,6 +1070,174 @@ export class SharedGame {
     );
     this.#run("INSERT INTO write_id (client_write_id, player_id, hole) VALUES (?, ?, ?)", clientWriteId, playerId, hole);
     return { ok: true, cell: this.#cell(playerId, hole) };
+  }
+
+  /** Seats taken: players plus invites still waiting, overall and per team. */
+  #seats() {
+    const players = this.#sql("SELECT player_id, team FROM player");
+    const pending = this.#sql("SELECT player_id, team FROM invite WHERE status = 'sent'").filter(
+      (row) => !players.some((player) => player.player_id === row.player_id),
+    );
+    const perTeam = new Map();
+    for (const row of [...players, ...pending]) {
+      if (row.team == null) continue;
+      const team = Number(row.team);
+      perTeam.set(team, (perTeam.get(team) ?? 0) + 1);
+    }
+    return { total: players.length + pending.length, perTeam };
+  }
+
+  #invite({ callerId, now, invitees }) {
+    const row = this.#gameRow();
+    if (!row) return { ok: false, error: "not_found" };
+    if (!this.#isPlayer(callerId)) return { ok: false, error: "forbidden" };
+    if (row.organizer_id !== callerId) return { ok: false, error: "forbidden" };
+    const seats = this.#seats();
+    const fresh = [];
+    const invites = [];
+    for (const invitee of invitees) {
+      if (this.#isPlayer(invitee.playerId)) {
+        invites.push({ playerId: invitee.playerId, status: "joined" });
+        continue;
+      }
+      const prior = this.#sql("SELECT status FROM invite WHERE player_id = ?", invitee.playerId);
+      if (prior.length === 1) {
+        invites.push({ playerId: invitee.playerId, status: prior[0].status === "joined" ? "joined" : "sent" });
+        continue;
+      }
+      fresh.push(invitee);
+      invites.push({ playerId: invitee.playerId, status: "sent" });
+    }
+    let total = seats.total;
+    const perTeam = new Map(seats.perTeam);
+    for (const invitee of fresh) {
+      total += 1;
+      perTeam.set(invitee.team, (perTeam.get(invitee.team) ?? 0) + 1);
+    }
+    if (total > SHARED_MAX_PLAYERS) return { ok: false, error: "cap" };
+    if (row.format === "wolf" && total > SHARED_WOLF_PLAYERS) return { ok: false, error: "cap" };
+    for (const count of perTeam.values()) if (count > SHARED_MAX_PER_TEAM) return { ok: false, error: "cap" };
+    for (const invitee of fresh) {
+      this.#run(
+        "INSERT INTO invite (player_id, friend_id, team, status, at) VALUES (?, ?, ?, 'sent', ?)",
+        invitee.playerId,
+        invitee.friendId,
+        invitee.team,
+        now,
+      );
+    }
+    return { ok: true, invites, newlySent: fresh.map((invitee) => invitee.friendId) };
+  }
+
+  #join({ callerId, joinedHole }) {
+    const row = this.#gameRow();
+    if (!row) return { ok: false, error: "not_found" };
+    if (this.#isPlayer(callerId)) return { ok: true, game: this.#publicGame(row) };
+    const invite = this.#sql("SELECT team, status FROM invite WHERE player_id = ? AND friend_id = ?", callerId, callerId);
+    if (invite.length !== 1 || invite[0].status !== "sent") return { ok: false, error: "forbidden" };
+    const team = Number(invite[0].team);
+    const players = this.#sql("SELECT team FROM player");
+    if (players.length + 1 > SHARED_MAX_PLAYERS) return { ok: false, error: "cap" };
+    if (players.filter((player) => Number(player.team) === team).length + 1 > SHARED_MAX_PER_TEAM) {
+      return { ok: false, error: "cap" };
+    }
+    // installId is the friend's ownerId: the app reads every non-guest with an install id.
+    this.#run(
+      "INSERT INTO player (player_id, install_id, guest, team, name) VALUES (?, ?, 0, ?, NULL)",
+      callerId,
+      callerId,
+      team,
+    );
+    this.#run("INSERT OR REPLACE INTO joined_hole (player_id, hole) VALUES (?, ?)", callerId, joinedHole);
+    this.#run("UPDATE invite SET status = 'joined' WHERE player_id = ?", callerId);
+    return { ok: true, game: this.#publicGame(this.#gameRow()) };
+  }
+
+  #decline({ callerId }) {
+    const row = this.#gameRow();
+    if (!row) return { ok: false, error: "not_found" };
+    if (this.#isPlayer(callerId)) return { ok: false, error: "refused" };
+    const invite = this.#sql("SELECT status FROM invite WHERE player_id = ? AND friend_id = ?", callerId, callerId);
+    if (invite.length !== 1) return { ok: false, error: "forbidden" };
+    this.#run("DELETE FROM invite WHERE player_id = ?", callerId);
+    return { ok: true };
+  }
+
+  #rename({ callerId, team, name }) {
+    const row = this.#gameRow();
+    if (!row) return { ok: false, error: "not_found" };
+    const caller = this.#player(callerId);
+    if (!caller) return { ok: false, error: "forbidden" };
+    if (caller.team == null || Number(caller.team) !== team) return { ok: false, error: "forbidden" };
+    this.#run("INSERT INTO team (number, name) VALUES (?, ?) ON CONFLICT(number) DO UPDATE SET name = excluded.name", team, name);
+    return { ok: true, team: { number: team, name } };
+  }
+
+  #suggest({ callerId, suggestionId, playerId, hole, strokes, rev, now }) {
+    const row = this.#gameRow();
+    if (!row) return { ok: false, error: "not_found" };
+    if (!this.#isPlayer(callerId)) return { ok: false, error: "forbidden" };
+    const prior = this.#sql("SELECT player_id, hole, strokes, suggested_by, status FROM suggestion WHERE id = ?", suggestionId);
+    if (prior.length === 1) {
+      const same =
+        prior[0].player_id === playerId &&
+        Number(prior[0].hole) === hole &&
+        Number(prior[0].strokes) === strokes &&
+        prior[0].suggested_by === callerId;
+      return same ? { ok: true, suggestion: { id: suggestionId, status: prior[0].status } } : { ok: false, error: "refused" };
+    }
+    const target = this.#player(playerId);
+    // The host keeps a guest's score, and your own score is not a suggestion.
+    if (!target || Number(target.guest) === 1 || playerId === callerId) return { ok: false, error: "refused" };
+    const cell = this.#cell(playerId, hole);
+    if (cell.strokes == null) return { ok: false, error: "refused" };
+    if (rev !== cell.rev) return { ok: false, error: "stale_rev", cell };
+    this.#run(
+      `INSERT INTO suggestion (id, player_id, hole, strokes, suggested_by, against_rev, status, at)
+       VALUES (?, ?, ?, ?, ?, ?, 'open', ?)`,
+      suggestionId,
+      playerId,
+      hole,
+      strokes,
+      callerId,
+      cell.rev,
+      now,
+    );
+    return { ok: true, suggestion: { id: suggestionId, status: "open" } };
+  }
+
+  #resolve({ callerId, suggestionId, action, now }) {
+    const row = this.#gameRow();
+    if (!row) return { ok: false, error: "not_found" };
+    if (!this.#isPlayer(callerId)) return { ok: false, error: "forbidden" };
+    const found = this.#sql("SELECT player_id, hole, strokes, against_rev, status FROM suggestion WHERE id = ?", suggestionId);
+    if (found.length !== 1) return { ok: false, error: "not_found" };
+    const suggestion = found[0];
+    if (suggestion.player_id !== callerId) return { ok: false, error: "forbidden" };
+    if (suggestion.status !== "open") return { ok: false, error: "refused" };
+    const hole = Number(suggestion.hole);
+    if (action === "keep") {
+      this.#run("UPDATE suggestion SET status = 'kept' WHERE id = ?", suggestionId);
+      return { ok: true, suggestion: { id: suggestionId, status: "kept" } };
+    }
+    const entries = this.#history(callerId, hole);
+    const current = entries.length ? Number(entries[entries.length - 1].rev) : 0;
+    if (current !== Number(suggestion.against_rev)) return { ok: false, error: "stale_rev", cell: this.#cell(callerId, hole) };
+    const writeId = `sug:${suggestionId}`;
+    this.#run(
+      `INSERT INTO score_history (player_id, hole, rev, strokes, entered_by, source, client_write_id, at)
+       VALUES (?, ?, ?, ?, ?, 'own', ?, ?)`,
+      callerId,
+      hole,
+      current + 1,
+      Number(suggestion.strokes),
+      callerId,
+      writeId,
+      now,
+    );
+    this.#run("INSERT INTO write_id (client_write_id, player_id, hole) VALUES (?, ?, ?)", writeId, callerId, hole);
+    this.#run("UPDATE suggestion SET status = 'accepted' WHERE id = ?", suggestionId);
+    return { ok: true, suggestion: { id: suggestionId, status: "accepted" } };
   }
 
   #scores() {
