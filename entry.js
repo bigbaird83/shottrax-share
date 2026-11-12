@@ -8,6 +8,7 @@ import { coverageFromOverlayResponse, handleGolfProxy, GolfapiCounter, runGolfap
 import { FriendGuessLimiter, handleFriends, isFriendPath } from "./friends.js";
 import { LeagueRoster, handleLeagues, isLeaguePath } from "./leagues.js";
 import { SharedGame, handleSharedGames, isSharedGamePath } from "./shared-games.js";
+import { handleCourseCorrections, isCourseCorrectionsPath } from "./course-corrections.js";
 
 export { GolfapiCounter };
 export { FriendGuessLimiter };
@@ -168,6 +169,9 @@ export default {
         status: 404,
         headers: { "Content-Type": "application/json" },
       }), pathname);
+    }
+    if (request.method !== "OPTIONS" && isCourseCorrectionsPath(pathname)) {
+      return withLiveCors(handleCourseCorrections(request), pathname);
     }
     if (request.method !== "OPTIONS" && isPrPath(pathname)) {
       const res = await handleGolfProxy(request, env, ctx);
