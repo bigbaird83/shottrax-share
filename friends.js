@@ -2169,6 +2169,8 @@ function doJson(body, status = 200) {
 
 // Shared with leagues.js so league calls use the same auth, body, name and limit rules.
 export {
+  PUSH_TOKEN_RE,
+  areFriends,
   boardsBinding,
   consumeGuess,
   consumeIpAction,

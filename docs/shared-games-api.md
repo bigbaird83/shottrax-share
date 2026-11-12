@@ -9,6 +9,12 @@ Every call uses the friends `X-Friend-Key`. The caller needs a friend code alrea
 | `POST /v1/shared-games` | `{ gameId?, format, scoring, options?, teams?, players }` | `{ game }` |
 | `GET /v1/shared-games/:gameId` | none | `{ game, scores }` |
 | `POST /v1/shared-games/:gameId/scores` | `{ playerId, hole, strokes, rev, clientWriteId }` | `{ cell }` |
+| `POST /v1/shared-games/:gameId/invites` | `{ invitees: [{ playerId, friendId, team }], push: { title, body? } }` | `{ invites: [{ playerId, status }] }` |
+| `POST /v1/shared-games/:gameId/join` | `{ playerId, joinedHole }` | `{ game }` |
+| `POST /v1/shared-games/:gameId/decline` | `{ playerId }` | `{ ok: true }` |
+| `POST /v1/shared-games/:gameId/teams/:n` | `{ name }` | `{ team: { number, name } }` |
+| `POST /v1/shared-games/:gameId/suggestions` | `{ suggestionId, playerId, hole, strokes, rev }` | `{ suggestion: { id, status } }` |
+| `POST /v1/shared-games/:gameId/suggestions/:id` | `{ action: "accept" \| "keep" }` | `{ suggestion: { id, status } }` |
 
 Ids (`gameId`, `playerId`, `installId`, `clientWriteId`, team `memberIds`) match `^[A-Za-z0-9_-]{1,64}$`.
 
@@ -43,4 +49,20 @@ Wager keys are stripped from the input and never returned, empty or not: `wager`
 | 429 | `rate_limited`, plus `Retry-After` |
 | 503 | `unavailable` |
 
-Creates: 30 per IP per hour. Reads: 60 per key and per IP per hour. Score writes: 240 per key and per IP per hour, so a racing burst can finish.
+## Invites, join, decline, team names, suggestions (for ShotTraxx PR #861)
+
+Invites: only the organizer. Each invitee must be the organizer's friend both ways, and plays as their own `ownerId`, so `playerId` must equal `friendId` (else `400`). Inviting yourself is `400`. A block in either direction between an invitee and anyone on the list is `409` `blocked`. `team` is 1 or 2 (3 or more is `409` `cap`). A pending invite holds its seat, so the 8-player, 4-per-team and wolf caps count it (`409` `cap`). `status` is `sent`, or `joined` once they are on the card. Sending the same invite again gives the same answer and no second push.
+
+Each newly invited friend with a push token gets one push through Expo (an APNs alert): `{ to, title, body?, sound: "default", data: { kind: "shared_game_invite", gameId } }`. `title` is 1–200 characters, `body` 1–500 and left out when not sent. A friend with no token (notifications off) gets the invite with no push.
+
+Join: only the invited friend, with their own `ownerId` as `playerId` (else `403`). `joinedHole` is null (from the start) or 1–18 for a mid-round join. No invite, or a declined one, is `403`. A block with anyone on the list is `409` `blocked`. Joining again returns the game. A joined player's `installId` is their `ownerId`.
+
+Decline: only the invited friend (else `403`), before joining (after is `409` `refused`). It removes the invite.
+
+Team names: any player on team `n` (else `403`). `n` other than 1 or 2 is `404`. `name` is trimmed, 1–20 code points, no control characters, and not caught by the app's team-name filter (else `400`).
+
+Suggestions: any player on the list suggests a fix to another non-guest player's score. Not for a guest (the host keeps it), not for your own score, and not before the player has a score: `409` `refused`. `rev` is the cell's current rev (1 or more); a stale one is `409` `stale_rev` with `cell`. The standing score does not change. The same `suggestionId` again with the same content returns it; with different content it is `409` `refused`.
+
+Accept or keep: only the player the suggestion is for (else `403`). An unknown id is `404`. A closed one is `409` `refused`. `accept` writes the suggestion as the player's own score (`source: "own"`, `clientWriteId` `sug:<id>`) if the cell is still at the rev it was made against; otherwise `409` `stale_rev` with `cell`, and the suggestion stays open. `keep` closes it and leaves the score.
+
+Creates: 30 per IP per hour. Reads: 60 per key and per IP per hour. Score writes and the six routes above share one limit: 240 per key and per IP per hour, so a racing burst can finish.
