@@ -141,6 +141,25 @@ CORS for this route allows `GET,POST,OPTIONS` and the `Authorization` header. Ot
 
 A deploy is a manual `npx wrangler deploy` approved by Brian. Auto-deploy on merge to `main` is off. The admin list and review stay closed until `COURSE_REPORTS_ADMIN_TOKEN` is set. Do not put that token in `wrangler.toml`.
 
+## Course corrections
+
+`GET /v1/course-corrections` serves `src/course-corrections.json`: hand-checked
+pars (and optionally the men's stroke index) keyed by app course id, e.g.
+`local:opengolf:<uuid>`. Same key as the app's paint and GCA routes
+(`X-Install-Id`, else `401 install_id_required`). `ETag` is `"cc-v<version>"`,
+`If-None-Match` with that tag is a 304, and `Cache-Control` is
+`private, max-age=3600`.
+
+The app fills only a par that is 0 or missing, and a stroke index only where
+the hole has none. `"override": true` on an entry replaces stored pars too.
+Rounds already in progress keep their pars.
+
+To fix a course: edit its entry (par 3-6 for 9 or 18 holes, strokeIndex
+1..n once each, note = source + date), bump `version`, open a PR. Tests in
+`course-corrections.test.js` validate the file; a file that fails validation
+is never served (503), so phones keep their last good copy. Live after a
+Worker deploy (Brian's OK); no app build.
+
 ## Golf vendor proxy
 
 GCA search (`GET /gca/v1/courses?...`) is cached at the edge for 24 hours. Its upstream status passes through unchanged, and it is not written to KV.

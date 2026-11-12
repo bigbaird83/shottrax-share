@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "version": 1,
+  "courses": {
+    "local:opengolf:489e906e-6e38-4fed-a232-043803aa8de5": {
+      "par": [4, 4, 3, 4, 4, 4, 5, 4, 3, 4, 5, 4, 3, 4, 4, 5, 3, 4],
+      "strokeIndex": [15, 5, 17, 1, 7, 11, 9, 13, 3, 4, 14, 10, 16, 18, 6, 2, 12, 8],
+      "note": "club scorecard, Brian, Nov 12 2026"
+    }
+  }
+}
