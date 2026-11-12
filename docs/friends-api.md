@@ -80,6 +80,28 @@ The sharer's optional photo for this invite, stored with the caller's current co
 
 Returned only by code lookup as `photo` next to `name`. `resetCode` deletes it from the server. A copy the friend already saved on their phone is theirs and is not affected.
 
+The same call also keeps the photo by owner, so friends' phones pick up a change: `fr:ownphoto:<ownerId>` = `{ "type": "image/jpeg", "data": "<base64>" }` and `fr:ownphotov:<ownerId>` = the version, the first 16 hex characters of the SHA-256 of `data`. `{ "photo": null }` deletes `fr:ownphoto:` and sets `fr:ownphotov:` to `"none"`, which is how a removal reaches friends. `resetCode` does not touch either row, so friends keep seeing the photo after a reset.
+
+### fetchFriendPhotos
+
+`POST /v1/friends/photos`
+
+```json
+{ "ownerIds": ["k3mR9xQ2nB8wL4pT6vYs1A"] }
+```
+
+1 to 5 `ownerIds` (body cap 1 KB). A bad id, more than 5 ids, an empty list or an unknown field is `400` `{ "error": "invalid_body" }`. A missing or unknown key is `401`. Repeated ids are answered once.
+
+`200`
+
+```json
+{ "photos": [ { "ownerId": "k3mR9xQ2nB8wL4pT6vYs1A", "photoV": "0123456789abcdef", "photo": { "type": "image/jpeg", "data": "<base64>" } } ] }
+```
+
+Only mutual friends (both `fr:friend:` rows) with no block in either direction are returned. Any other id, the caller's own id, and a friend who has never set a photo since `fr:ownphotov:` existed are left out silently. A friend who removed their photo is `{ "ownerId", "photoV": "none", "photo": null }`. The worst-case response is 5 × 87 KB of base64, about 440 KB.
+
+Read limit: 60 calls per friend key (`keyphoto:`) and 60 per IP hash (`ipphoto:`) per 60 minutes, separate from the list counters. Over the limit is `429` `{ "error": "rate_limited" }` with `Retry-After`. A bad body does not consume a call. No KV `put` or `delete`.
+
 ### putLive / fetchLive / stopLive (live rounds for friends)
 
 `PUT /v1/friends/live`
@@ -298,11 +320,11 @@ No body. The `Content-Length` rules, auth errors, and `boards_not_configured` er
 
 Each entry is a current friend: an id in the caller's `fr:friends:` list, with both `fr:friend:` rows present (`fr:friend:<caller>:<friend>` and `fr:friend:<friend>:<caller>`). That is the accepted pair `accept` writes and the pair `remove` and `block` require. One row without the other is not a friend and is not listed. A block in either direction hides the friend, the same rule `fetchRounds` uses when it skips a friend's rounds. The response is at most 50 friends. Only the first 50 ids in the stored array are inspected, in that stored order, and ids past the cap are ignored.
 
-`since` is the friendship's created time when a row stores one. Today each `fr:friend:` value is the string `1`, and the `fr:friends:` array is only ids, so no created time is stored. The field is omitted. An entry is `{ "ownerId" }` plus optional `name`, the friend's own invite name from `fr:ownname:<ownerId>` (1–24 characters, no control characters, omitted when unset or invalid). No friend code, friend key, raw KV key, or other person's data is returned. Older apps ignore `name`.
+`since` is the friendship's created time when a row stores one. Today each `fr:friend:` value is the string `1`, and the `fr:friends:` array is only ids, so no created time is stored. The field is omitted. An entry is `{ "ownerId" }` plus optional `name`, the friend's own invite name from `fr:ownname:<ownerId>` (1–24 characters, no control characters, omitted when unset or invalid). No friend code, friend key, raw KV key, or other person's data is returned. Older apps ignore `name`. An entry also carries `photoV` when that friend has a photo version in `fr:ownphotov:<ownerId>`: 16 hex characters, or `"none"` after they removed it. It carries no image data; the phone fetches a changed photo with `POST /v1/friends/photos`. Older apps ignore `photoV`.
 
 Sort: `friends` is sorted by `ownerId` ascending, JavaScript string order. There is no cursor.
 
-KV reads, no list. Formula: `3 + N + P + 2M + F` gets, plus 1 when the caller has no `fr:ownname:` row (then `fr:invname:<caller CODE>` is read, and when it holds a valid name it is copied to `fr:ownname:<caller>`: the only write, a one-time backfill for names saved before `fr:ownname:` existed). `F` is the number of friends returned (one `fr:ownname:` read each). `N` is the number of ids inspected, `N = min(length of fr:friends:<caller>, 50)`. `P` is how many of those have a caller→friend row, so the reverse row is read. `M` is how many have both rows, so both block rows are read (`M ≤ P ≤ N`). The `2` is the auth row and the `fr:friends:` value. A clean list, every inspected id a mutual unblocked friend, caller name already stored, is `3 + 5N` gets. No `delete`.
+KV reads, no list. Formula: `3 + N + P + 2M + F` gets, plus 1 when the caller has no `fr:ownname:` row (then `fr:invname:<caller CODE>` is read, and when it holds a valid name it is copied to `fr:ownname:<caller>`: the only write, a one-time backfill for names saved before `fr:ownname:` existed). `F` is the number of friends returned (one `fr:ownname:` read each). `N` is the number of ids inspected, `N = min(length of fr:friends:<caller>, 50)`. `P` is how many of those have a caller→friend row, so the reverse row is read. `M` is how many have both rows, so both block rows are read (`M ≤ P ≤ N`). The `2` is the auth row and the `fr:friends:` value. Photo sync adds `1 + F` gets: the caller's own `fr:ownphotov:` and one `fr:ownphotov:` per returned friend, plus 1 when the caller has no `fr:ownphotov:` row (then `fr:invphoto:<caller CODE>` is read, and when it holds a valid photo it is copied to `fr:ownphoto:` / `fr:ownphotov:`: a one-time backfill for photos saved before `fr:ownphotov:` existed). A clean list, every inspected id a mutual unblocked friend, caller name and photo version already stored, is `4 + 6N` gets. No `delete`.
 
 The read limit is 60 calls per friend key per 60 minutes (`keylist:`) and 60 per IP hash per 60 minutes when `CF-Connecting-IP` is present (`iplist:`). It does not share the listRequests counters, the code-guess counters, `ipget:`, or `ippub:`. No IP header skips the IP limit. Over the limit is `429` `{ "error": "rate_limited" }` and `Retry-After`, and that request does not read the friend list. A bad body does not consume a call.
 
@@ -464,6 +486,8 @@ Friend rows use the `fr:` prefix only. The keys this API writes are:
 - `fr:rounds:<ownerId>` — JSON array of that owner's shared rounds, one value, `expirationTtl` of 365 days. This replaces per-round `fr:round:<owner>:<id>` keys. A past round carries `to: [ownerIds]`, the friends it was given to.
 - `fr:invname:<CODE>` — the invite name for that code, a plain string of 1–24 characters. `resetCode` deletes it with the old code.
 - `fr:ownname:<ownerId>` — the same invite name keyed by owner, written and cleared by setInviteName, deleted by resetCode. listFriends and listRequests return it as optional `name`. Names set before this key existed appear once the owner saves their invite name again.
+- `fr:ownphoto:<ownerId>` — the owner's photo, `{ "type": "image/jpeg", "data": "<base64>" }`, written by setInvitePhoto, deleted by `{ "photo": null }`. Not touched by resetCode. Returned only by `POST /v1/friends/photos` to mutual, unblocked friends.
+- `fr:ownphotov:<ownerId>` — that photo's version: 16 hex characters (start of the SHA-256 of `data`), or `none` after a removal. Not touched by resetCode. listFriends returns it as optional `photoV`.
 - `fr:device:<ownerId>` — `{ "tokenHash", "claimedAt" }`, the SHA-256 of the active device token. No raw token. No `expirationTtl`.
 - `fr:live:<ownerId>` — that owner's live round, one JSON value, `expirationTtl` of 30 minutes from the last `PUT`. Shot lat/lon live only inside this value. Deleted by `POST /v1/friends/live/stop`, by `PUT` with `finished: true`, and by a follower read that finds the row older than 30 minutes.
 

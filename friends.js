@@ -18,6 +18,10 @@
  * only. It is not a request, it has no TTL, and unblock does not promote it.
  * setInvitePhoto stores the sharer's invite photo (JPEG, 64 KB cap) at fr:invphoto:<code>,
  * the same way as the name: never in a URL, returned only by lookup, deleted by reset.
+ * The same call keeps the photo by ownerId (fr:ownphoto:<ownerId>) with a version
+ * (fr:ownphotov:<ownerId>, 16 hex or "none"), so a changed or removed photo reaches
+ * friends: listFriends returns photoV and POST /v1/friends/photos returns the image
+ * to mutual friends only. resetCode does not touch either row.
  * setInviteName stores the sharer's invite name at fr:invname:<code>; only
  * code lookup returns it and resetCode deletes it. setPastRounds gives one
  * friend a pick of the caller's past rounds (private "to" audience inside
@@ -84,6 +88,12 @@ const SCRAMBLE_MISSING_OWNER_ID = "_".repeat(21);
 const DELETE_ROUNDS_BODY_LIMIT = 8192;
 const PAST_BODY_LIMIT = 256 * 1024;
 const PHOTO_BODY_LIMIT = 96 * 1024;
+/** POST /v1/friends/photos: at most this many ownerIds per call, body cap 1 KB. */
+export const FRIEND_PHOTOS_MAX_IDS = 5;
+const PHOTOS_BODY_LIMIT = 1024;
+/** fr:ownphotov value after the owner removes their photo. */
+export const OWN_PHOTO_NONE = "none";
+const OWN_PHOTO_VERSION_RE = /^[0-9a-f]{16}$/;
 const ROUND_TTL_SECONDS = 365 * 24 * 60 * 60;
 const ROUND_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const PLAYED_ON_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
@@ -121,6 +131,9 @@ function limitForDurableObjectName(name) {
   if (name.startsWith("ip:")) return FRIEND_IP_GUESS_LIMIT;
   if (name.startsWith("keyreq:")) return FRIEND_READ_KEY_LIMIT;
   if (name.startsWith("keylist:")) return FRIEND_READ_KEY_LIMIT;
+  // Friend photo sync (POST /v1/friends/photos): same read budget as the list.
+  if (name.startsWith("ipphoto:")) return FRIEND_READ_IP_LIMIT;
+  if (name.startsWith("keyphoto:")) return FRIEND_READ_KEY_LIMIT;
   // Leagues (leagues.js): creates per IP, and member/standings reads per key and per IP.
   if (name.startsWith("iplgnew:")) return LEAGUE_CREATE_IP_LIMIT;
   if (name.startsWith("iplgread:")) return FRIEND_READ_IP_LIMIT;
@@ -274,6 +287,7 @@ const FRIEND_ROUTES = {
   "/v1/friends/codes/lookup": { POST: lookupCode },
   "/v1/friends/requests": { POST: sendRequest, GET: listRequests },
   "/v1/friends/list": { GET: listFriends },
+  "/v1/friends/photos": { POST: fetchFriendPhotos },
   "/v1/friends/requests/accept": { POST: acceptRequest },
   "/v1/friends/requests/cancel": { POST: cancelRequest },
   "/v1/friends/block": { POST: blockPerson },
@@ -422,6 +436,7 @@ async function resetCode(request, env, cors) {
   await deleteIfPresent(boards, friendKvKey("invname", previous));
   await deleteIfPresent(boards, friendKvKey("ownname", existing.ownerId));
   await deleteIfPresent(boards, friendKvKey("invphoto", previous));
+  // fr:ownphoto: / fr:ownphotov: are kept: friends keep seeing the photo after a reset.
   return friendJson(200, { code, ownerId: existing.ownerId }, cors);
 }
 
@@ -523,7 +538,79 @@ async function setInvitePhoto(request, env, cors) {
   const key = friendKvKey("invphoto", caller.code);
   if (photo) await friendPut(boards, key, JSON.stringify(photo));
   else await deleteIfPresent(boards, key);
+  // The same photo is kept by ownerId with a version, so friends' phones pick up a change or a removal.
+  await writeOwnPhoto(boards, caller.ownerId, photo);
   return friendJson(200, { ok: true }, cors);
+}
+
+/** First 16 hex characters of the SHA-256 of the base64 data. */
+export async function ownPhotoVersion(data) {
+  return (await sha256Hex(data)).slice(0, 16);
+}
+
+async function writeOwnPhoto(boards, ownerId, photo) {
+  if (photo) {
+    await friendPut(boards, friendKvKey("ownphoto", ownerId), JSON.stringify(photo));
+    await friendPut(boards, friendKvKey("ownphotov", ownerId), await ownPhotoVersion(photo.data));
+  } else {
+    await deleteIfPresent(boards, friendKvKey("ownphoto", ownerId));
+    await friendPut(boards, friendKvKey("ownphotov", ownerId), OWN_PHOTO_NONE);
+  }
+}
+
+function readOwnPhotoVersion(raw) {
+  if (raw === OWN_PHOTO_NONE) return OWN_PHOTO_NONE;
+  if (typeof raw === "string" && OWN_PHOTO_VERSION_RE.test(raw)) return raw;
+  return null;
+}
+
+/** A photo set before fr:ownphotov: existed is copied once from the invite photo. */
+async function backfillOwnPhoto(boards, caller) {
+  if (readOwnPhotoVersion(await friendGet(boards, friendKvKey("ownphotov", caller.ownerId)))) return;
+  const photo = readInvitePhoto(await friendGet(boards, friendKvKey("invphoto", caller.code)));
+  if (photo) await writeOwnPhoto(boards, caller.ownerId, photo);
+}
+
+/**
+ * Friends' current photos. Body { ownerIds: [1..5 ownerIds] }.
+ * Only mutual friends with no block either way are returned; any other id is left out.
+ * 200 { photos: [{ ownerId, photoV, photo: { type, data } | null }] }.
+ */
+async function fetchFriendPhotos(request, env, cors) {
+  const friendKey = readFriendKey(request);
+  if (!friendKey) return friendJson(401, { error: "friend_key_required" }, cors);
+  const parsed = await readJsonObject(request, PHOTOS_BODY_LIMIT, false);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  if (unknownFields(parsed.value, ["ownerIds"])) return friendJson(400, { error: "invalid_body" }, cors);
+  const raw = parsed.value.ownerIds;
+  if (!Array.isArray(raw) || raw.length < 1 || raw.length > FRIEND_PHOTOS_MAX_IDS) {
+    return friendJson(400, { error: "invalid_body" }, cors);
+  }
+  const ids = [];
+  for (const value of raw) {
+    const ownerId = readOwnerId(value);
+    if (!ownerId) return friendJson(400, { error: "invalid_body" }, cors);
+    if (!ids.includes(ownerId)) ids.push(ownerId);
+  }
+  const boards = boardsBinding(env);
+  if (!boards) return friendJson(503, { error: "boards_not_configured" }, cors);
+  const caller = await loadCaller(boards, friendKey);
+  if (!caller) return friendJson(401, { error: "friend_key_required" }, cors);
+  const limited = await consumeReadLimit(request, env, friendKey, "keyphoto:", "ipphoto:", cors);
+  if (limited) return limited;
+  const photos = [];
+  for (const otherId of ids) {
+    if (otherId === caller.ownerId) continue;
+    if (!(await areFriends(boards, caller.ownerId, otherId))) continue;
+    if (!(await areFriends(boards, otherId, caller.ownerId))) continue;
+    if (await hasBlock(boards, caller.ownerId, otherId)) continue;
+    if (await hasBlock(boards, otherId, caller.ownerId)) continue;
+    const version = readOwnPhotoVersion(await friendGet(boards, friendKvKey("ownphotov", otherId)));
+    if (!version) continue;
+    const photo = version === OWN_PHOTO_NONE ? null : readInvitePhoto(await friendGet(boards, friendKvKey("ownphoto", otherId)));
+    photos.push({ ownerId: otherId, photoV: photo ? version : OWN_PHOTO_NONE, photo });
+  }
+  return friendJson(200, { photos }, cors);
 }
 
 function readInvitePhoto(raw) {
@@ -956,6 +1043,8 @@ async function listFriends(request, env, cors) {
   if (limited) return limited;
   // Backfill: an invite name saved before fr:ownname: existed is copied once from the code row.
   await backfillOwnName(boards, caller);
+  // Backfill: an invite photo saved before fr:ownphotov: existed is copied once by ownerId.
+  await backfillOwnPhoto(boards, caller);
   // accept stores at most FRIEND_CAP ids. Inspect that many, in stored order.
   const ids = (await loadFriendIds(boards, caller.ownerId)).slice(0, FRIEND_CAP);
   const friends = [];
@@ -970,7 +1059,13 @@ async function listFriends(request, env, cors) {
     friends.push({ ownerId: otherId });
   }
   const named = [];
-  for (const row of dedupeByOwnerId(friends).sort(compareByOwnerId)) named.push(await withOwnerName(boards, row.ownerId));
+  for (const row of dedupeByOwnerId(friends).sort(compareByOwnerId)) {
+    const entry = await withOwnerName(boards, row.ownerId);
+    // Only the photo's version: the image itself comes from POST /v1/friends/photos.
+    const photoV = readOwnPhotoVersion(await friendGet(boards, friendKvKey("ownphotov", row.ownerId)));
+    if (photoV) entry.photoV = photoV;
+    named.push(entry);
+  }
   return friendJson(200, { friends: named }, cors);
 }
 
@@ -2045,6 +2140,8 @@ function friendKvKey(kind, id) {
     kind !== "invname" &&
     kind !== "invphoto" &&
     kind !== "ownname" &&
+    kind !== "ownphoto" &&
+    kind !== "ownphotov" &&
     kind !== "live" &&
     kind !== "push" &&
     kind !== "pushsent" &&

@@ -25,6 +25,7 @@ const FRIEND_CODE_CALLS = [
   ["GET", "/v1/friends/list"],
   ["POST", "/v1/friends/code/name"],
   ["POST", "/v1/friends/code/photo"],
+  ["POST", "/v1/friends/photos"],
   ["PUT", "/v1/friends/live"],
   ["GET", "/v1/friends/live"],
   ["POST", "/v1/friends/live/stop"],
@@ -64,6 +65,14 @@ async function call(path, method) {
 }
 
 describe("friends API contract", () => {
+  it("photo sync: documents the photos call, photoV and the owner photo rows", () => {
+    expect(doc).toContain("`POST /v1/friends/photos`");
+    expect(doc).toContain("An entry also carries `photoV`");
+    expect(doc).toContain("- `fr:ownphoto:<ownerId>`");
+    expect(doc).toContain("- `fr:ownphotov:<ownerId>`");
+    expect(doc).toContain("`resetCode` does not touch either row, so friends keep seeing the photo after a reset.");
+  });
+
   it("unblock: never-blocked target is a harmless no-op", () => {
     expect(doc).toContain("Unblocking someone the caller has not blocked, or an `ownerId` that does not exist, is the same `200` `{ \"ok\": true }` with nothing written");
   });
