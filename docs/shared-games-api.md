@@ -7,6 +7,7 @@ Every call uses the friends `X-Friend-Key`. The caller needs a friend code alrea
 | Call | Body | Answer |
 | --- | --- | --- |
 | `POST /v1/shared-games` | `{ gameId?, format, scoring, options?, teams?, players }` | `{ game }` |
+| `GET /v1/shared-games/invites` | none | `{ invites: [{ gameId, hostName, format, course, invitedAt }] }` |
 | `GET /v1/shared-games/:gameId` | none | `{ game, scores }` |
 | `POST /v1/shared-games/:gameId/scores` | `{ playerId, hole, strokes, rev, clientWriteId }` | `{ cell }` |
 | `POST /v1/shared-games/:gameId/invites` | `{ invitees: [{ playerId, friendId, team }], push: { title, body? } }` | `{ invites: [{ playerId, status }] }` |
@@ -34,7 +35,9 @@ The standing score for a non-guest is their latest own entry. A suggestion, or a
 
 Reads and score writes are only for players on the list. Someone else gets `403` `forbidden` when the game exists and `404` `not_found` when it does not. Neither body includes the card. A block in either direction between the caller and anyone else on the list is `409` `blocked` with no card, for both people. Starting a game whose roster already contains a blocked pair is the same `409`.
 
-The card is one SQLite Durable Object per game (`SharedGame`, binding `SHARED_GAMES`). Nothing from the game is written to `BOARDS`.
+The card is one SQLite Durable Object per game (`SharedGame`, binding `SHARED_GAMES`). Nothing from the card is written to `BOARDS`.
+
+`GET /v1/shared-games/invites` lists the caller's invites still waiting on them, newest first, at most 20, so an invitee whose push never arrived still sees them. Each newly sent invite also writes one `BOARDS` row for the invitee, `fr:sginv:<ownerId>:<gameId>` (`{ at, organizerId, hostName, course }`, kept 7 days). Join and decline delete it. On read each row is checked against its game: the invite must still be `sent` to the caller's `ownerId` and the caller not on the card yet, or the row is dropped; a block either way with anyone on the card hides it. `hostName` is the name in the approved push title (`{Name} invited you to a shared scorecard`), else the host's own Friends name, else null. `course` is the course in the approved Scramble push body, else null. Same auth and read limit as `GET /v1/shared-games/:gameId`; a body is `400`, another method `405`.
 
 Wager keys are stripped from the input and never returned, empty or not: `wager`, `wagers`, `sidegame`, `sidegames`, `side_game`, `side_games`, `bet`, `bets`.
 

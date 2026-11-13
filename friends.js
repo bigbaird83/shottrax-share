@@ -2145,7 +2145,8 @@ function friendKvKey(kind, id) {
     kind !== "live" &&
     kind !== "push" &&
     kind !== "pushsent" &&
-    kind !== "device"
+    kind !== "device" &&
+    kind !== "sginv"
   ) {
     throw new Error("friend_namespace");
   }
@@ -2276,8 +2277,10 @@ export {
   friendJson,
   friendKvKey,
   friendPut,
+  friendDelete,
   guessNamespace,
   hasBlock,
+  listKeysByPrefix,
   loadCaller,
   normalizeFriendCode,
   randomFriendCode,
