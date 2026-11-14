@@ -143,6 +143,9 @@ function limitForDurableObjectName(name) {
   if (name.startsWith("ipsgnew:")) return SHARED_GAME_CREATE_IP_LIMIT;
   if (name.startsWith("ipsgread:")) return SHARED_GAME_READ_LIMIT;
   if (name.startsWith("keysgread:")) return SHARED_GAME_READ_LIMIT;
+  // The invitee's pending-invite list: its own bucket, so it never eats a live card's read budget.
+  if (name.startsWith("ipsginv:")) return SHARED_GAME_READ_LIMIT;
+  if (name.startsWith("keysginv:")) return SHARED_GAME_READ_LIMIT;
   if (name.startsWith("ipsgwrite:")) return SHARED_GAME_WRITE_LIMIT;
   if (name.startsWith("keysgwrite:")) return SHARED_GAME_WRITE_LIMIT;
   return FRIEND_CODE_GUESS_LIMIT;

@@ -333,6 +333,16 @@ describe("GET /v1/shared-games/invites", () => {
     expect((await mine(jordan)).json.invites).toHaveLength(SHARED_INVITE_LIST_MAX);
   });
 
+  it("has its own read budget: 60 list reads an hour, then 429, and card reads still work", async () => {
+    const host = await player(1);
+    const jordan = await player(2);
+    befriend(host, jordan);
+    const gameId = await game(host);
+    for (let n = 0; n < 60; n += 1) expect((await mine(host)).status).toBe(200);
+    expect((await mine(host)).status).toBe(429);
+    expect((await call(`/v1/shared-games/${gameId}`, { method: "GET", friend: host.friend })).status).toBe(200);
+  });
+
   it("same auth as the other shared-games routes: no key 401, unknown key 401, GET only, no body", async () => {
     const jordan = await player(2);
     expect((await call("/v1/shared-games/invites", { method: "GET" })).status).toBe(401);

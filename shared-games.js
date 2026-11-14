@@ -542,14 +542,15 @@ async function postSuggestionAction(request, env, cors, gameId, suggestionId) {
  * not already on the card, and no block either way with anyone on it. Same
  * auth and read limit as GET /v1/shared-games/:gameId. hostName and course
  * come from the invite push text when it had them (course only for the
- * Scramble body), else the host's own Friends name and null.
+ * Scramble body), else the host's own Friends name and null. The read limit
+ * is the card read limit in its own bucket, so it never eats a live card's reads.
  */
 async function listMyInvites(request, env, cors) {
   const ready = await readyCaller(request, env, cors);
   if (ready.response) return ready.response;
   const rejected = await rejectGetBody(request, cors);
   if (rejected) return rejected;
-  const limited = await consumeReadLimit(request, env, ready.friendKey, "keysgread:", "ipsgread:", cors);
+  const limited = await consumeReadLimit(request, env, ready.friendKey, "keysginv:", "ipsginv:", cors);
   if (limited) return limited;
   const me = ready.caller.ownerId;
   const prefix = `${friendKvKey("sginv", me)}:`;
