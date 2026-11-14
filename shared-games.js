@@ -10,7 +10,8 @@
  * way with anyone else on that list refuses the caller: the card would
  * otherwise include the blocked person's scores. KV is not used for the card.
  * BOARDS stays the friend auth and block rows only, so a board GET cannot
- * read a score or a wager.
+ * read a score or a wager. The one exception is the invitee's invite list
+ * (fr:sginv:<ownerId>:<gameId>): game id, time, host name and course only.
  *
  * Not deployed. A deploy needs Brian's OK. No new secrets and no new vars.
  */
@@ -23,9 +24,12 @@ import {
   friendGet,
   friendKvKey,
   consumeReadLimit,
+  friendDelete,
   friendJson,
+  friendPut,
   guessNamespace,
   hasBlock,
+  listKeysByPrefix,
   loadCaller,
   randomOwnerId,
   readFriendKey,
@@ -65,6 +69,12 @@ export const SHARED_TEAM_NAME_BLOCKLIST = Object.freeze([
 /** Invite push data kind. The app opens the in-app invite for this game on tap. */
 export const SHARED_INVITE_PUSH_KIND = "shared_game_invite";
 const PUSH_TITLE_MAX = 200;
+/** An invite stays on the invitee's list this long after it is sent, unless joined or declined first. */
+export const SHARED_INVITE_LIST_TTL_SECONDS = 7 * 24 * 60 * 60;
+/** Most invites GET /v1/shared-games/invites returns, newest first. */
+export const SHARED_INVITE_LIST_MAX = 20;
+const INVITE_TITLE_RE = /^(.+) invited you to a shared scorecard$/;
+const INVITE_SCRAMBLE_BODY_RE = /^Scramble match at (.+)\. Your scores show for everyone in the match\.$/;
 const PUSH_BODY_MAX = 500;
 export const SHARED_FORMATS = Object.freeze([
   "strokePlay",
@@ -223,6 +233,10 @@ export function projectStanding(guest, entries) {
 
 export async function handleSharedGames(request, url, env, cors) {
   if (!isSharedGamePath(url.pathname)) return null;
+  if (url.pathname === "/v1/shared-games/invites") {
+    if (request.method !== "GET") return reply(405, { error: "method_not_allowed" }, cors);
+    return listMyInvites(request, env, cors);
+  }
   const route = routeOf(url.pathname);
   if (route.kind === "unknown") return reply(404, { error: "unknown_route" }, cors);
   if (route.kind === "bad") return reply(404, { error: "not_found" }, cors);
@@ -361,6 +375,7 @@ async function postInvites(request, env, cors, gameId) {
     invitees: body.invitees,
   });
   if (!answer.ok) return mapScore(answer, cors);
+  await indexInvites(ready.boards, gameId, ready.caller.ownerId, answer.newlySent, body.push);
   await sendInvitePushes(env, ready.boards, gameId, answer.newlySent, body.push);
   return reply(200, { invites: answer.invites }, cors);
 }
@@ -392,7 +407,10 @@ async function postJoin(request, env, cors, gameId) {
   const roster = members.players.map((player) => player.playerId);
   if (await callerBlocked(ready.boards, ready.caller.ownerId, roster)) return reply(409, { error: "blocked" }, cors);
   const answer = await gameCall(env, gameId, { op: "join", callerId: ready.caller.ownerId, joinedHole });
-  if (answer.ok) return reply(200, { game: answer.game }, cors);
+  if (answer.ok) {
+    await unindexInvite(ready.boards, ready.caller.ownerId, gameId);
+    return reply(200, { game: answer.game }, cors);
+  }
   return mapScore(answer, cors);
 }
 
@@ -411,7 +429,10 @@ async function postDecline(request, env, cors, gameId) {
   if (typeof body.playerId !== "string" || !ID_RE.test(body.playerId)) return reply(400, { error: "invalid_body" }, cors);
   if (body.playerId !== ready.caller.ownerId) return reply(403, { error: "forbidden" }, cors);
   const answer = await gameCall(env, gameId, { op: "decline", callerId: ready.caller.ownerId });
-  if (answer.ok) return reply(200, { ok: true }, cors);
+  if (answer.ok) {
+    await unindexInvite(ready.boards, ready.caller.ownerId, gameId);
+    return reply(200, { ok: true }, cors);
+  }
   return mapScore(answer, cors);
 }
 
@@ -511,6 +532,112 @@ async function postSuggestionAction(request, env, cors, gameId, suggestionId) {
   });
   if (answer.ok) return reply(200, { suggestion: answer.suggestion }, cors);
   return mapScore(answer, cors);
+}
+
+/**
+ * GET /v1/shared-games/invites → { invites: [{ gameId, hostName, format, course, invitedAt }] }
+ * The caller's invites still waiting on them, newest first, so an invitee whose
+ * push never arrived (or was cleared) still sees the Join row. Each one is
+ * checked against its game: still "sent" to the caller's ownerId, the caller
+ * not already on the card, and no block either way with anyone on it. Same
+ * auth and read limit as GET /v1/shared-games/:gameId. hostName and course
+ * come from the invite push text when it had them (course only for the
+ * Scramble body), else the host's own Friends name and null. The read limit
+ * is the card read limit in its own bucket, so it never eats a live card's reads.
+ */
+async function listMyInvites(request, env, cors) {
+  const ready = await readyCaller(request, env, cors);
+  if (ready.response) return ready.response;
+  const rejected = await rejectGetBody(request, cors);
+  if (rejected) return rejected;
+  const limited = await consumeReadLimit(request, env, ready.friendKey, "keysginv:", "ipsginv:", cors);
+  if (limited) return limited;
+  const me = ready.caller.ownerId;
+  const prefix = `${friendKvKey("sginv", me)}:`;
+  const rows = [];
+  for (const name of await listKeysByPrefix(ready.boards, prefix)) {
+    const gameId = name.slice(prefix.length);
+    if (!ID_RE.test(gameId)) continue;
+    const stored = parseIndexRow(await friendGet(ready.boards, name));
+    if (stored) rows.push({ gameId, ...stored });
+  }
+  rows.sort((a, b) => b.at - a.at);
+  const invites = [];
+  for (const row of rows) {
+    if (invites.length >= SHARED_INVITE_LIST_MAX) break;
+    const answer = await gameCall(env, row.gameId, { op: "pending", callerId: me });
+    if (!answer.ok) {
+      // The game is gone, or the Durable Object is busy: only a missing game drops the row.
+      if (answer.error === "not_found") await unindexInvite(ready.boards, me, row.gameId);
+      continue;
+    }
+    if (!answer.pending) {
+      await unindexInvite(ready.boards, me, row.gameId);
+      continue;
+    }
+    if (await callerBlocked(ready.boards, me, answer.playerIds)) continue;
+    let hostName = row.hostName;
+    if (!hostName) hostName = readInviteName(await friendGet(ready.boards, friendKvKey("ownname", answer.organizerId)));
+    invites.push({
+      gameId: row.gameId,
+      hostName: hostName || null,
+      format: answer.format,
+      course: row.course,
+      invitedAt: answer.invitedAt,
+    });
+  }
+  return reply(200, { invites }, cors);
+}
+
+function parseIndexRow(raw) {
+  if (typeof raw !== "string") return null;
+  try {
+    const value = JSON.parse(raw);
+    if (!value || typeof value !== "object" || !Number.isFinite(value.at)) return null;
+    return {
+      at: value.at,
+      hostName: typeof value.hostName === "string" && value.hostName ? value.hostName : null,
+      course: typeof value.course === "string" && value.course ? value.course : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Host name and course as the push showed them: the approved title, and the Scramble body when sent. */
+function inviteTextFromPush(push) {
+  const title = INVITE_TITLE_RE.exec(push && typeof push.title === "string" ? push.title.trim() : "");
+  const hostName = title ? title[1].trim() : "";
+  const body = INVITE_SCRAMBLE_BODY_RE.exec(push && typeof push.body === "string" ? push.body : "");
+  const course = body ? body[1].trim() : "";
+  return {
+    hostName: hostName && [...hostName].length <= 64 ? hostName : null,
+    course: course && [...course].length <= 120 ? course : null,
+  };
+}
+
+/** Best effort, after the invites are stored: one row per invitee, read by GET /v1/shared-games/invites. */
+async function indexInvites(boards, gameId, organizerId, friendIds, push) {
+  if (!Array.isArray(friendIds) || friendIds.length === 0) return;
+  const text = inviteTextFromPush(push);
+  const value = JSON.stringify({ at: Date.now(), organizerId, hostName: text.hostName, course: text.course });
+  for (const friendId of friendIds) {
+    try {
+      await friendPut(boards, `${friendKvKey("sginv", friendId)}:${gameId}`, value, {
+        expirationTtl: SHARED_INVITE_LIST_TTL_SECONDS,
+      });
+    } catch {
+      // Best effort: the invite itself is stored in the game.
+    }
+  }
+}
+
+async function unindexInvite(boards, friendId, gameId) {
+  try {
+    await friendDelete(boards, `${friendKvKey("sginv", friendId)}:${gameId}`);
+  } catch {
+    // Best effort: the list checks each game anyway.
+  }
 }
 
 function normalizeInvites(body) {
@@ -948,6 +1075,7 @@ export class SharedGame {
     try {
       if (op === "create") return gameJson(this.ctx.storage.transactionSync(() => this.#create(body)));
       if (op === "members") return gameJson(this.#members());
+      if (op === "pending") return gameJson(this.#pending(body));
       if (op === "read") return gameJson(this.#read(body));
       if (op === "score") return gameJson(this.ctx.storage.transactionSync(() => this.#score(body)));
       if (op === "invite") return gameJson(this.ctx.storage.transactionSync(() => this.#invite(body)));
@@ -1034,6 +1162,23 @@ export class SharedGame {
       guest: Number(player.guest) === 1,
     }));
     return { ok: true, organizerId: row.organizer_id, players };
+  }
+
+  /** Is there an invite still waiting on this caller? Never returns scores. */
+  #pending({ callerId }) {
+    const row = this.#gameRow();
+    if (!row) return { ok: false, error: "not_found" };
+    const playerIds = this.#sql("SELECT player_id FROM player ORDER BY player_id").map((player) => player.player_id);
+    const invite = this.#sql("SELECT status, at FROM invite WHERE player_id = ? AND friend_id = ?", callerId, callerId);
+    const pending = invite.length === 1 && invite[0].status === "sent" && !playerIds.includes(callerId);
+    return {
+      ok: true,
+      pending,
+      format: row.format,
+      organizerId: row.organizer_id,
+      playerIds,
+      invitedAt: pending ? Number(invite[0].at) : null,
+    };
   }
 
   #read({ callerId }) {
