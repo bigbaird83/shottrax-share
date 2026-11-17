@@ -76,6 +76,9 @@ export const SHARED_INVITE_LIST_MAX = 20;
 const INVITE_TITLE_RE = /^(.+) invited you to a shared scorecard$/;
 const INVITE_SCRAMBLE_BODY_RE = /^Scramble match at (.+)\. Your scores show for everyone in the match\.$/;
 const PUSH_BODY_MAX = 500;
+/** Optional course id / name on create and invite. Empty after trim is absent. */
+export const COURSE_ID_MAX = 128;
+export const COURSE_NAME_MAX = 200;
 export const SHARED_FORMATS = Object.freeze([
   "strokePlay",
   "matchPlay",
@@ -112,7 +115,9 @@ const GAME_SCHEMA = [
     format TEXT NOT NULL,
     scoring TEXT NOT NULL,
     options_json TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    course_id TEXT,
+    course_name TEXT
   )`,
   `CREATE TABLE IF NOT EXISTS team (
     number INTEGER PRIMARY KEY,
@@ -338,8 +343,11 @@ async function postScore(request, env, cors, gameId) {
 
 /**
  * POST /v1/shared-games/:gameId/invites (organizer only)
- *   { invitees: [{ playerId, friendId, team }], push: { title, body? } }
+ *   { invitees: [{ playerId, friendId, team }], push: { title, body? }, courseId?, courseName? }
  *   → { invites: [{ playerId, status: "sent" | "joined" }] }
+ * Optional courseId (string, max 128) and courseName (string, max 200) are
+ * stored on the game when it does not already have them, and on the invitee's
+ * list row. Empty or omitted leaves the game as it was.
  * An invitee's playerId is their friend ownerId (the Worker's player identity).
  * They must be the organizer's accepted friend both ways and not blocked either
  * way with anyone on the card. Pending invites count toward the caps. A friend
@@ -373,9 +381,14 @@ async function postInvites(request, env, cors, gameId) {
     callerId: ready.caller.ownerId,
     now: Date.now(),
     invitees: body.invitees,
+    courseId: body.courseId,
+    courseName: body.courseName,
   });
   if (!answer.ok) return mapScore(answer, cors);
-  await indexInvites(ready.boards, gameId, ready.caller.ownerId, answer.newlySent, body.push);
+  await indexInvites(ready.boards, gameId, ready.caller.ownerId, answer.newlySent, body.push, {
+    courseId: answer.courseId || body.courseId,
+    courseName: answer.courseName || body.courseName,
+  });
   await sendInvitePushes(env, ready.boards, gameId, answer.newlySent, body.push);
   return reply(200, { invites: answer.invites }, cors);
 }
@@ -535,15 +548,18 @@ async function postSuggestionAction(request, env, cors, gameId, suggestionId) {
 }
 
 /**
- * GET /v1/shared-games/invites → { invites: [{ gameId, hostName, format, course, invitedAt }] }
+ * GET /v1/shared-games/invites → { invites: [{ gameId, hostName, format, course, courseId?, courseName?, invitedAt }] }
  * The caller's invites still waiting on them, newest first, so an invitee whose
  * push never arrived (or was cleared) still sees the Join row. Each one is
  * checked against its game: still "sent" to the caller's ownerId, the caller
  * not already on the card, and no block either way with anyone on it. Same
  * auth and read limit as GET /v1/shared-games/:gameId. hostName and course
  * come from the invite push text when it had them (course only for the
- * Scramble body), else the host's own Friends name and null. The read limit
- * is the card read limit in its own bucket, so it never eats a live card's reads.
+ * Scramble body), else the host's own Friends name and null. courseId and
+ * courseName come from the game (or the invite body, stored on the list row)
+ * and are omitted when absent, so older clients that never sent them keep
+ * the same shape. The read limit is the card read limit in its own bucket,
+ * so it never eats a live card's reads.
  */
 async function listMyInvites(request, env, cors) {
   const ready = await readyCaller(request, env, cors);
@@ -578,13 +594,15 @@ async function listMyInvites(request, env, cors) {
     if (await callerBlocked(ready.boards, me, answer.playerIds)) continue;
     let hostName = row.hostName;
     if (!hostName) hostName = readInviteName(await friendGet(ready.boards, friendKvKey("ownname", answer.organizerId)));
-    invites.push({
+    const item = {
       gameId: row.gameId,
       hostName: hostName || null,
       format: answer.format,
       course: row.course,
       invitedAt: answer.invitedAt,
-    });
+    };
+    attachCourse(item, answer.courseId || row.courseId, answer.courseName || row.courseName);
+    invites.push(item);
   }
   return reply(200, { invites }, cors);
 }
@@ -598,6 +616,8 @@ function parseIndexRow(raw) {
       at: value.at,
       hostName: typeof value.hostName === "string" && value.hostName ? value.hostName : null,
       course: typeof value.course === "string" && value.course ? value.course : null,
+      courseId: typeof value.courseId === "string" && value.courseId ? value.courseId : null,
+      courseName: typeof value.courseName === "string" && value.courseName ? value.courseName : null,
     };
   } catch {
     return null;
@@ -617,10 +637,16 @@ function inviteTextFromPush(push) {
 }
 
 /** Best effort, after the invites are stored: one row per invitee, read by GET /v1/shared-games/invites. */
-async function indexInvites(boards, gameId, organizerId, friendIds, push) {
+async function indexInvites(boards, gameId, organizerId, friendIds, push, course = {}) {
   if (!Array.isArray(friendIds) || friendIds.length === 0) return;
   const text = inviteTextFromPush(push);
-  const value = JSON.stringify({ at: Date.now(), organizerId, hostName: text.hostName, course: text.course });
+  const value = JSON.stringify(
+    attachCourse(
+      { at: Date.now(), organizerId, hostName: text.hostName, course: text.course },
+      course.courseId,
+      course.courseName,
+    ),
+  );
   for (const friendId of friendIds) {
     try {
       await friendPut(boards, `${friendKvKey("sginv", friendId)}:${gameId}`, value, {
@@ -642,7 +668,7 @@ async function unindexInvite(boards, friendId, gameId) {
 
 function normalizeInvites(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return { error: "invalid_body" };
-  if (unknownFields(body, ["invitees", "push"])) return { error: "invalid_body" };
+  if (unknownFields(body, ["invitees", "push", "courseId", "courseName"])) return { error: "invalid_body" };
   if (!Array.isArray(body.invitees) || body.invitees.length < 1 || body.invitees.length > SHARED_MAX_PLAYERS) {
     return { error: "invalid_body" };
   }
@@ -672,7 +698,14 @@ function normalizeInvites(body) {
     return { error: "invalid_body" };
   }
   if (overTeams) return { error: "cap" };
-  return { invitees, push: { title: push.title, ...(push.body != null ? { body: push.body } : {}) } };
+  const course = normalizeCourseFields(body);
+  if (course.error) return course;
+  return {
+    invitees,
+    push: { title: push.title, ...(push.body != null ? { body: push.body } : {}) },
+    courseId: course.courseId,
+    courseName: course.courseName,
+  };
 }
 
 /** Best effort, after the invites are stored. A friend with no push token has notifications off. */
@@ -819,7 +852,7 @@ async function gameCall(env, gameId, op) {
 
 function normalizeCreate(body, organizerId) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return { error: "invalid_body" };
-  if (unknownFields(body, ["gameId", "format", "scoring", "options", "teams", "players"])) {
+  if (unknownFields(body, ["gameId", "format", "scoring", "options", "teams", "players", "courseId", "courseName"])) {
     return { error: "invalid_body" };
   }
   let gameId = null;
@@ -839,6 +872,8 @@ function normalizeCreate(body, organizerId) {
   if (linked.error) return linked;
   const cap = rosterCap(body.format, linked.teams, linked.players);
   if (cap) return { error: cap };
+  const course = normalizeCourseFields(body);
+  if (course.error) return course;
   return {
     game: {
       gameId,
@@ -848,8 +883,35 @@ function normalizeCreate(body, organizerId) {
       options: options.options,
       teams: linked.teams,
       players: linked.players,
+      courseId: course.courseId,
+      courseName: course.courseName,
     },
   };
+}
+
+/** Optional courseId / courseName: trim, cap length, reject a non-string, treat empty as absent. */
+function normalizeCourseFields(body) {
+  const courseId = normalizeOptionalCourseText(body.courseId, COURSE_ID_MAX);
+  if (courseId.error) return courseId;
+  const courseName = normalizeOptionalCourseText(body.courseName, COURSE_NAME_MAX);
+  if (courseName.error) return courseName;
+  return { courseId: courseId.value, courseName: courseName.value };
+}
+
+function normalizeOptionalCourseText(value, max) {
+  if (value == null) return { value: null };
+  if (typeof value !== "string") return { error: "invalid_body" };
+  const text = value.trim();
+  if (text.length === 0) return { value: null };
+  if (text.length > max) return { error: "invalid_body" };
+  if (/[\u0000-\u001F\u007F]/.test(text)) return { error: "invalid_body" };
+  return { value: text };
+}
+
+function attachCourse(target, courseId, courseName) {
+  if (courseId) target.courseId = courseId;
+  if (courseName) target.courseName = courseName;
+  return target;
 }
 
 function normalizeOptions(format, raw) {
@@ -1092,6 +1154,18 @@ export class SharedGame {
 
   #ensure() {
     for (const statement of GAME_SCHEMA) this.ctx.storage.sql.exec(statement);
+    this.#ensureCourseColumns();
+  }
+
+  /** Existing games were created without course columns; add them once, nullable. */
+  #ensureCourseColumns() {
+    for (const column of ["course_id", "course_name"]) {
+      try {
+        this.#run(`ALTER TABLE game ADD COLUMN ${column} TEXT`);
+      } catch {
+        // Already present: new games get the columns from GAME_SCHEMA.
+      }
+    }
   }
 
   #sql(query, ...bindings) {
@@ -1129,14 +1203,16 @@ export class SharedGame {
     const cap = rosterCap(game.format, game.teams, game.players);
     if (cap) return { ok: false, error: cap };
     this.#run(
-      `INSERT INTO game (id, game_id, organizer_id, format, scoring, options_json, created_at)
-       VALUES (1, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO game (id, game_id, organizer_id, format, scoring, options_json, created_at, course_id, course_name)
+       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)`,
       game.gameId,
       game.organizerId,
       game.format,
       game.scoring,
       JSON.stringify(game.options ?? {}),
       now,
+      game.courseId || null,
+      game.courseName || null,
     );
     for (const team of game.teams) {
       this.#run("INSERT INTO team (number, name) VALUES (?, ?)", team.number, team.name);
@@ -1178,6 +1254,8 @@ export class SharedGame {
       organizerId: row.organizer_id,
       playerIds,
       invitedAt: pending ? Number(invite[0].at) : null,
+      courseId: row.course_id || null,
+      courseName: row.course_name || null,
     };
   }
 
@@ -1232,7 +1310,7 @@ export class SharedGame {
     return { total: players.length + pending.length, perTeam };
   }
 
-  #invite({ callerId, now, invitees }) {
+  #invite({ callerId, now, invitees, courseId, courseName }) {
     const row = this.#gameRow();
     if (!row) return { ok: false, error: "not_found" };
     if (!this.#isPlayer(callerId)) return { ok: false, error: "forbidden" };
@@ -1271,7 +1349,25 @@ export class SharedGame {
         now,
       );
     }
-    return { ok: true, invites, newlySent: fresh.map((invitee) => invitee.friendId) };
+    this.#fillCourse(courseId, courseName);
+    const stored = this.#gameRow();
+    return {
+      ok: true,
+      invites,
+      newlySent: fresh.map((invitee) => invitee.friendId),
+      courseId: stored.course_id || null,
+      courseName: stored.course_name || null,
+    };
+  }
+
+  /** Fill course fields the game does not already have. Does not overwrite. */
+  #fillCourse(courseId, courseName) {
+    if (!courseId && !courseName) return;
+    const row = this.#gameRow();
+    const nextId = row.course_id || courseId || null;
+    const nextName = row.course_name || courseName || null;
+    if (nextId === (row.course_id || null) && nextName === (row.course_name || null)) return;
+    this.#run("UPDATE game SET course_id = ?, course_name = ? WHERE id = 1", nextId, nextName);
   }
 
   #join({ callerId, joinedHole }) {
@@ -1437,7 +1533,7 @@ export class SharedGame {
     } catch {
       options = {};
     }
-    return {
+    const game = {
       gameId: row.game_id,
       organizerId: row.organizer_id,
       format: row.format,
@@ -1446,6 +1542,8 @@ export class SharedGame {
       teams,
       players,
     };
+    attachCourse(game, row.course_id, row.course_name);
+    return game;
   }
 }
 
