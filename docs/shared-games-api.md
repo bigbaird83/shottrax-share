@@ -6,11 +6,11 @@ Every call uses the friends `X-Friend-Key`. The caller needs a friend code alrea
 
 | Call | Body | Answer |
 | --- | --- | --- |
-| `POST /v1/shared-games` | `{ gameId?, format, scoring, options?, teams?, players }` | `{ game }` |
-| `GET /v1/shared-games/invites` | none | `{ invites: [{ gameId, hostName, format, course, invitedAt }] }` |
+| `POST /v1/shared-games` | `{ gameId?, format, scoring, options?, teams?, players, courseId?, courseName? }` | `{ game }` |
+| `GET /v1/shared-games/invites` | none | `{ invites: [{ gameId, hostName, format, course, courseId?, courseName?, invitedAt }] }` |
 | `GET /v1/shared-games/:gameId` | none | `{ game, scores }` |
 | `POST /v1/shared-games/:gameId/scores` | `{ playerId, hole, strokes, rev, clientWriteId }` | `{ cell }` |
-| `POST /v1/shared-games/:gameId/invites` | `{ invitees: [{ playerId, friendId, team }], push: { title, body? } }` | `{ invites: [{ playerId, status }] }` |
+| `POST /v1/shared-games/:gameId/invites` | `{ invitees: [{ playerId, friendId, team }], push: { title, body? }, courseId?, courseName? }` | `{ invites: [{ playerId, status }] }` |
 | `POST /v1/shared-games/:gameId/join` | `{ playerId, joinedHole }` | `{ game }` |
 | `POST /v1/shared-games/:gameId/decline` | `{ playerId }` | `{ ok: true }` |
 | `POST /v1/shared-games/:gameId/teams/:n` | `{ name }` | `{ team: { number, name } }` |
@@ -27,6 +27,8 @@ Ids (`gameId`, `playerId`, `installId`, `clientWriteId`, team `memberIds`) match
 
 `options` for best ball: `{ balls: 1 | 2, matchPlay: boolean }` (defaults 1 and false). Other formats store `{}`.
 
+`courseId` and `courseName` are optional on create and on invite, for every format. Each is a string, trimmed; empty after trim is treated as absent. `courseId` is at most 128 characters, `courseName` at most 200. A non-string, a string over the cap, or a control character is `400` `invalid_body`. They are stored on the game (nullable SQLite columns; existing Durable Objects gain the columns on first open, no D1 migration). An invite also copies them onto that invitee's `fr:sginv:` row when present. They do not overwrite a value the game already has. The game object on create, GET, and join includes each field only when it is set; older clients that send neither keep the same shape.
+
 `rev` on a score write is the expected current rev (`0` when the cell is empty). The write compare-and-sets that rev in one transaction. The same `clientWriteId` again returns the cell from the first write and does not append history. A different write with a stale rev is `409` `{ error: "stale_rev", cell }` and `cell` is the standing cell.
 
 The standing score for a non-guest is their latest own entry. A suggestion, or a host entry from the organizer, stays in history and does not replace it. Until the player has an own entry, the organizer's host entry is what the cell shows. A suggestion alone leaves `strokes` null. A guest's standing score is the organizer's host entry and is never `source: "own"`.
@@ -37,7 +39,7 @@ Reads and score writes are only for players on the list. Someone else gets `403`
 
 The card is one SQLite Durable Object per game (`SharedGame`, binding `SHARED_GAMES`). Nothing from the card is written to `BOARDS`.
 
-`GET /v1/shared-games/invites` lists the caller's invites still waiting on them, newest first, at most 20, so an invitee whose push never arrived still sees them. Each newly sent invite also writes one `BOARDS` row for the invitee, `fr:sginv:<ownerId>:<gameId>` (`{ at, organizerId, hostName, course }`, kept 7 days). Join and decline delete it. On read each row is checked against its game: the invite must still be `sent` to the caller's `ownerId` and the caller not on the card yet, or the row is dropped; a block either way with anyone on the card hides it. `hostName` is the name in the approved push title (`{Name} invited you to a shared scorecard`), else the host's own Friends name, else null. `course` is the course in the approved Scramble push body, else null. Same auth as `GET /v1/shared-games/:gameId`, and the same read limit (60 an hour per key and per IP) in its own bucket, so it never uses up a live card's reads; a body is `400`, another method `405`.
+`GET /v1/shared-games/invites` lists the caller's invites still waiting on them, newest first, at most 20, so an invitee whose push never arrived still sees them. Each newly sent invite also writes one `BOARDS` row for the invitee, `fr:sginv:<ownerId>:<gameId>` (`{ at, organizerId, hostName, course }` plus `courseId` / `courseName` when set, kept 7 days). Join and decline delete it. On read each row is checked against its game: the invite must still be `sent` to the caller's `ownerId` and the caller not on the card yet, or the row is dropped; a block either way with anyone on the card hides it. `hostName` is the name in the approved push title (`{Name} invited you to a shared scorecard`), else the host's own Friends name, else null. `course` is the course in the approved Scramble push body, else null. `courseId` and `courseName` come from the game (or the invite body) and are omitted when absent. Same auth as `GET /v1/shared-games/:gameId`, and the same read limit (60 an hour per key and per IP) in its own bucket, so it never uses up a live card's reads; a body is `400`, another method `405`.
 
 Wager keys are stripped from the input and never returned, empty or not: `wager`, `wagers`, `sidegame`, `sidegames`, `side_game`, `side_games`, `bet`, `bets`.
 
