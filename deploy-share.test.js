@@ -805,5 +805,46 @@ describe('shottrax-share deploy wrapper', { concurrency: 1 }, () => {
     }
   });
 
+  test('/admin/pulls/ GET and HEAD are served by the golf proxy and need the admin token', async () => {
+    const recorder = installFetchRecorder();
+    const { env } = baseEnv({ ALERT_ADMIN_TOKEN: 'test-admin-key' });
+    try {
+      for (const method of ['GET', 'HEAD']) {
+        const denied = await entryFetch('/admin/pulls/', env, { method });
+        assert.equal(denied.status, 401, method);
+
+        const wrong = await entryFetch('/admin/pulls/', env, {
+          method,
+          headers: { 'X-Admin-Token': 'nope' },
+        });
+        assert.equal(wrong.status, 401, method);
+
+        // Live does not implement this route; 401/200 from entry means isPrPath
+        // sent it to the golf proxy instead of falling through.
+        const viaLive = await live.fetch(request('/admin/pulls/', { method }), env, {});
+        assert.notEqual(viaLive.status, 200, `${method} live`);
+        assert.equal((await viaLive.text()).includes('cycleId'), false, `${method} live body`);
+
+        const ok = await entryFetch('/admin/pulls/', env, {
+          method,
+          headers: { 'X-Admin-Token': 'test-admin-key' },
+        });
+        assert.equal(ok.status, 200, method);
+        if (method === 'GET') {
+          const listed = await ok.json();
+          assert.equal(typeof listed.cycleId, 'string');
+          assert.equal(Array.isArray(listed.rows), true);
+          assert.equal(listed.rows.length, 0);
+          assert.equal(listed.totals.credits, 0);
+        } else {
+          await ok.arrayBuffer();
+        }
+      }
+      assert.equal(recorder.calls.some((call) => call.url.includes('golfapi.io')), false);
+    } finally {
+      recorder.restore();
+    }
+  });
+
 
 });

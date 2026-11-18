@@ -1011,7 +1011,7 @@ async function handleDemand(request, env) {
 }
 
 async function handlePulls(request, url, env) {
-  if (request.method !== 'GET') return json(405, { error: 'method_not_allowed' });
+  if (request.method !== 'GET' && request.method !== 'HEAD') return json(405, { error: 'method_not_allowed' });
   if (!adminTokenOk(request, env)) return json(401, { error: 'unauthorized' });
   const asked = (url.searchParams.get('cycle') || '').trim();
   if (asked && !CYCLE_ID_RE.test(asked)) return json(400, { error: 'bad_cycle' });

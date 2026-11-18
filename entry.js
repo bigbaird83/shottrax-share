@@ -31,6 +31,7 @@ function isPrPath(p) {
     p === "/admin/demand" ||
     p === "/admin/stockpile" ||
     p === "/admin/pulls" ||
+    p === "/admin/pulls/" ||
     p.startsWith("/course-card/") ||
     p === "/admin/greens-no-tees-digest"
   );
