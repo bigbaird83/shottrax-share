@@ -805,40 +805,61 @@ describe('shottrax-share deploy wrapper', { concurrency: 1 }, () => {
     }
   });
 
-  test('/admin/pulls/ GET and HEAD are served by the golf proxy and need the admin token', async () => {
+  test('/admin/pulls/ GET is served by the golf proxy and needs the admin token', async () => {
     const recorder = installFetchRecorder();
     const { env } = baseEnv({ ALERT_ADMIN_TOKEN: 'test-admin-key' });
     try {
-      for (const method of ['GET', 'HEAD']) {
-        const denied = await entryFetch('/admin/pulls/', env, { method });
-        assert.equal(denied.status, 401, method);
+      const denied = await entryFetch('/admin/pulls/', env);
+      assert.equal(denied.status, 401);
+      assert.equal((await denied.json()).error, 'unauthorized');
 
-        const wrong = await entryFetch('/admin/pulls/', env, {
-          method,
-          headers: { 'X-Admin-Token': 'nope' },
-        });
-        assert.equal(wrong.status, 401, method);
+      const wrong = await entryFetch('/admin/pulls/', env, {
+        headers: { 'X-Admin-Token': 'nope' },
+      });
+      assert.equal(wrong.status, 401);
 
-        // Live does not implement this route; 401/200 from entry means isPrPath
-        // sent it to the golf proxy instead of falling through.
-        const viaLive = await live.fetch(request('/admin/pulls/', { method }), env, {});
-        assert.notEqual(viaLive.status, 200, `${method} live`);
-        assert.equal((await viaLive.text()).includes('cycleId'), false, `${method} live body`);
+      // Live does not implement this route; 401/200 from entry means isPrPath
+      // sent it to the golf proxy instead of falling through.
+      const viaLive = await live.fetch(request('/admin/pulls/'), env, {});
+      assert.notEqual(viaLive.status, 200);
+      assert.equal((await viaLive.text()).includes('cycleId'), false);
 
-        const ok = await entryFetch('/admin/pulls/', env, {
-          method,
+      const ok = await entryFetch('/admin/pulls/', env, {
+        headers: { 'X-Admin-Token': 'test-admin-key' },
+      });
+      assert.equal(ok.status, 200);
+      const listed = await ok.json();
+      assert.equal(typeof listed.cycleId, 'string');
+      assert.equal(Array.isArray(listed.rows), true);
+      assert.equal(listed.rows.length, 0);
+      assert.equal(listed.totals.credits, 0);
+      assert.equal(recorder.calls.some((call) => call.url.includes('golfapi.io')), false);
+    } finally {
+      recorder.restore();
+    }
+  });
+
+  test('HEAD /admin/pulls and /admin/pulls/ are 405 from the golf proxy, not the live script', async () => {
+    const recorder = installFetchRecorder();
+    const { env } = baseEnv({ ALERT_ADMIN_TOKEN: 'test-admin-key' });
+    try {
+      for (const path of ['/admin/pulls', '/admin/pulls/']) {
+        const viaLive = await live.fetch(request(path, { method: 'HEAD' }), env, {});
+        const liveBody = await viaLive.text();
+
+        const head = await entryFetch(path, env, {
+          method: 'HEAD',
           headers: { 'X-Admin-Token': 'test-admin-key' },
         });
-        assert.equal(ok.status, 200, method);
-        if (method === 'GET') {
-          const listed = await ok.json();
-          assert.equal(typeof listed.cycleId, 'string');
-          assert.equal(Array.isArray(listed.rows), true);
-          assert.equal(listed.rows.length, 0);
-          assert.equal(listed.totals.credits, 0);
-        } else {
-          await ok.arrayBuffer();
-        }
+        assert.equal(head.status, 405, path);
+        const body = await head.text();
+        // json() always emits a JSON body, including for HEAD 405.
+        // Live also answers HEAD with 405, but as text/plain "no", so the
+        // JSON method_not_allowed body is what proves this hit the proxy.
+        assert.equal(head.headers.get('content-type'), 'application/json', path);
+        assert.equal(JSON.parse(body).error, 'method_not_allowed', path);
+        assert.notEqual(body, liveBody, `${path} not live body`);
+        assert.notEqual(head.headers.get('content-type'), viaLive.headers.get('content-type'), `${path} not live type`);
       }
       assert.equal(recorder.calls.some((call) => call.url.includes('golfapi.io')), false);
     } finally {
