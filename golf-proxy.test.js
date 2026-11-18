@@ -256,6 +256,11 @@ async function bodyOf(response) {
   return response.json();
 }
 
+function paidRows(fake, now = new Date()) {
+  const raw = fake.counter.sql.map.get(`golfapi:paid:${golfapiCycleId(now, 5)}`);
+  return raw ? JSON.parse(raw) : [];
+}
+
 describe('golf proxy worker', { concurrency: 1 }, () => {
   test('US and territory points are inside the bounding polygons; other countries are not', () => {
     assert.equal(usTerritoryAt(34.7465, -92.2896), 'conus');
@@ -2103,6 +2108,238 @@ describe('golf proxy worker', { concurrency: 1 }, () => {
       }
       const rows = JSON.parse(fake.counter.sql.map.get(`golfapi:demand:${cycleId}`));
       assert.equal(rows.length, 500);
+    } finally {
+      fake.restore();
+    }
+  });
+  test('a paid search, course pull, and coordinates pull each add one paid-log row', async () => {
+    const fake = installFakes();
+    try {
+      globalThis.fetch = async (input) => {
+        const url = String(input);
+        fake.calls.push(url);
+        let payload = { courseID: 'x' };
+        if (url.includes('/courses?')) {
+          payload = { courses: [{ courseID: 'pb-1', clubName: 'Pebble Beach', country: 'US' }] };
+        } else if (url.endsWith('/courses/pb-1')) {
+          payload = usableCourse('pb-1', 'Pebble Beach');
+        } else if (url.endsWith('/coordinates/pb-1')) {
+          payload = { coordinates: usableCourse('pb-1').coordinates };
+        } else if (url.endsWith('/coordinates/zz-9')) {
+          payload = { coordinates: usableCourse('zz-9').coordinates };
+        }
+        return new Response(JSON.stringify(payload), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      };
+      const env = baseEnv(fake);
+      const typed = `  Pebble ${'x'.repeat(100)}  `;
+      const search = `/golfapi/v2.3/courses?country=US&name=${encodeURIComponent(typed)}`;
+      assert.equal((await proxy(search, env, usHeaders('id_paid_a'))).status, 200);
+      assert.equal((await proxy('/golfapi/v2.3/courses/pb-1', env, usHeaders('id_paid_a'))).status, 200);
+      assert.equal((await proxy('/golfapi/v2.3/coordinates/pb-1', env, usHeaders('id_paid_a'))).status, 200);
+      assert.equal((await proxy('/golfapi/v2.3/coordinates/zz-9', env, usHeaders('id_paid_b'))).status, 200);
+      assert.equal(fake.calls.length, 4);
+
+      const rows = paidRows(fake);
+      assert.equal(rows.length, 4);
+      assert.deepEqual(rows.map((row) => row.kind), ['search', 'course', 'coordinates', 'coordinates']);
+      assert.deepEqual(rows.map((row) => row.credits), [0.1, 1, 1, 1]);
+      assert.equal(rows[0].query, typed.trim().slice(0, 80));
+      assert.equal(rows[0].query.length, 80);
+      assert.equal(rows[0].courseId, null);
+      assert.equal(rows[0].courseName, null);
+      assert.equal(rows[1].query, null);
+      assert.equal(rows[1].courseId, 'pb-1');
+      assert.equal(rows[1].courseName, 'Pebble Beach');
+      assert.equal(rows[2].courseId, 'pb-1');
+      assert.equal(rows[2].courseName, 'Pebble Beach', 'coordinates name comes from knownCourse');
+      assert.equal(rows[3].courseId, 'zz-9');
+      assert.equal(rows[3].courseName, null);
+      for (const row of rows) {
+        assert.deepEqual(Object.keys(row).sort(), ['at', 'courseId', 'courseName', 'credits', 'kind', 'query']);
+        assert.match(row.at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+      }
+      const spentTenths = rows.reduce((sum, row) => sum + Math.round(row.credits * 10), 0);
+      assert.equal(Math.round(counterValue(fake, creditKey('any', 'month')) * 10), spentTenths,
+        'logged credits match what the app monthly counter charged');
+    } finally {
+      fake.restore();
+    }
+  });
+
+  test('stored and edge repeats charge 0 and add no paid-log row', async () => {
+    const fake = installFakes();
+    try {
+      globalThis.fetch = async (input) => {
+        const url = String(input);
+        fake.calls.push(url);
+        let payload = usableCourse('rp-1', 'Repeat Club');
+        if (url.includes('name=Repeat')) payload = { courses: [{ courseID: 'rp-1', clubName: 'Repeat Club', country: 'US' }] };
+        if (url.includes('name=NoHits')) payload = { courses: [] };
+        return new Response(JSON.stringify(payload), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      };
+      const env = baseEnv(fake);
+      const paths = [
+        '/golfapi/v2.3/courses?country=US&name=Repeat',
+        '/golfapi/v2.3/courses?country=US&name=NoHits',
+        '/golfapi/v2.3/courses/rp-1',
+        '/golfapi/v2.3/coordinates/rp-1',
+      ];
+      for (const path of paths) assert.equal((await proxy(path, env, usHeaders('id_repeat'))).status, 200);
+      assert.equal(fake.calls.length, 4);
+      assert.equal(paidRows(fake).length, 4);
+      const monthBefore = counterValue(fake, creditKey('id_repeat', 'month'));
+
+      for (const path of paths) assert.equal((await proxy(path, env, usHeaders('id_repeat'))).status, 200);
+      fake.kv.store.clear();
+      for (const path of paths) assert.equal((await proxy(path, env, usHeaders('id_repeat'))).status, 200);
+      assert.equal(fake.calls.length, 4, 'every repeat is a KV or edge copy');
+      assert.equal(counterValue(fake, creditKey('id_repeat', 'month')), monthBefore);
+      assert.equal(paidRows(fake).length, 4);
+    } finally {
+      fake.restore();
+    }
+  });
+
+  test('refunds and refusals add no paid-log row', async () => {
+    const fake = installFakes();
+    try {
+      const env = baseEnv(fake);
+      golfJson(fake, { error: 'boom' }, 500);
+      assert.equal((await proxy('/golfapi/v2.3/courses/fail-1', env, usHeaders('id_ref'))).status, 500);
+      assert.equal((await proxy('/golfapi/v2.3/courses?country=US&name=Fail', env, usHeaders('id_ref'))).status, 500);
+      globalThis.fetch = async () => {
+        throw new Error('network down');
+      };
+      assert.equal((await proxy('/golfapi/v2.3/coordinates/fail-2', env, usHeaders('id_ref'))).status, 502);
+      const noKey = baseEnv(fake, { GOLFAPI_KEY: '' });
+      assert.equal((await proxy('/golfapi/v2.3/courses/fail-3', noKey, usHeaders('id_ref'))).status, 503);
+      assert.equal(counterValue(fake, creditKey('id_ref', 'month')), 0, 'every failure was refunded');
+      assert.equal(paidRows(fake).length, 0);
+
+      globalThis.fetch = async (input) => {
+        throw new Error(`a refused call must not reach golfapi: ${String(input)}`);
+      };
+      const capped = baseEnv(fake, { GOLFAPI_DAILY_CAP: '0' });
+      assert.equal((await bodyOf(await proxy('/golfapi/v2.3/courses/cap-1', capped, usHeaders('id_cap')))).reason, 'app_daily');
+      fake.counter.sql.map.set(creditKey('id_limit', 'pull'), '4');
+      assert.equal((await bodyOf(await proxy('/golfapi/v2.3/courses/lim-1', env, usHeaders('id_limit')))).reason, 'phone_limit');
+      seedCredits(fake, 'id_backstop', 20);
+      assert.equal((await bodyOf(await proxy('/golfapi/v2.3/courses/bs-1', baseEnv(fake, {
+        GOLFAPI_DAILY_CAP: '500',
+        GOLFAPI_MONTHLY_CAP: '3500',
+      }), usHeaders('id_backstop')))).reason, 'phone_limit');
+      assert.equal((await bodyOf(await proxy('/golfapi/v2.3/courses/nu-1', env, usHeaders('id_abroad', 'GBR')))).reason, 'storefront');
+      await fake.kv.put('gq:balance', JSON.stringify({ left: 156, at: 1, lastStatus: 200 }));
+      assert.equal((await bodyOf(await proxy('/golfapi/v2.3/courses/fl-1', env, usHeaders('id_floor')))).reason, 'floor');
+      assert.equal(paidRows(fake).length, 0);
+    } finally {
+      fake.restore();
+    }
+  });
+
+  test('the paid log keeps the last 1000 rows, dropping the oldest', async () => {
+    const fake = installFakes();
+    try {
+      const cycleId = '2026-11-05';
+      for (let n = 0; n < 1003; n += 1) {
+        await counterOp(fake, {
+          op: 'notePaidPull',
+          cycleId,
+          at: new Date(Date.UTC(2026, 10, 6, 0, 0, n)).toISOString(),
+          kind: 'course',
+          query: null,
+          courseId: `row-${n}`,
+          courseName: null,
+          tenths: 10,
+        });
+      }
+      const rows = JSON.parse(fake.counter.sql.map.get(`golfapi:paid:${cycleId}`));
+      assert.equal(rows.length, 1000);
+      assert.equal(rows[0].courseId, 'row-3');
+      assert.equal(rows.at(-1).courseId, 'row-1002');
+      const zero = await counterOp(fake, { op: 'notePaidPull', cycleId, at: 'x', kind: 'course', courseId: 'free', tenths: 0 });
+      assert.equal(zero.ok, false, 'a 0-credit row is never written');
+    } finally {
+      fake.restore();
+    }
+  });
+
+  test('/admin/pulls needs the admin token, is GET only, lists newest first with totals, and never calls golfapi', async () => {
+    const fake = installFakes();
+    try {
+      const install = 'id_pulls_admin_7c1e';
+      globalThis.fetch = async (input) => {
+        const url = String(input);
+        fake.calls.push(url);
+        const payload = url.includes('/courses?')
+          ? { courses: [{ courseID: 'ad-1', clubName: 'Admin Club', country: 'US' }] }
+          : usableCourse('ad-1', 'Admin Club');
+        return new Response(JSON.stringify(payload), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      };
+      const env = baseEnv(fake, { ALERT_ADMIN_TOKEN: 'secret-token' });
+      assert.equal((await proxy('/golfapi/v2.3/courses?country=US&name=Admin', env, usHeaders(install))).status, 200);
+      assert.equal((await proxy('/golfapi/v2.3/courses?country=US&name=Admin2', env, usHeaders(install))).status, 200);
+      assert.equal((await proxy('/golfapi/v2.3/courses/ad-1', env, usHeaders(install))).status, 200);
+      assert.equal((await proxy('/golfapi/v2.3/coordinates/ad-1', env, usHeaders(install))).status, 200);
+
+      globalThis.fetch = async () => {
+        throw new Error('pulls admin must not call golfapi');
+      };
+      assert.equal((await proxy('/admin/pulls', env, {})).status, 401);
+      assert.equal((await proxy('/admin/pulls', env, { 'X-Admin-Token': 'nope' })).status, 401);
+      assert.equal((await proxy('/admin/pulls', env, { 'X-Install-Id': install })).status, 401);
+      assert.equal((await proxy('/admin/pulls', env, { 'X-Admin-Token': install })).status, 401);
+      assert.equal((await proxy('/admin/pulls', env, { 'X-Admin-Token': DOC })).status, 401);
+      const noSecret = baseEnv(fake, { ALERT_ADMIN_TOKEN: '' });
+      assert.equal((await proxy('/admin/pulls', noSecret, { 'X-Admin-Token': '' })).status, 401);
+      assert.equal((await proxy('/admin/pulls', env, { 'X-Admin-Token': 'secret-token' }, 'POST')).status, 405);
+
+      const ok = await proxy('/admin/pulls', env, { 'X-Admin-Token': 'secret-token' });
+      assert.equal(ok.status, 200);
+      const listed = await bodyOf(ok);
+      assert.equal(listed.cycleId, golfapiCycleId(new Date(), 5));
+      assert.deepEqual(listed.rows.map((row) => row.kind), ['coordinates', 'course', 'search', 'search']);
+      assert.deepEqual(listed.rows.map((row) => row.query), [null, null, 'Admin2', 'Admin']);
+      assert.ok(listed.rows[0].at >= listed.rows[3].at);
+      assert.deepEqual(listed.totals, {
+        search: { count: 2, credits: 0.2 },
+        course: { count: 1, credits: 1 },
+        coordinates: { count: 1, credits: 1 },
+        credits: 2.2,
+      });
+      assert.equal(JSON.stringify(listed).includes(install), false);
+
+      const past = await bodyOf(await proxy('/admin/pulls?cycle=2020-01-05', env, { 'X-Admin-Token': 'secret-token' }));
+      assert.equal(past.cycleId, '2020-01-05');
+      assert.deepEqual(past.rows, []);
+      assert.equal(past.totals.credits, 0);
+      assert.equal((await proxy('/admin/pulls?cycle=nope', env, { 'X-Admin-Token': 'secret-token' })).status, 400);
+    } finally {
+      fake.restore();
+    }
+  });
+
+  test('the stored paid log contains no install id', async () => {
+    const fake = installFakes();
+    try {
+      const installs = ['id_secret_install_a1', 'id_secret_install_b2', 'id_secret_install_c3'];
+      golfJson(fake, usableCourse('priv-1', 'Private Club'));
+      const env = baseEnv(fake);
+      assert.equal((await proxy('/golfapi/v2.3/courses/priv-1', env, usHeaders(installs[0]))).status, 200);
+      fake.kv.store.clear();
+      fake.cache.entries.clear();
+      assert.equal((await proxy('/golfapi/v2.3/coordinates/priv-1', env, usHeaders(installs[1]))).status, 200);
+      golfJson(fake, { courses: [{ courseID: 'priv-1', clubName: 'Private Club', country: 'US' }] });
+      assert.equal((await proxy('/golfapi/v2.3/courses?country=US&name=Private', env, usHeaders(installs[2], 'US'))).status, 200);
+      assert.equal(paidRows(fake).length, 3);
+      const raw = [...fake.counter.sql.map.entries()]
+        .filter(([key]) => key.startsWith('golfapi:paid:'))
+        .map(([, value]) => value)
+        .join('\n');
+      assert.ok(raw.length > 0);
+      for (const install of installs) assert.equal(raw.includes(install), false, install);
+      assert.equal(raw.includes('golf-secret'), false);
+      assert.equal(raw.includes('USA'), false);
     } finally {
       fake.restore();
     }

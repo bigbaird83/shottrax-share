@@ -30,6 +30,7 @@ function isPrPath(p) {
     p === "/admin/alert-test" ||
     p === "/admin/demand" ||
     p === "/admin/stockpile" ||
+    p === "/admin/pulls" ||
     p.startsWith("/course-card/") ||
     p === "/admin/greens-no-tees-digest"
   );
