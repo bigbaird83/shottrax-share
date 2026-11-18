@@ -13,7 +13,7 @@ import {
   planImport,
   scanRaw,
 } from './import-raw-pulls.mjs';
-import { buildLists, findSignalFiles } from './import-lists.mjs';
+import { GREENBRIAR_MI_ID, buildLists, findSignalFiles } from './import-lists.mjs';
 
 // A fixture course that passes every Oct 28 check: 18 par-4 holes, back tee
 // (poi 12) 380 yd and front tee (poi 11) 340 yd from the green, matching the
@@ -599,6 +599,11 @@ const SC = {
   km2: '0129000000000000020',
   excluded: '0129000000000000021',
   errorBody: '0129000000000000022',
+  fillMissingPlusReject: '0129000000000000023',
+  unusablePartial: '0129000000000000024',
+  acceptedPartial: '0129000000000000025',
+  acceptedPartialReady: '0129000000000000026',
+  greenbriar: GREENBRIAR_MI_ID,
 };
 const SC_TABLE = `# ZZ national golfapi pull: validation
 ## Per-course table
@@ -623,11 +628,16 @@ const SC_TABLE = `# ZZ national golfapi pull: validation
 | Q | Q GC | ${SC.km2} | partial |
 | R | R GC | ${SC.excluded} | exclude (duplicate row) |
 | S | S GC | ${SC.errorBody} | partial |
+| T | T GC | ${SC.fillMissingPlusReject} | import-ready (fill missing only) |
+| U | U GC | ${SC.unusablePartial} | partial (unusable) |
+| V | V GC | ${SC.acceptedPartial} | partial (greens only) |
+| W | W GC | ${SC.acceptedPartialReady} | import-ready |
+| X | X GC | ${SC.greenbriar} | partial |
 
 ### Partial courses
 - ${SC.prose}: partial, greens look fine.
 `;
-const SC_CONFLICT = `| Course | id | Bucket |\n|---|---|---|\n| L again | ${SC.conflict} | rejected |\n`;
+const SC_CONFLICT = `| Course | id | Bucket |\n|---|---|---|\n| L again | ${SC.conflict} | rejected |\n| T again | ${SC.fillMissingPlusReject} | rejected |\n`;
 
 function serverCacheFixture() {
   const root = join(dir, 'signal');
@@ -635,7 +645,12 @@ function serverCacheFixture() {
   mkdirSync(join(root, 'raw/national/ZZ'), { recursive: true });
   writeFileSync(join(root, 'national/ZZ-validation.md'), SC_TABLE);
   writeFileSync(join(root, 'national/ZZ-older-validation.md'), SC_CONFLICT);
-  writeFileSync(join(root, 'raw/national/ZZ/validate-2km.json'), JSON.stringify([{ id: SC.km2, result: 'REJECTED: green center 6.1 km from OSM' }]));
+  writeFileSync(join(root, 'raw/national/ZZ/validate-2km.json'), JSON.stringify([
+    { id: SC.km2, result: 'REJECTED: green center 6.1 km from OSM' },
+    { id: SC.acceptedPartial, result: 'accepted-partial greens 9/18' },
+    { id: SC.acceptedPartialReady, result: 'accepted-partial greens 9/18' },
+    { id: SC.greenbriar, result: 'accepted-partial greens 3/18' },
+  ]));
 
   const copiedNine = coordBody(SC.trim);
   const front = copiedNine.coordinates.filter((r) => r.hole <= 9);
@@ -654,7 +669,7 @@ function serverCacheFixture() {
   put(`raw/${SC.missingPair}.courses.json`, pyText(courseBody(SC.missingPair)));
   pair('raw', SC.noGreens, courseBody(SC.noGreens), coordBody(SC.noGreens, {}, allHoles({ green: false })));
   pair('raw', SC.errorBody, courseBody(SC.errorBody, { error: 'Course not found' }));
-  for (const id of ['rejected', 'unusable', 'conflict', 'fillMissing', 'wrongCourse', 'twoIdA', 'twoIdB', 'unreviewed', 'halfStored', 'prose', 'km2', 'excluded']) pair('raw', SC[id]);
+  for (const id of ['rejected', 'unusable', 'conflict', 'fillMissing', 'wrongCourse', 'twoIdA', 'twoIdB', 'unreviewed', 'halfStored', 'prose', 'km2', 'excluded', 'fillMissingPlusReject', 'unusablePartial', 'acceptedPartial', 'acceptedPartialReady', 'greenbriar']) pair('raw', SC[id]);
   return root;
 }
 function planMode(mode, existing = []) {
@@ -676,13 +691,13 @@ describe('--mode server-cache', () => {
     serverCacheFixture();
     const server = planMode('server-cache');
     const strict = planMode('default');
-    const included = [SC.ready, SC.partialPar, SC.trim, SC.readyCardFail, SC.noTee, SC.readyNoTee, SC.halfStored];
+    const included = [SC.ready, SC.partialPar, SC.trim, SC.readyCardFail, SC.noTee, SC.readyNoTee, SC.halfStored, SC.fillMissing, SC.acceptedPartial];
     assert.deepEqual([...server.ids].sort(), included.sort());
     assert.deepEqual([...strict.ids], [SC.ready], 'default mode is the strict #66 behavior');
     assert.equal(strict.result.report.skipped.trim_to_9, undefined, 'the default list never even allows the trim row');
     assert.equal(strict.result.report.skipped.coordinates_no_usable_map, 1, 'default keeps the no-tee skip (import-ready no-tee row)');
     assert.equal(strict.result.report.skipped.oct28_card_yards_15pct, 1);
-    assert.deepEqual(server.result.report.writtenByVerdict, { 'import-ready': 3, partial: 3, 'trim-to-9': 1 });
+    assert.deepEqual(server.result.report.writtenByVerdict, { 'import-ready': 3, partial: 4, 'trim-to-9': 1, 'fill-missing': 1 });
     assert.deepEqual(server.result.report.noTeeIncluded.map((r) => r.id).sort(), [SC.noTee, SC.readyNoTee]);
     assert.equal(server.result.report.skipped.oct28_card_yards_15pct, undefined);
   });
@@ -707,18 +722,32 @@ describe('--mode server-cache', () => {
     assert.equal(result.report.skipped.error_field, 1);
   });
 
-  test('rejected, unusable, excluded, conflict, fill-missing, 2-id, prose, validate-2km and unreviewed ids stay out', () => {
+  test('rejected, unusable, excluded, conflict, fill-missing-plus-reject, 2-id, prose, validate-2km and unreviewed ids stay out', () => {
     serverCacheFixture();
     const { lists, result, ids } = planMode('server-cache');
-    for (const id of ['rejected', 'unusable', 'excluded', 'conflict', 'fillMissing', 'wrongCourse', 'twoIdA', 'twoIdB', 'prose', 'km2', 'unreviewed']) {
+    for (const id of ['rejected', 'unusable', 'excluded', 'conflict', 'fillMissingPlusReject', 'unusablePartial', 'wrongCourse', 'twoIdA', 'twoIdB', 'prose', 'km2', 'unreviewed', 'acceptedPartialReady', 'greenbriar']) {
       assert.equal(ids.has(SC[id]), false, id);
     }
+    assert.equal(ids.has(SC.fillMissing), true, 'fill-missing only is written in server-cache');
+    assert.equal(ids.has(SC.acceptedPartial), true, 'accepted-partial is written when Signal\'s row is partial');
     assert.ok(lists.allowAlsoRejected.includes(SC.conflict), 'an id on an allow-type and a reject-type row is conflict-blocked');
     assert.ok(lists.allowAlsoRejected.includes(SC.km2));
-    assert.deepEqual(lists.fillMissing, [SC.fillMissing]);
+    assert.ok(lists.allowAlsoRejected.includes(SC.fillMissingPlusReject));
+    assert.ok(lists.allowAlsoRejected.includes(SC.acceptedPartialReady));
+    assert.ok(lists.allowAlsoRejected.includes(SC.greenbriar));
+    assert.deepEqual(lists.fillMissing, [SC.fillMissing, SC.fillMissingPlusReject].sort());
+    assert.deepEqual(lists.acceptedPartialIncluded, [SC.acceptedPartial]);
     assert.equal(lists.allow[SC.prose], undefined, 'prose never allows');
     assert.equal(lists.reject[SC.prose], undefined, 'a trim/partial word in prose no longer rejects');
     assert.equal(result.report.skipped.not_allowlisted, 2, 'prose id and the unreviewed id');
+  });
+
+  test('fill-missing stays out of default mode; accepted-partial stays out unless Signal\'s row is partial', () => {
+    serverCacheFixture();
+    const strict = planMode('default');
+    for (const id of [SC.fillMissing, SC.fillMissingPlusReject, SC.acceptedPartial, SC.acceptedPartialReady, SC.greenbriar, SC.unusablePartial]) {
+      assert.equal(strict.ids.has(id), false, id);
+    }
   });
 
   test('an existing key is never rewritten', () => {

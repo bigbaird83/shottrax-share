@@ -26,14 +26,20 @@
  *
  * --mode server-cache (Brian, Nov 17 2026, 7:43 and 7:45 PM CT: upload every
  * reviewed course Signal Lab has not rejected or marked unusable, including
- * partial, 9-hole and no-tee ones). Needs an allowlist built with
- * `import-lists.mjs --mode server-cache`; each id carries its Signal verdict
- * (import-ready, partial, trim-to-9). The Oct 28 checks and the evidence gate
- * do not apply, trim-to-9 bodies are stored raw (never trimmed), and a
- * coordinates body with greens but no tee is allowed. Still required: both
- * bodies, valid JSON, no error/quota body, matching id, US, nonzero GPS, and at
- * least one nonzero green. Never-overwrite, rejects-win, dedupe and fail-closed
- * rules are the same as the default mode, which is unchanged.
+ * partial, 9-hole and no-tee ones; 7:58 PM CT: include fill-missing-only;
+ * 8:00 PM CT: include the 19 Signal-cleared accepted-partials). Needs an
+ * allowlist built with `import-lists.mjs --mode server-cache`; each id carries
+ * its Signal verdict (import-ready, partial, trim-to-9, fill-missing). The
+ * Oct 28 checks and the evidence gate do not apply, trim-to-9 and fill-missing
+ * bodies are stored raw (never trimmed or filled), and a coordinates body with
+ * greens but no tee is allowed. Still required: both bodies, valid JSON, no
+ * error/quota body, matching id, US, nonzero GPS, and at least one nonzero
+ * green. "unusable" anywhere in a verdict is a reject in both modes.
+ * validate-2km accepted-partial is included only when Signal's row is partial;
+ * Greenbriar MI 012141520859173562416 is hard-excluded. Never-overwrite,
+ * rejects-win, dedupe and fail-closed rules are the same as the default mode,
+ * which is unchanged except that Jacksonville CC IL is no longer in
+ * ALWAYS_REJECT.
  *
  * Fail closed: a missing allowlist, reject list or key listing, an empty or
  * failed key listing, is an error and no output file is written.
@@ -583,10 +589,18 @@ function markdown(report, meta) {
   lines.push(`Reject list: ${meta.rejects} (${report.rejectListSize} ids, plus ALWAYS_REJECT)`, '');
   if (report.mode === 'server-cache') {
     lines.push('## Mode: server-cache', '');
-    lines.push('Signal verdicts import-ready, partial and trim-to-9 (stored raw, not trimmed); Oct 28 checks not applied; greens without tees allowed.', '');
+    lines.push('Signal verdicts import-ready, partial, trim-to-9 and fill-missing (stored raw, not trimmed); Oct 28 checks not applied; greens without tees allowed. "unusable" anywhere is a reject. validate-2km accepted-partial is included only when Signal\'s row is partial; Greenbriar MI is hard-excluded.', '');
     for (const [v, n] of Object.entries(report.writtenByVerdict).sort()) lines.push(`- written, ${v}: ${n} (valid ${report.validByVerdict[v] || 0})`);
     lines.push(`- no-tee courses included (greens, no tee): ${report.noTeeIncluded.length}`);
-    if (meta.fillMissing) lines.push(`- fill missing only ids excluded (reject list): ${meta.fillMissing.length}`);
+    const fillMissing = meta.fillMissing || [];
+    lines.push(`- fill-missing written: ${report.writtenByVerdict['fill-missing'] || 0}`);
+    if (fillMissing.length) lines.push(`- fill-missing Signal rows seen: ${fillMissing.length}`);
+    const acceptedPartial = meta.acceptedPartialIncluded || [];
+    lines.push(`- validate-2km accepted-partial included (Signal partial row, not Greenbriar): ${acceptedPartial.length}`);
+    if (acceptedPartial.length) {
+      lines.push('', '## validate-2km accepted-partial included', '');
+      for (const id of acceptedPartial) lines.push(`- ${id}`);
+    }
     lines.push('');
   }
   lines.push('## Counts', '');
@@ -694,9 +708,9 @@ export function main(argv = process.argv.slice(2), { run } = {}) {
     raw: resolve(args.raw),
     existingSource,
     qualityPolicy: mode === 'server-cache'
-      ? 'server-cache: Signal Lab verdict import-ready, partial or trim-to-9 on a one-id table row; rejected/unusable/excluded/bundled/conflict/fill-missing/validate-2km/ALWAYS_REJECT/unreviewed excluded. Oct 28 checks not applied. Both bodies, valid JSON, no error, US, nonzero GPS, at least one green; tees not required. No bodies modified (trim-to-9 stored raw).'
+      ? 'server-cache: Signal Lab verdict import-ready, partial, trim-to-9 or fill-missing on a one-id table row; rejected/unusable-anywhere/excluded/bundled/conflict/validate-2km/ALWAYS_REJECT/unreviewed excluded. validate-2km accepted-partial included only when Signal\'s row is partial; Greenbriar MI hard-excluded. Oct 28 checks not applied. Both bodies, valid JSON, no error, US, nonzero GPS, at least one green; tees not required. No bodies modified (trim-to-9 and fill-missing stored raw).'
       : 'All holes: tee+green, 5-700 yd span, 15% card yardage, length vs par. OSM outline and right-course: Signal Lab import-ready row evidence; not independently re-reviewed. Trim/partial/ambiguous excluded, no bodies modified.',
-    ...(mode === 'server-cache' ? { fillMissing: rejectFile.fillMissing || [] } : {}),
+    ...(mode === 'server-cache' ? { fillMissing: rejectFile.fillMissing || allowFile.fillMissing || [], acceptedPartialIncluded: allowFile.acceptedPartialIncluded || rejectFile.acceptedPartialIncluded || [] } : {}),
     signalSources: allowFile.sources || [],
     allowlist: resolve(args.allowlist),
     rejects: resolve(args.rejects),
