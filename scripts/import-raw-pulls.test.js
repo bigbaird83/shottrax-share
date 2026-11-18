@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, test } from 'vitest';
@@ -14,32 +14,64 @@ import {
   scanRaw,
 } from './import-raw-pulls.mjs';
 
+// A fixture course that passes every Oct 28 check: 18 par-4 holes, back tee
+// (poi 12) 380 yd and front tee (poi 11) 340 yd from the green, matching the
+// card's Blue 380 / Red 340, all within ~2.5 km of the clubhouse.
+const BASE = { lat: 34.84, lng: -92.39 };
+const YD = 0.9144;
+function north(p, yards) {
+  return { lat: p.lat + (yards * YD) / 111_320, lng: p.lng };
+}
+function east(p, meters) {
+  return { lat: p.lat, lng: p.lng + meters / (111_320 * Math.cos((p.lat * Math.PI) / 180)) };
+}
+function holeTee(n) {
+  return east(BASE, (n - 9.5) * 250);
+}
 function courseBody(id, extra = {}) {
+  const blue = { teeName: 'Blue' };
+  const red = { teeName: 'Red' };
+  for (let n = 1; n <= 18; n += 1) {
+    blue[`length${n}`] = 380;
+    red[`length${n}`] = 340;
+  }
   return {
     apiRequestsLeft: '4498.6',
     clubName: `Club ${id}`,
     city: 'Maumelle',
     state: 'AR',
     country: 'USA',
-    latitude: '34.84',
-    longitude: '-92.39',
+    latitude: String(BASE.lat - 0.005),
+    longitude: String(BASE.lng),
     courseID: id,
     numHoles: '18',
     hasGPS: '1',
+    measure: 'y',
+    parsMen: Array(18).fill(4),
+    tees: [blue, red],
     ...extra,
   };
 }
-function coordBody(id, extra = {}) {
-  return {
-    apiRequestsLeft: '4497.6',
-    courseID: id,
-    numCoordinates: 2,
-    coordinates: [
-      { poi: 1, hole: 1, latitude: 34.8466, longitude: -92.3949 },
-      { poi: 11, hole: 1, latitude: 34.8444, longitude: -92.3966 },
-    ],
-    ...extra,
-  };
+function holeRows(n, { backYards = 380, frontYards = 340, green = true, tees = true } = {}) {
+  const back = holeTee(n);
+  const g = north(back, backYards);
+  const front = north(back, backYards - frontYards);
+  const rows = [];
+  if (green) {
+    rows.push({ poi: 1, location: 1, sideFW: 2, hole: n, latitude: north(g, -10).lat, longitude: g.lng });
+    rows.push({ poi: 1, location: 2, sideFW: 2, hole: n, latitude: g.lat, longitude: g.lng });
+    rows.push({ poi: 1, location: 3, sideFW: 2, hole: n, latitude: north(g, 10).lat, longitude: g.lng });
+  }
+  if (tees) {
+    rows.push({ poi: 11, location: 2, sideFW: 2, hole: n, latitude: front.lat, longitude: front.lng });
+    rows.push({ poi: 12, location: 2, sideFW: 2, hole: n, latitude: back.lat, longitude: back.lng });
+  }
+  return rows;
+}
+function coordBody(id, extra = {}, holeOpts = {}) {
+  const coordinates = [];
+  for (let n = 1; n <= 18; n += 1) coordinates.push(...holeRows(n, holeOpts[n] || {}));
+  return { apiRequestsLeft: '4497.6', courseID: id, numCoordinates: coordinates.length, coordinates, ...extra };
 }
 /** Python-style spacing, like the files on disk. */
 function pyText(value) {
@@ -57,8 +89,16 @@ function pair(folder, id, course = courseBody(id), coords = coordBody(id), mtime
   put(`${folder}/${id}.courses.json`, typeof course === 'string' ? course : pyText(course), mtimeSec);
   put(`${folder}/${id}.coordinates.json`, typeof coords === 'string' ? coords : pyText(coords), mtimeSec);
 }
-function plan(existing = []) {
-  return planImport({ scan: scanRaw(dir), existing: new Set(existing) });
+/** Every scanned id is allowlisted unless `allow` is given. */
+function plan(existing = [], { allow, reject = {}, reviewEvidence } = {}) {
+  const scan = scanRaw(dir);
+  return planImport({
+    scan,
+    existing: new Set(existing),
+    allow: new Set(allow ?? scan.ids.keys()),
+    reject: new Map(Object.entries(reject)),
+    reviewEvidence: reviewEvidence ?? new Map([...scan.ids.keys()].map((id) => [id, [{ source: 'test-validation.md', checks: { outline: 'import-ready', rightCourse: 'import-ready' } }]])),
+  });
 }
 function keysOf(result) {
   return result.bulk.map((row) => row.key).sort();
@@ -229,8 +269,8 @@ describe('import-raw-pulls dry run', () => {
   });
 
   test('existing key list reads plain lines or wrangler JSON', () => {
-    assert.deepEqual([...parseExistingKeys('a\nb\r\n\n')], ['a', 'b']);
-    assert.deepEqual([...parseExistingKeys('[{"name":"a"},{"name":"b"}]')], ['a', 'b']);
+    assert.deepEqual([...parseExistingKeys('golfapi:a\ngolfapi:b\r\n\n')], ['golfapi:a', 'golfapi:b']);
+    assert.deepEqual([...parseExistingKeys('[{"name":"golfapi:a"},{"name":"golfapi:b"}]')], ['golfapi:a', 'golfapi:b']);
     assert.equal(parseExistingKeys('').size, 0);
   });
 
@@ -246,29 +286,218 @@ describe('import-raw-pulls dry run', () => {
 
   test('main writes bulk, undo list and reports without any KV access', () => {
     pair('t', '800');
-    const existing = join(dir, 'existing.txt');
-    writeFileSync(existing, 'golfapi:permanent:search:x\n');
-    const outDir = mkdtempSync(join(tmpdir(), 'raw-pulls-out-'));
+    pair('t', '801');
+    const io = cliFiles({ allow: ['800', '801'], reject: { 801: [{ source: 'x', reason: 'rejected' }] } });
     try {
       const logs = [];
       const log = console.log;
       console.log = (...a) => logs.push(a.join(' '));
       try {
-        main(['--raw', join(dir, 't'), '--existing', existing, '--out', join(outDir, 'bulk.json'), '--report', join(outDir, 'report.json')]);
+        main(io.args());
       } finally {
         console.log = log;
       }
-      const bulk = JSON.parse(readFileSync(join(outDir, 'bulk.json'), 'utf8'));
-      assert.equal(bulk.length, 3);
-      assert.deepEqual(JSON.parse(readFileSync(join(outDir, 'bulk.delete-keys.json'), 'utf8')).sort(), bulk.map((r) => r.key).sort());
-      const report = JSON.parse(readFileSync(join(outDir, 'report.json'), 'utf8'));
+      const bulk = JSON.parse(readFileSync(io.bulk, 'utf8'));
+      assert.deepEqual(bulk.map((r) => r.key).sort(), ['golfapi:permanent:coordinates:800', 'golfapi:permanent:course:800', 'golfapi:us:800']);
+      assert.deepEqual(JSON.parse(readFileSync(join(io.dir, 'bulk.delete-keys.json'), 'utf8')).sort(), bulk.map((r) => r.key).sort());
+      const report = JSON.parse(readFileSync(io.report, 'utf8'));
       assert.equal(report.dryRun, true);
       assert.equal(report.keysToWrite.total, 3);
-      assert.match(readFileSync(join(outDir, 'report.md'), 'utf8'), /NOT RUN/);
+      assert.equal(report.skipped.rejected, 1);
+      assert.match(readFileSync(join(io.dir, 'report.md'), 'utf8'), /NOT RUN/);
       assert.ok(logs.some((l) => l.startsWith('NOT RUN: npx wrangler kv bulk put')));
     } finally {
-      rmSync(outDir, { recursive: true, force: true });
+      io.cleanup();
     }
+  });
+});
+
+/** Temp allowlist / rejects / existing files and output paths for main(). */
+function cliFiles({ allow = [], reject = {}, existing = 'golfapi:permanent:search:x\n' } = {}) {
+  const out = mkdtempSync(join(tmpdir(), 'raw-pulls-out-'));
+  const paths = {
+    dir: out,
+    allowlist: join(out, 'allowlist.json'),
+    rejects: join(out, 'rejects.json'),
+    existing: join(out, 'existing.txt'),
+    bulk: join(out, 'bulk.json'),
+    report: join(out, 'report.json'),
+  };
+  writeFileSync(paths.allowlist, JSON.stringify({ kind: 'allowlist', ids: Object.fromEntries(allow.map((id) => [id, [{ source: 'test-validation.md', bucket: 'import-ready', checks: { outline: 'import-ready', rightCourse: 'import-ready' } }]])) }));
+  writeFileSync(paths.rejects, JSON.stringify({ kind: 'rejects', ids: reject }));
+  if (existing != null) writeFileSync(paths.existing, existing);
+  return {
+    ...paths,
+    args(overrides = {}) {
+      const opts = { raw: join(dir, 't'), allowlist: paths.allowlist, rejects: paths.rejects, existing: paths.existing, out: paths.bulk, report: paths.report, ...overrides };
+      const argv = [];
+      for (const [k, v] of Object.entries(opts)) {
+        if (v === undefined) continue;
+        if (v === true) argv.push(`--${k}`);
+        else argv.push(`--${k}`, v);
+      }
+      return argv;
+    },
+    cleanup() {
+      rmSync(out, { recursive: true, force: true });
+    },
+  };
+}
+
+describe('fail closed', () => {
+  function assertNoOutput(io) {
+    assert.equal(existsSync(io.bulk), false, 'no bulk file');
+    assert.equal(existsSync(join(io.dir, 'bulk.delete-keys.json')), false, 'no undo file');
+    assert.equal(existsSync(io.report), false, 'no report');
+  }
+
+  test('a missing allowlist or reject list is an error and writes nothing', () => {
+    pair('t', '810');
+    const io = cliFiles({ allow: ['810'] });
+    try {
+      assert.throws(() => main(io.args({ allowlist: undefined })), /--allowlist is required/);
+      assertNoOutput(io);
+      assert.throws(() => main(io.args({ allowlist: join(io.dir, 'nope.json') })), /cannot read --allowlist/);
+      assertNoOutput(io);
+      assert.throws(() => main(io.args({ rejects: undefined })), /--rejects is required/);
+      assertNoOutput(io);
+      writeFileSync(io.rejects, JSON.stringify({ kind: 'allowlist', ids: {} }));
+      assert.throws(() => main(io.args()), /not an import-lists rejects file/);
+      assertNoOutput(io);
+    } finally {
+      io.cleanup();
+    }
+  });
+
+  test('a missing, empty or failed key listing is an error and writes nothing', () => {
+    pair('t', '820');
+    const io = cliFiles({ allow: ['820'], existing: null });
+    try {
+      assert.throws(() => main(io.args()), /ENOENT/);
+      assertNoOutput(io);
+      assert.throws(() => main(io.args({ existing: undefined })), /need --existing <file> or --list-remote/);
+      assertNoOutput(io);
+      // The old fail-open flag is gone: it no longer stands in for a listing.
+      assert.throws(() => main(io.args({ existing: undefined, 'assume-empty-existing': true })), /need --existing/);
+      assertNoOutput(io);
+      writeFileSync(io.existing, '\n');
+      assert.throws(() => main(io.args()), /listing is empty/);
+      assertNoOutput(io);
+      const failing = () => {
+        throw new Error('wrangler: not authenticated');
+      };
+      assert.throws(() => main(io.args({ existing: undefined, 'list-remote': true }), { run: failing }), /key listing failed/);
+      assertNoOutput(io);
+      assert.throws(() => main(io.args({ existing: undefined, 'list-remote': true }), { run: () => '[]' }), /listing is empty/);
+      assertNoOutput(io);
+      assert.throws(() => main(io.args({ existing: undefined, 'list-remote': true }), { run: () => 'Not authenticated' }), /invalid key listing/);
+      assertNoOutput(io);
+      const calls = [];
+      main(io.args({ existing: undefined, 'list-remote': true }), {
+        run: (cmd, args) => {
+          calls.push([cmd, ...args]);
+          return '[{"name":"golfapi:permanent:search:x"}]';
+        },
+      });
+      assert.deepEqual(calls, [['npx', ...LIST_REMOTE_ARGS]]);
+      assert.equal(JSON.parse(readFileSync(io.bulk, 'utf8')).length, 3);
+    } finally {
+      io.cleanup();
+    }
+  });
+});
+
+describe('allowlist and rejects', () => {
+  test('only allowlisted ids are imported; the default (empty) allowlist imports nothing', () => {
+    pair('t', '830');
+    pair('t', '831');
+    const some = plan([], { allow: ['830'] });
+    assert.deepEqual(keysOf(some), ['golfapi:permanent:coordinates:830', 'golfapi:permanent:course:830', 'golfapi:us:830']);
+    assert.equal(some.report.skipped.not_allowlisted, 1);
+    const none = plan([], { allow: [] });
+    assert.equal(none.bulk.length, 0);
+    assert.equal(none.report.skipped.not_allowlisted, 2);
+  });
+
+  test('the reject list wins over the allowlist, and ALWAYS_REJECT applies without a reject file', () => {
+    pair('t', '840');
+    pair('t', '0121263749725147'); // Naples Grande, in ALWAYS_REJECT
+    const result = plan([], {
+      allow: ['840', '0121263749725147'],
+      reject: { 840: [{ source: 'OH-validation.md', reason: 'trim to 9' }] },
+    });
+    assert.equal(result.bulk.length, 0);
+    assert.equal(result.report.skipped.rejected, 2);
+    assert.deepEqual(result.report.rejectedByKind, { trim_to_9: 1, signal_gate_list: 1 });
+  });
+});
+
+describe("Brian's Oct 28 checks", () => {
+  function only(id, course, coords) {
+    pair('t', id, course, coords);
+    return plan();
+  }
+
+  test('a hole with no tee or no green fails the course', () => {
+    assert.equal(only('850', courseBody('850'), coordBody('850', {}, { 7: { tees: false } })).report.skipped.oct28_missing_tee_or_green, 1);
+    rmSync(join(dir, 't'), { recursive: true });
+    assert.equal(only('851', courseBody('851'), coordBody('851', {}, { 18: { green: false } })).report.skipped.oct28_missing_tee_or_green, 1);
+  });
+
+  test('a 9-hole course must have every hole 1-9, and an 18 every hole 1-18', () => {
+    const nine = courseBody('852', { numHoles: '9' });
+    const result = only('852', nine, coordBody('852'));
+    assert.equal(result.report.valid, 1);
+    rmSync(join(dir, 't'), { recursive: true });
+    const short = coordBody('853');
+    short.coordinates = short.coordinates.filter((r) => r.hole <= 17);
+    assert.equal(only('853', courseBody('853'), short).report.skipped.oct28_missing_tee_or_green, 1);
+  });
+
+  test('a tee more than 15% off the card fails; inside 15% passes', () => {
+    // 380-yd card, back tee measured 450 yd (18% long), front tee still fits Red.
+    const off = only('860', courseBody('860'), coordBody('860', {}, { 3: { backYards: 450, frontYards: 340 } }));
+    assert.equal(off.report.skipped.oct28_card_yards_15pct, 1);
+    assert.equal(off.report.checkFailures.oct28_card_yards_15pct[0].hole, 3);
+    rmSync(join(dir, 't'), { recursive: true });
+    const near = only('861', courseBody('861'), coordBody('861', {}, { 3: { backYards: 420, frontYards: 340 } }));
+    assert.equal(near.report.valid, 1);
+  });
+
+  test('hole length must fit par (par 3 over 280 yd, par 5 under 380 yd)', () => {
+    const par3 = courseBody('870', { parsMen: [3, ...Array(17).fill(4)] });
+    assert.equal(only('870', par3, coordBody('870')).report.skipped.oct28_par_length, 1);
+    rmSync(join(dir, 't'), { recursive: true });
+    const noPar = courseBody('871', { parsMen: [0, ...Array(17).fill(4)] });
+    assert.equal(only('871', noPar, coordBody('871')).report.skipped.oct28_par_missing, 1);
+  });
+
+  test('outline and right-course need Signal import-ready evidence, not a bare id', () => {
+    pair('t', '880');
+    const outlineMissing = plan([], { reviewEvidence: new Map() });
+    assert.equal(outlineMissing.bulk.length, 0);
+    assert.equal(outlineMissing.report.skipped.oct28_outline_unverified, 1);
+    const identityMissing = plan([], { reviewEvidence: new Map([['880', [{ source: 'test-validation.md', checks: { outline: 'import-ready' } }]]]) });
+    assert.equal(identityMissing.bulk.length, 0);
+    assert.equal(identityMissing.report.skipped.oct28_right_course_unverified, 1);
+    const signalPass = plan();
+    assert.equal(signalPass.report.valid, 1);
+    assert.equal(signalPass.report.acceptedEvidence['880'][0].source, 'test-validation.md');
+  });
+
+  test('a tee-to-green span outside 5-700 yd fails', () => {
+    const span = courseBody('885');
+    for (const t of span.tees) t.length4 = 0; // no card yardage on hole 4, so only the span rule applies
+    assert.equal(only('885', span, coordBody('885', {}, { 4: { backYards: 900, frontYards: 860 } })).report.skipped.oct28_tee_green_span, 1);
+  });
+
+  test('a back nine copied onto the front nine is trim_to_9 and is excluded, not trimmed', () => {
+    const copied = coordBody('890');
+    const front = copied.coordinates.filter((r) => r.hole <= 9);
+    copied.coordinates = [...front, ...front.map((r) => ({ ...r, hole: r.hole + 9 }))];
+    const result = only('890', courseBody('890'), copied);
+    assert.equal(result.report.skipped.trim_to_9, 1);
+    assert.equal(result.bulk.length, 0);
   });
 });
 

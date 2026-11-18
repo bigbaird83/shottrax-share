@@ -17,14 +17,27 @@
  * corrections live under other keys (course-corrections.js), so they are not
  * touched either.
  *
+ * Quality gates (Signal Lab #66): only ids on the Signal Lab allowlist
+ * (--allowlist, built by scripts/import-lists.mjs from the import-ready rows)
+ * are considered; the reject list (--rejects, plus ALWAYS_REJECT) always wins;
+ * and every course must pass Brian's Oct 28 checks (import-course-checks.mjs).
+ * Trim-to-9 courses are excluded, not trimmed: the stored body must stay the
+ * vendor's own response, which the Worker serves as-is.
+ *
+ * Fail closed: a missing allowlist, reject list or key listing, an empty or
+ * failed key listing, is an error and no output file is written.
+ *
  * Usage:
- *   node scripts/import-raw-pulls.mjs --raw <dir> (--existing <keys.txt> | --list-remote)
- *     --out <bulk.json> --report <report.json> [--report-md <report.md>] [--undo <delete-keys.json>]
+ *   node scripts/import-raw-pulls.mjs --raw <dir> --allowlist <allowlist.json> --rejects <rejects.json>
+ *     (--existing <keys.txt> | --list-remote) --out <bulk.json> --report <report.json>
+ *     [--report-md <report.md>] [--undo <delete-keys.json>]
  */
 import { execFileSync } from 'node:child_process';
 import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { checkCourse } from './import-course-checks.mjs';
+import { ALWAYS_REJECT } from './import-lists.mjs';
 
 /**
  * Thunderbird Country Club, Heber Springs AR. Never import it: the app paints
@@ -211,6 +224,19 @@ export function pickFile(files) {
 
 // ---- Plan ----
 
+/** Which kind of Signal Lab verdict put an id on the reject list (for the report). */
+export function rejectKind(entries, id) {
+  const text = (entries || []).map((e) => `${e.source} ${e.reason}`).join(' ').toLowerCase();
+  if (Object.prototype.hasOwnProperty.call(ALWAYS_REJECT, id) || text.includes('always_reject')) return 'signal_gate_list';
+  if (text.includes('validate-2km')) return 'validate_2km';
+  if (/unusable/.test(text)) return 'unusable';
+  if (/reject|wrong/.test(text)) return 'rejected';
+  if (/trim/.test(text)) return 'trim_to_9';
+  if (/partial/.test(text)) return 'partial';
+  if (/exclude|duplicate|protected/.test(text)) return 'exclude';
+  return 'other';
+}
+
 function bump(map, key, n = 1) {
   map[key] = (map[key] || 0) + n;
 }
@@ -219,7 +245,11 @@ function bump(map, key, n = 1) {
  * Pure planning step. `scan` is scanRaw's result, `existing` a Set of key names
  * already in GOLFAPI_KV, `readText(file)` returns the file's text.
  */
-export function planImport({ scan, existing, readText = (file) => readFileSync(file.path, 'utf8') }) {
+export function planImport({ scan, existing, allow, reject, reviewEvidence = new Map(), readText = (file) => readFileSync(file.path, 'utf8') }) {
+  if (!(allow instanceof Set) || !(reject instanceof Map)) throw new Error('planImport needs an allow Set and a reject Map');
+  const rejectedByKind = {};
+  const checkFailures = {};
+  const acceptedEvidence = {};
   const bulk = [];
   const skipped = {};
   const skippedIds = {};
@@ -256,6 +286,15 @@ export function planImport({ scan, existing, readText = (file) => readFileSync(f
       skip(id, SKIP_IDS.get(id));
       continue;
     }
+    if (reject.has(id) || Object.prototype.hasOwnProperty.call(ALWAYS_REJECT, id)) {
+      skip(id, 'rejected');
+      bump(rejectedByKind, rejectKind(reject.get(id), id));
+      continue;
+    }
+    if (!allow.has(id)) {
+      skip(id, 'not_allowlisted');
+      continue;
+    }
     if (existing.has(noDataKey(id))) {
       skip(id, 'nodata');
       continue;
@@ -282,7 +321,27 @@ export function planImport({ scan, existing, readText = (file) => readFileSync(f
       skip(id, `coordinates_${coords.reason}`);
       continue;
     }
+    // OSM outline / right-course evidence is not present in golfapi bodies.
+    // Use only Signal's clean import-ready verdict, never validate-2km accepted
+    // or a name heuristic. The list generator carries the original table row.
+    const evidence = reviewEvidence.get(id) || [];
+    const outlinePass = evidence.some((e) => e.source && e.checks?.outline === 'import-ready');
+    const identityPass = evidence.some((e) => e.source && e.checks?.rightCourse === 'import-ready');
+    if (!outlinePass || !identityPass) {
+      const reason = !outlinePass ? 'oct28_outline_unverified' : 'oct28_right_course_unverified';
+      skip(id, reason);
+      (checkFailures[reason] ||= []).push({ id, hole: null, detail: 'needs Signal Lab import-ready evidence' });
+      continue;
+    }
+    const checked = checkCourse(course.payload, coords.payload);
+    if (!checked.ok) {
+      const reason = checked.check === 'trim_to_9' ? 'trim_to_9' : `oct28_${checked.check}`;
+      skip(id, reason);
+      (checkFailures[reason] ||= []).push({ id, hole: checked.hole ?? null, detail: checked.detail ?? null });
+      continue;
+    }
     valid += 1;
+    acceptedEvidence[id] = evidence;
 
     const writes = [];
     if (!courseStored) {
@@ -341,6 +400,11 @@ export function planImport({ scan, existing, readText = (file) => readFileSync(f
       skipped,
       skippedIds,
       partialExisting: partial,
+      rejectedByKind,
+      checkFailures,
+      acceptedEvidence,
+      allowlistSize: allow.size,
+      rejectListSize: reject.size,
       duplicates: { count: duplicates.length, items: duplicates },
       ignoredFiles: scan.ignored,
       existingKeysConsidered: existing.size,
@@ -360,18 +424,46 @@ export function planImport({ scan, existing, readText = (file) => readFileSync(f
 export function parseExistingKeys(text) {
   const trimmed = text.trim();
   if (!trimmed) return new Set();
+  let names;
   if (trimmed.startsWith('[')) {
     const rows = JSON.parse(trimmed);
-    return new Set(rows.map((row) => (typeof row === 'string' ? row : row.name)).filter(Boolean));
+    if (!Array.isArray(rows)) throw new Error('invalid key listing: expected JSON array');
+    names = rows.map((row) => typeof row === 'string' ? row : row?.name);
+  } else {
+    names = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   }
-  return new Set(trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
+  if (names.some((name) => typeof name !== 'string' || !/^golfapi:[^\s]+$/.test(name))) {
+    throw new Error('invalid key listing: expected golfapi: key names, not command output or errors');
+  }
+  return new Set(names);
+}
+
+/** Reads an import-lists.mjs output. Missing or malformed is an error (fail closed). */
+export function readIdList(path, kind) {
+  if (!path) throw new Error(`--${kind} is required (fail closed)`);
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf8'));
+  } catch (err) {
+    throw new Error(`cannot read --${kind} ${path}: ${err.message}`);
+  }
+  const expected = kind === 'allowlist' ? 'allowlist' : 'rejects';
+  if (!parsed || parsed.kind !== expected || !parsed.ids || typeof parsed.ids !== 'object') {
+    throw new Error(`--${kind} ${path} is not an import-lists ${expected} file`);
+  }
+  return parsed;
 }
 
 /** The one remote command this script runs. Read-only. */
 export const LIST_REMOTE_ARGS = ['wrangler', 'kv', 'key', 'list', '--binding', 'GOLFAPI_KV', '--remote', '--prefix', 'golfapi:'];
 
-function listRemote() {
-  const text = execFileSync('npx', LIST_REMOTE_ARGS, { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024 });
+export function listRemote(run = (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024 })) {
+  let text;
+  try {
+    text = run('npx', LIST_REMOTE_ARGS);
+  } catch (err) {
+    throw new Error(`read-only key listing failed; refusing to build a bulk file: ${err.message}`);
+  }
   return parseExistingKeys(text);
 }
 
@@ -393,7 +485,9 @@ function markdown(report, meta) {
   lines.push('Snapshot only: refresh existing keys immediately before a separately approved write. KV bulk put is not conditional; concurrent writes could otherwise be overwritten. Undo also needs review for later writers. Name searches remain paid; this only stocks course/coordinates copies.', '');
   lines.push(`Generated: ${meta.generatedAt}`);
   lines.push(`Raw dir: ${meta.raw}`);
-  lines.push(`Existing keys: ${meta.existingSource} (${report.existingKeysConsidered} keys)`, '');
+  lines.push(`Existing keys: ${meta.existingSource} (${report.existingKeysConsidered} keys)`);
+  lines.push(`Allowlist: ${meta.allowlist} (${report.allowlistSize} ids)`);
+  lines.push(`Reject list: ${meta.rejects} (${report.rejectListSize} ids, plus ALWAYS_REJECT)`, '');
   lines.push('## Counts', '');
   lines.push(`- IDs scanned: ${report.idsScanned}`);
   lines.push(`- IDs with a course body: ${report.idsWithCourseBody}`);
@@ -405,6 +499,14 @@ function markdown(report, meta) {
   lines.push('## Skipped by reason', '');
   for (const [reason, n] of Object.entries(report.skipped).sort()) lines.push(`- ${reason}: ${n}`);
   if (!Object.keys(report.skipped).length) lines.push('- none');
+  lines.push('', '## Rejected by Signal Lab verdict kind', '');
+  for (const [kind, n] of Object.entries(report.rejectedByKind).sort()) lines.push(`- ${kind}: ${n}`);
+  if (!Object.keys(report.rejectedByKind).length) lines.push('- none');
+  lines.push('', '## Failed Oct 28 checks (first failing hole)', '');
+  for (const [reason, rows] of Object.entries(report.checkFailures).sort()) {
+    lines.push(`- ${reason}: ${rows.length} (e.g. ${rows.slice(0, 5).map((r) => `${r.id}${r.hole ? ` h${r.hole}` : ''}`).join(', ')})`);
+  }
+  if (!Object.keys(report.checkFailures).length) lines.push('- none');
   lines.push('', '## Keys to write', '');
   lines.push(`- golfapi:permanent:course: ${report.keysToWrite.course}`);
   lines.push(`- golfapi:permanent:coordinates: ${report.keysToWrite.coordinates}`);
@@ -431,42 +533,49 @@ function parseArgs(argv) {
   const args = {};
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (arg === '--list-remote' || arg === '--assume-empty-existing') args[arg.slice(2)] = true;
+    if (arg === '--list-remote') args['list-remote'] = true;
     else if (arg.startsWith('--')) args[arg.slice(2)] = argv[++i];
   }
   return args;
 }
 
-export function main(argv = process.argv.slice(2)) {
+export function main(argv = process.argv.slice(2), { run } = {}) {
   const args = parseArgs(argv);
   if (!args.raw || !args.out || !args.report) {
-    throw new Error('usage: --raw <dir> (--existing <file> | --list-remote | --assume-empty-existing) --out <bulk.json> --report <report.json>');
+    throw new Error('usage: --raw <dir> --allowlist <file> --rejects <file> (--existing <file> | --list-remote) --out <bulk.json> --report <report.json>');
   }
+  const allowFile = readIdList(args.allowlist, 'allowlist');
+  const rejectFile = readIdList(args.rejects, 'rejects');
+  const allow = new Set(Object.keys(allowFile.ids));
+  const reject = new Map(Object.entries(rejectFile.ids));
   let existing;
   let existingSource;
   if (args.existing) {
     existing = parseExistingKeys(readFileSync(args.existing, 'utf8'));
     existingSource = `file ${resolve(args.existing)}`;
   } else if (args['list-remote']) {
-    existing = listRemote();
+    existing = listRemote(run);
     existingSource = 'read-only wrangler kv key list --remote --prefix golfapi:';
-  } else if (args['assume-empty-existing']) {
-    existing = new Set();
-    existingSource = 'ASSUMED EMPTY (no remote list) - do not bulk put from this output';
   } else {
-    throw new Error('need --existing <file>, --list-remote, or --assume-empty-existing');
+    throw new Error('need --existing <file> or --list-remote (fail closed)');
   }
+  // GOLFAPI_KV already holds keys; an empty listing means the listing failed.
+  if (existing.size === 0) throw new Error('existing key listing is empty; refusing to build a bulk file (fail closed)');
   const out = resolve(args.out);
   const undo = resolve(args.undo || join(dirname(out), `${basename(out, '.json')}.delete-keys.json`));
   const reportPath = resolve(args.report);
   const mdPath = resolve(args['report-md'] || reportPath.replace(/\.json$/, '') + '.md');
 
   const scan = scanRaw(args.raw);
-  const plan = planImport({ scan, existing });
+  const plan = planImport({ scan, existing, allow, reject, reviewEvidence: new Map(Object.entries(allowFile.ids)) });
   const meta = {
     generatedAt: new Date().toISOString(),
     raw: resolve(args.raw),
     existingSource,
+    qualityPolicy: 'All holes: tee+green, 5-700 yd span, 15% card yardage, length vs par. OSM outline and right-course: Signal Lab import-ready row evidence; not independently re-reviewed. Trim/partial/ambiguous excluded, no bodies modified.',
+    signalSources: allowFile.sources || [],
+    allowlist: resolve(args.allowlist),
+    rejects: resolve(args.rejects),
     out,
     undo,
     commands: commands(out, undo),
