@@ -15,6 +15,9 @@
  *   (012141520779052713789) is no longer in ALWAYS_REJECT (Brian, Nov 17
  *   8:00 PM CT, rematch-nov17.md: the ID is the right body for Jacksonville
  *   CC; it was listed only because The Links of Jacksonville was wrong).
+ *   Beavercreek GC OH (012141521001279406018) is no longer in ALWAYS_REJECT
+ *   (Brian, Nov 17 7:43 PM CT: upload every course Signal Lab has not rejected
+ *   or marked unusable; rematch-pulls-nov17-validation.md marks it import-ready).
  *
  * --mode server-cache (Brian, Nov 17 2026: "upload every course Signal Lab
  * hasn't rejected or marked unusable, including partial and 9-hole ones";
@@ -37,9 +40,9 @@
  * it is lifted only when Signal's row for that id is partial and no other
  * reject remains. Greenbriar MI 012141520859173562416 is hard-excluded by id.
  *
- * The default mode is unchanged except for the Jacksonville ALWAYS_REJECT
- * removal (a reject on any other id, and every other ALWAYS_REJECT entry,
- * still wins).
+ * The default mode is unchanged except for the Jacksonville and Beavercreek
+ * ALWAYS_REJECT removals (a reject on any other id, and every other
+ * ALWAYS_REJECT entry, still wins).
  *
  * Usage:
  *   node scripts/import-lists.mjs --signal-root /workspace/golfapi-pulls \
@@ -72,7 +75,6 @@ export const ALWAYS_REJECT = Object.freeze({
   '011141520625780263856': 'Delta CC (AR): bundled on main, protected/exclude',
   '012141520629437545788': 'The Course at Eagle Mountain (AR): bundled on main, protected/exclude',
   '011141520629948893391': 'Thunderbird CC Heber Springs (AR): app-only partial seed, never import',
-  '012141521001279406018': 'Beavercreek GC (OH): unusable-for-now, no later Signal re-review',
 });
 
 const NOT_IMPORT_WORDS = /\b(trim|partial|reject|rejected|unusable|exclude|excluded|duplicate|do not|don't|wrong|not pulled|verify|mixed|second shape|hold)\b/i;
@@ -88,6 +90,7 @@ export const ACCEPTED_PARTIAL_RE = /(?:^|validate-2km:\s*)accepted-partial\b/i;
 /** Greenbriar Golf Club (MI). Hard-excluded in server-cache even with a partial row + accepted-partial. */
 export const GREENBRIAR_MI_ID = '012141520859173562416';
 export const JACKSONVILLE_CC_IL_ID = '012141520779052713789';
+export const BEAVERCREEK_OH_ID = '012141521001279406018';
 
 export function isAcceptedPartialReason(reason) {
   return /validate-2km:\s*accepted-partial\b/i.test(String(reason || ''));
@@ -272,7 +275,7 @@ export function buildLists({ markdown = [], validate2km = [], root = '/', mode =
   const acceptedPartialIncluded = [];
   if (mode === 'server-cache') {
     // Hard-exclude is not an ALWAYS_REJECT change; Signal's gate checks that
-    // only Jacksonville CC IL was removed from that list.
+    // only Jacksonville CC IL and Beavercreek GC OH were removed from that list.
     addReject({
       id: GREENBRIAR_MI_ID,
       source: 'hard-exclude (Greenbriar MI, Signal Lab #67)',

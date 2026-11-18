@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, test } from 'vitest';
-import { ALWAYS_REJECT, GREENBRIAR_MI_ID, JACKSONVILLE_CC_IL_ID, allowedVerdict, bucketAllows, buildLists, findSignalFiles, main, parseValidate2km, parseValidationMarkdown } from './import-lists.mjs';
+import { ALWAYS_REJECT, BEAVERCREEK_OH_ID, GREENBRIAR_MI_ID, JACKSONVILLE_CC_IL_ID, allowedVerdict, bucketAllows, buildLists, findSignalFiles, main, parseValidate2km, parseValidationMarkdown } from './import-lists.mjs';
 
 const TABLE = `# OH national golfapi pull: validation (read-only)
 ## Counts
@@ -215,8 +215,9 @@ describe('import-lists: Signal Lab verdicts only', () => {
     }
   });
 
-  test('ALWAYS_REJECT drops only Jacksonville CC IL; every other gate id stays', () => {
+  test('ALWAYS_REJECT drops only Jacksonville CC IL and Beavercreek GC OH; every other gate id stays', () => {
     assert.equal(ALWAYS_REJECT[JACKSONVILLE_CC_IL_ID], undefined);
+    assert.equal(ALWAYS_REJECT[BEAVERCREEK_OH_ID], undefined);
     const expected = [
       '0121263749725147',
       '012141520689264205787',
@@ -237,17 +238,18 @@ describe('import-lists: Signal Lab verdicts only', () => {
       '011141520625780263856',
       '012141520629437545788',
       '011141520629948893391',
-      '012141521001279406018',
     ];
     assert.deepEqual(Object.keys(ALWAYS_REJECT).sort(), expected.sort());
     const root = mkdtempSync(join(tmpdir(), 'signal-jax-'));
     try {
       mkdirSync(join(root, 'national'), { recursive: true });
-      writeFileSync(join(root, 'national/IL-validation.md'), `| Course | id | Bucket |\n|---|---|---|\n| Jacksonville CC | ${JACKSONVILLE_CC_IL_ID} | import-ready |\n| Naples | 0121263749725147 | import-ready |\n`);
+      writeFileSync(join(root, 'national/IL-validation.md'), `| Course | id | Bucket |\n|---|---|---|\n| Jacksonville CC | ${JACKSONVILLE_CC_IL_ID} | import-ready |\n| Beavercreek | ${BEAVERCREEK_OH_ID} | import-ready |\n| Naples | 0121263749725147 | import-ready |\n`);
       const server = buildLists({ ...findSignalFiles(root), root, mode: 'server-cache' });
       const strict = buildLists({ ...findSignalFiles(root), root, mode: 'default' });
       assert.ok(server.allow[JACKSONVILLE_CC_IL_ID], 'Jacksonville CC IL can be allowed once ALWAYS_REJECT no longer names it');
       assert.ok(strict.allow[JACKSONVILLE_CC_IL_ID]);
+      assert.ok(server.allow[BEAVERCREEK_OH_ID], 'Beavercreek GC OH can be allowed once ALWAYS_REJECT no longer names it');
+      assert.ok(strict.allow[BEAVERCREEK_OH_ID]);
       assert.ok(server.reject['0121263749725147']);
       assert.ok(strict.reject['0121263749725147']);
     } finally {
