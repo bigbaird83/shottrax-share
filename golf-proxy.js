@@ -75,8 +75,9 @@
  * TERRAIN_INSTALL_DAILY_CAP (54, three full courses),
  * TERRAIN_MAX_GRID_POINTS (6000, Workers Paid).
  * ALERT_TO (shottraxx@gmail.com), ALERT_FROM (alerts@shottraxx.com).
- * Secret ALERT_ADMIN_TOKEN gates POST /admin/alert-test and GET /admin/demand.
- * An empty secret rejects both. An install id does not grant access.
+ * Secret ALERT_ADMIN_TOKEN gates POST /admin/alert-test, GET /admin/demand,
+ * and GET /admin/pulls. An empty secret rejects all three. An install id does
+ * not grant access.
  * The test send is limited to 1 per 10 minutes and 5 per UTC day in the DO.
  * 2000-plan caps, set only on the day Doc upgrades golfapi:
  *   GOLFAPI_DAILY_CAP=300
@@ -98,7 +99,20 @@
  * and app-monthly counters, the per-call open charge, the terrain per-phone
  * sample count, the terrain sampler lock, the billing-cycle start balance,
  * the usage-alert sent flags, the last 200 US course ids per field-build
- * phone, and the demand log. Those do not write KV.
+ * phone, the demand log, and the paid-pull log. Those do not write KV.
+ *
+ * Paid-pull log: one row per golfapi call that charged credits, written right
+ * after the open settles as 'spent' (key golfapi:paid:{cycleId}, newest last,
+ * last 1000 rows, so it starts empty each billing cycle). Row:
+ * { at, kind: search|course|coordinates, query (search only, trimmed, max 80),
+ *   courseId, courseName, credits (0.1 or 1, from the settled tenths) }.
+ * Not logged: KV or edge copies, stored zero-hit searches, refunds, refusals,
+ * course-card reads, exempt (allowlisted) installs, which never open or settle,
+ * and stockpile or terrain spend. No install id, storefront, IP, user agent,
+ * or key is stored. GET /admin/pulls[?cycle=YYYY-MM-DD] returns
+ * { cycleId, rows (newest first), totals: { search, course, coordinates:
+ * { count, credits }, credits } } and never calls golfapi.
+ *
  * The monthly counter uses the golfapi billing cycle (GOLFAPI_CYCLE_DAY,
  * default the 5th, through the 4th), the same cycle as the alert flags.
  * golfapi bills 0.1 for a name search and 1 for a course or coordinates pull.
@@ -178,6 +192,11 @@ const PHONE_US_ID_LIMIT = 200;
 const PHONE_US_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEMAND_LIMIT = 500;
 const DEMAND_REASONS = new Set(['non_us', 'phone_limit', 'app_cap', 'no_data']);
+/** Paid-pull log rows kept per billing cycle, newest last in storage. */
+const PAID_LOG_LIMIT = 1000;
+const PAID_KINDS = ['search', 'course', 'coordinates'];
+const PAID_QUERY_MAX = 80;
+const CYCLE_ID_RE = /^\d{4}-\d{2}-\d{2}$/;
 const DEFAULT_TERRAIN_DAILY = 54;
 /** Same key the live Worker uses for the last-seen golfapi balance. */
 const GOLFAPI_BALANCE_KEY = 'gq:balance';
@@ -738,6 +757,51 @@ async function logKnownRefusal(env, now, reason, courseId) {
   }]);
 }
 
+function paidKindOf(rest) {
+  if (rest === 'courses') return 'search';
+  if (rest.startsWith('coordinates/')) return 'coordinates';
+  return 'course';
+}
+
+/**
+ * One row in the paid-pull log, written only after a 'spent' settle.
+ * Never carries the install id, storefront, IP, user agent, or any key.
+ */
+async function notePaidPull(env, now, { rest, url, pathId, payload, tenths }) {
+  try {
+    const kind = paidKindOf(rest);
+    let query = null;
+    let courseId = null;
+    let courseName = null;
+    if (kind === 'search') {
+      const typed = (url.searchParams.get('name') || '').trim();
+      query = typed ? typed.slice(0, PAID_QUERY_MAX) : null;
+    } else {
+      courseId = pathId || null;
+      const rows = coursesInPayload(payload);
+      const match = rows.find((row) => row.courseId === courseId && row.name)
+        || (rows.length === 1 && rows[0].name ? rows[0] : null);
+      courseName = match ? match.name : null;
+      if (!courseName && courseId) {
+        const known = (await counterFetch(env, { op: 'knownCourse', courseId })) || {};
+        courseName = known.name || null;
+      }
+    }
+    await counterFetch(env, {
+      op: 'notePaidPull',
+      cycleId: golfapiCycleId(now, cycleDayOf(env)),
+      at: now.toISOString(),
+      kind,
+      query,
+      courseId,
+      courseName,
+      tenths,
+    });
+  } catch {
+    // The paid log must never fail the golfer's request.
+  }
+}
+
 function serveStored(envelope, cacheControl) {
   const parsed = typeof envelope === 'string' ? parseJsonLoose(envelope) : null;
   if (!parsed || typeof parsed.body !== 'string') return null;
@@ -946,6 +1010,17 @@ async function handleDemand(request, env) {
   return json(200, listed || { pull_candidates: [], no_data: [] });
 }
 
+async function handlePulls(request, url, env) {
+  if (request.method !== 'GET') return json(405, { error: 'method_not_allowed' });
+  if (!adminTokenOk(request, env)) return json(401, { error: 'unauthorized' });
+  const asked = (url.searchParams.get('cycle') || '').trim();
+  if (asked && !CYCLE_ID_RE.test(asked)) return json(400, { error: 'bad_cycle' });
+  const cycleId = asked || golfapiCycleId(new Date(), cycleDayOf(env));
+  const listed = await counterFetch(env, { op: 'readPaidLog', cycleId });
+  if (!listed) return json(503, { error: 'not_configured' });
+  return json(200, listed);
+}
+
 function isPlainObject(value) {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
@@ -1102,7 +1177,8 @@ async function handleGolfApi(request, url, rest, env, exempt, ctx) {
   const pathId = courseIdFromRest(rest);
   const balance = await readBalance(kv);
   const floor = intEnv(env, 'GOLFAPI_CREDIT_FLOOR', GOLFAPI_CREDIT_FLOOR);
-  const callCost = (search ? SEARCH_CREDIT_TENTHS : PULL_CREDIT_TENTHS) / 10;
+  const callTenths = search ? SEARCH_CREDIT_TENTHS : PULL_CREDIT_TENTHS;
+  const callCost = callTenths / 10;
   if (balance && golfApiSpendBreaksFloor(balance.left, callCost, floor)) {
     await logKnownRefusal(env, now, 'app_cap', pathId);
     return limited('floor', secondsUntilUtcDay(now));
@@ -1129,7 +1205,7 @@ async function handleGolfApi(request, url, rest, env, exempt, ctx) {
       dayCap: intEnv(env, 'GOLFAPI_DAILY_CAP', DEFAULT_APP_DAILY),
       monthCap: intEnv(env, 'GOLFAPI_MONTHLY_CAP', DEFAULT_APP_MONTHLY),
       planMonthly: intEnv(env, 'GOLFAPI_PLAN_MONTHLY', DEFAULT_PLAN_MONTHLY),
-      chargeTenths: search ? SEARCH_CREDIT_TENTHS : PULL_CREDIT_TENTHS,
+      chargeTenths: callTenths,
       needTenths: OPEN_ROOM_TENTHS,
       isSearch: search,
       retryDay: secondsUntilUtcDay(now),
@@ -1160,7 +1236,7 @@ async function handleGolfApi(request, url, rest, env, exempt, ctx) {
         op: 'settle',
         openKey,
         outcome: 'refund',
-        refundTenths: search ? 1 : 10,
+        refundTenths: callTenths,
         uncountSearch: search,
         searchKey: usage.searchKey,
       });
@@ -1180,7 +1256,7 @@ async function handleGolfApi(request, url, rest, env, exempt, ctx) {
         op: 'settle',
         openKey,
         outcome: 'refund',
-        refundTenths: search ? 1 : 10,
+        refundTenths: callTenths,
         uncountSearch: search,
         searchKey: usage.searchKey,
       });
@@ -1214,14 +1290,17 @@ async function handleGolfApi(request, url, rest, env, exempt, ctx) {
   }
   if (pendingAlert) scheduleAlerts(ctx, env, { ...pendingAlert, left: pendingAlert.left ?? left });
   if (openKey) {
-    await counterFetch(env, {
+    const settled = await counterFetch(env, {
       op: 'settle',
       openKey,
       outcome: ok ? 'spent' : 'refund',
-      refundTenths: search ? 1 : 10,
+      refundTenths: callTenths,
       uncountSearch: !ok && search,
       searchKey: usage.searchKey,
     });
+    if (ok && settled && settled.ok && settled.spentTenths > 0) {
+      await notePaidPull(env, now, { rest, url, pathId, payload, tenths: settled.spentTenths });
+    }
   }
   if (ok) {
     const courses = coursesInPayload(payload);
@@ -1723,6 +1802,7 @@ export async function handleGolfProxy(request, env, ctx) {
 
   if (pathname === '/admin/alert-test') return handleAlertTest(request, env ?? {});
   if (pathname === '/admin/demand') return handleDemand(request, env ?? {});
+  if (pathname === '/admin/pulls') return handlePulls(request, url, env ?? {});
   if (pathname === '/admin/stockpile') return handleStockpileAdmin(request, env ?? {});
 
   const courseCard = await handleCourseCard(request, env ?? {});
@@ -2123,6 +2203,47 @@ export class GolfapiCounter {
     return { ok: true };
   }
 
+  notePaidPull(body) {
+    if (!body.cycleId || !CYCLE_ID_RE.test(body.cycleId) || !PAID_KINDS.includes(body.kind)) return { ok: false };
+    const tenths = Math.round(Number(body.tenths));
+    if (!Number.isFinite(tenths) || tenths <= 0) return { ok: false };
+    const text = (value, max) => {
+      if (typeof value !== 'string') return null;
+      const trimmed = value.trim();
+      return trimmed ? trimmed.slice(0, max) : null;
+    };
+    const search = body.kind === 'search';
+    const row = {
+      at: typeof body.at === 'string' && body.at ? body.at : new Date().toISOString(),
+      kind: body.kind,
+      query: search ? text(body.query, PAID_QUERY_MAX) : null,
+      courseId: search ? null : text(body.courseId, 200),
+      courseName: search ? null : text(body.courseName, 200),
+      credits: tenths / 10,
+    };
+    const key = `golfapi:paid:${body.cycleId}`;
+    const rows = this.readJson(key, []);
+    const list = Array.isArray(rows) ? rows : [];
+    list.push(row);
+    this.put(key, JSON.stringify(list.slice(-PAID_LOG_LIMIT)));
+    return { ok: true };
+  }
+
+  readPaidLog(body) {
+    const rows = this.readJson(`golfapi:paid:${body.cycleId}`, []);
+    const list = (Array.isArray(rows) ? rows : []).filter((row) => row && PAID_KINDS.includes(row.kind));
+    const tenths = { search: 0, course: 0, coordinates: 0 };
+    const counts = { search: 0, course: 0, coordinates: 0 };
+    for (const row of list) {
+      counts[row.kind] += 1;
+      tenths[row.kind] += Math.round(Number(row.credits) * 10) || 0;
+    }
+    const totals = {};
+    for (const kind of PAID_KINDS) totals[kind] = { count: counts[kind], credits: tenths[kind] / 10 };
+    totals.credits = (tenths.search + tenths.course + tenths.coordinates) / 10;
+    return { cycleId: body.cycleId, rows: list.slice().reverse(), totals };
+  }
+
   noteCourses(body) {
     const courses = Array.isArray(body.courses) ? body.courses : [];
     for (const course of courses) {
@@ -2180,10 +2301,12 @@ export class GolfapiCounter {
     const open = this.readOpen(body.openKey);
     if (!open) return { ok: true };
     if (body.outcome === 'spent') {
+      const pending = Math.round(Number(open.pendingTenths));
+      const spentTenths = Number.isFinite(pending) && pending > 0 ? pending : 0;
       open.spent += 1;
       open.pendingTenths = 0;
       this.writeOpen(body.openKey, open);
-      return { ok: true, held: open.held, spent: open.spent };
+      return { ok: true, held: open.held, spent: open.spent, spentTenths };
     }
     if (open.held > open.spent) {
       const explicit = Math.round(Number(body.refundTenths));
@@ -2330,6 +2453,8 @@ export class GolfapiCounter {
     else if (body.op === 'noteCourses') result = this.noteCourses(body);
     else if (body.op === 'noteDemand') result = this.noteDemand(body);
     else if (body.op === 'readDemand') result = this.readDemand(body);
+    else if (body.op === 'notePaidPull') result = this.notePaidPull(body);
+    else if (body.op === 'readPaidLog') result = this.readPaidLog(body);
     else if (body.op === 'terrainBegin') result = this.terrainBegin(body);
     else if (body.op === 'terrainFinish') result = this.terrainFinish(body);
     else if (body.op === 'terrainAbort') result = this.terrainAbort(body);
