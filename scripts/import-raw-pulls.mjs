@@ -88,7 +88,7 @@ export function looksLikeQuota(payload) {
   return false;
 }
 function nonZeroPoint(lat, lng) {
-  return Number.isFinite(lat) && Number.isFinite(lng) && !(lat === 0 && lng === 0);
+  return Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180 && !(lat === 0 && lng === 0);
 }
 /** golf-stockpile.js coordsHaveMap, but a 0,0 point never counts as a tee or green. */
 export function coordsHaveMap(payload) {
@@ -322,7 +322,9 @@ export function planImport({ scan, existing, readText = (file) => readFileSync(f
   const bulkText = JSON.stringify(bulk);
 
   // Every key in the bulk file is new (existing keys are excluded), so
-  // deleting exactly these keys returns GOLFAPI_KV to its pre-import state.
+  // deleting these keys can undo this import ONLY if no later writer changed
+  // them. A snapshot is not an atomic no-overwrite guarantee; refresh it and
+  // review concurrent-writer risks before any separately approved write.
   const deleteKeys = bulk.map((row) => row.key);
 
   return {
@@ -375,16 +377,20 @@ function listRemote() {
 
 // ---- CLI ----
 
+function shellPath(value) {
+  return /^[A-Za-z0-9_./:-]+$/.test(value) ? value : "'" + value.replace(/'/g, "'\\''") + "'";
+}
 export function commands(outPath, undoPath) {
   return {
-    write: `npx wrangler kv bulk put --binding GOLFAPI_KV --remote ${outPath}`,
-    undo: `npx wrangler kv bulk delete --binding GOLFAPI_KV --remote ${undoPath}`,
+    write: `npx wrangler kv bulk put --binding GOLFAPI_KV --remote ${shellPath(outPath)}`,
+    undo: `npx wrangler kv bulk delete --binding GOLFAPI_KV --remote ${shellPath(undoPath)}`,
   };
 }
 
 function markdown(report, meta) {
   const lines = [];
   lines.push('# GOLFAPI_KV import dry run (NO KV WRITE)', '');
+  lines.push('Snapshot only: refresh existing keys immediately before a separately approved write. KV bulk put is not conditional; concurrent writes could otherwise be overwritten. Undo also needs review for later writers. Name searches remain paid; this only stocks course/coordinates copies.', '');
   lines.push(`Generated: ${meta.generatedAt}`);
   lines.push(`Raw dir: ${meta.raw}`);
   lines.push(`Existing keys: ${meta.existingSource} (${report.existingKeysConsidered} keys)`, '');
@@ -417,7 +423,7 @@ function markdown(report, meta) {
   }
   lines.push('', '## Commands (NOT RUN; each needs Brian\'s OK)', '');
   lines.push('Write:', '', '```', meta.commands.write, '```', '');
-  lines.push(`Undo (deletes exactly the ${report.keysToWrite.total} new keys; none existed before):`, '', '```', meta.commands.undo, '```', '');
+  lines.push(`Undo candidate (deletes the ${report.keysToWrite.total} planned new keys; verify no later writes first):`, '', '```', meta.commands.undo, '```', '');
   return lines.join('\n');
 }
 
