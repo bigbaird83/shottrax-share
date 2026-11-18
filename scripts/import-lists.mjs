@@ -13,9 +13,20 @@
  *   validate-2km.json rows whose result is not "accepted"; and the fixed list
  *   in ALWAYS_REJECT (Signal Lab's #66 gate comment).
  *
+ * --mode server-cache (Brian, Nov 17 2026: "upload every course Signal Lab
+ * hasn't rejected or marked unusable, including partial and 9-hole ones"):
+ * a table row also ALLOWS when its verdict cell starts with partial, trim to 9
+ * or import-after-trim, as long as the cell names no reject-type word
+ * (SERVER_REJECT_WORDS). Trim/partial words in a heading or in prose no longer
+ * reject; every reject-type word still does. "fill missing only" rows, 2-id
+ * rows, validate-2km rejects and ALWAYS_REJECT stay rejects, prose still never
+ * allows, and an id on both an allow-type and a reject-type row stays out.
+ * Each allowed id carries its verdict (import-ready, partial, trim-to-9).
+ * The default mode is unchanged.
+ *
  * Usage:
  *   node scripts/import-lists.mjs --signal-root /workspace/golfapi-pulls \
- *     --allow-out allowlist.json --reject-out rejects.json
+ *     --allow-out allowlist.json --reject-out rejects.json [--mode server-cache]
  */
 import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
@@ -49,6 +60,16 @@ export const ALWAYS_REJECT = Object.freeze({
 });
 
 const NOT_IMPORT_WORDS = /\b(trim|partial|reject|rejected|unusable|exclude|excluded|duplicate|do not|don't|wrong|not pulled|verify|mixed|second shape|hold)\b/i;
+/** server-cache mode: NOT_IMPORT_WORDS without trim/partial, plus bundled/protected. */
+export const SERVER_REJECT_WORDS = /\b(reject|rejected|unusable|exclude|excluded|duplicate|do not|don't|wrong|not pulled|verify|mixed|second shape|hold|bundled|protected)\b/i;
+const WRONG_HOLE_DATA = /\bwrong (holes?|pars?|tees?)\b|\b(holes?|pars?|tees?) (are |is )?wrong\b/g;
+export const MODES = Object.freeze(['default', 'server-cache']);
+export const FILL_MISSING_RE = /fill[- ]missing/i;
+
+export function assertMode(mode) {
+  if (!MODES.includes(mode)) throw new Error(`unknown --mode ${mode} (expected ${MODES.join(' or ')})`);
+  return mode;
+}
 const BUCKET_HEADER = /bucket|verdict|class|validated|status|result/i;
 
 function cleanCell(cell) {
@@ -64,12 +85,33 @@ export function bucketAllows(cell) {
   return !NOT_IMPORT_WORDS.test(text);
 }
 
+/**
+ * The verdict a bucket cell allows, or null. Default mode: only a clean
+ * import-ready cell. server-cache mode: import-ready, partial or trim-to-9,
+ * never a fill-missing cell or one naming a reject-type word.
+ */
+export function allowedVerdict(cell, mode = 'default') {
+  if (mode === 'default') return bucketAllows(cell) ? 'import-ready' : null;
+  assertMode(mode);
+  const text = cleanCell(cell).toLowerCase();
+  // "pars wrong" / "tees on the wrong hole" describe why a row is partial;
+  // "wrong course" (or any other reject-type word) still blocks.
+  const blockText = text.replace(WRONG_HOLE_DATA, ' ');
+  if (FILL_MISSING_RE.test(text) || SERVER_REJECT_WORDS.test(blockText)) return null;
+  if (/^import[- ]ready\b/.test(text)) return 'import-ready';
+  if (/^(trim[- ]to[- ](9|nine)\b|import[- ]after[- ]trim\b)/.test(text)) return 'trim-to-9';
+  if (/^partial\b/.test(text)) return 'partial';
+  return null;
+}
+
 function idsIn(text) {
   return [...new Set(String(text).match(ID_RE) || [])];
 }
 
 /** Parse one markdown file into allow and reject entries. */
-export function parseValidationMarkdown(text, source) {
+export function parseValidationMarkdown(text, source, mode = 'default') {
+  assertMode(mode);
+  const blocks = mode === 'default' ? NOT_IMPORT_WORDS : SERVER_REJECT_WORDS;
   const allow = [];
   const reject = [];
   const lines = text.split(/\r?\n/);
@@ -93,13 +135,14 @@ export function parseValidationMarkdown(text, source) {
         if (ids.length === 0) continue;
         const cells = row.trim().replace(/^\||\|$/g, '').split('|');
         const bucket = bucketAt >= 0 && bucketAt < cells.length ? cleanCell(cells[bucketAt]) : '';
-        if (bucketAt >= 0 && ids.length === 1 && bucketAllows(bucket) && !NOT_IMPORT_WORDS.test(heading)) {
-          allow.push({ id: ids[0], source, bucket, row: cleanCell(row) });
-        } else if (bucketAt >= 0 && (bucket || NOT_IMPORT_WORDS.test(heading))) {
-          // A verdict row that is not a clean import-ready (or names 2+ ids): reject.
-          const why = ids.length > 1 && bucketAllows(bucket) ? `ambiguous row (${ids.length} ids): ${bucket}` : bucket || heading;
+        const verdict = bucketAt >= 0 ? allowedVerdict(bucket, mode) : null;
+        if (verdict && ids.length === 1 && !blocks.test(heading)) {
+          allow.push({ id: ids[0], source, bucket, verdict, row: cleanCell(row) });
+        } else if (bucketAt >= 0 && (bucket || blocks.test(heading))) {
+          // A verdict row that does not allow (or names 2+ ids): reject.
+          const why = ids.length > 1 && verdict ? `ambiguous row (${ids.length} ids): ${bucket}` : bucket || heading;
           for (const id of ids) reject.push({ id, source, reason: why.slice(0, 160) });
-        } else if (NOT_IMPORT_WORDS.test(row) || NOT_IMPORT_WORDS.test(heading)) {
+        } else if (blocks.test(row) || blocks.test(heading)) {
           for (const id of ids) reject.push({ id, source, reason: `table note: ${cleanCell(row).slice(0, 140)}` });
         }
       }
@@ -112,8 +155,8 @@ export function parseValidationMarkdown(text, source) {
     }
     const ids = idsIn(line);
     if (ids.length === 0) continue;
-    if (NOT_IMPORT_WORDS.test(heading) || NOT_IMPORT_WORDS.test(line)) {
-      for (const id of ids) reject.push({ id, source, reason: `prose: ${(NOT_IMPORT_WORDS.test(heading) ? heading : line).replace(/\*/g, '').slice(0, 140)}` });
+    if (blocks.test(heading) || blocks.test(line)) {
+      for (const id of ids) reject.push({ id, source, reason: `prose: ${(blocks.test(heading) ? heading : line).replace(/\*/g, '').slice(0, 140)}` });
     }
   }
   return { allow, reject };
@@ -150,7 +193,15 @@ export function findSignalFiles(root) {
   };
 }
 
-export function buildLists({ markdown = [], validate2km = [], root = '/' }) {
+/** One label per id when its allow rows disagree: the most cautious one. No verdict, no label (fail closed). */
+const VERDICT_RANK = ['partial', 'trim-to-9', 'import-ready'];
+export function verdictFor(rows) {
+  const seen = new Set((rows || []).map((r) => r.verdict).filter(Boolean));
+  return VERDICT_RANK.find((v) => seen.has(v)) || null;
+}
+
+export function buildLists({ markdown = [], validate2km = [], root = '/', mode = 'default' }) {
+  assertMode(mode);
   const allowById = new Map();
   const rejectById = new Map();
   const addReject = (entry) => {
@@ -161,10 +212,14 @@ export function buildLists({ markdown = [], validate2km = [], root = '/' }) {
   for (const file of markdown) {
     const rel = relative(root, file);
     sources.push({ path: file, mtime: statSync(file).mtime.toISOString(), kind: 'markdown' });
-    const parsed = parseValidationMarkdown(readFileSync(file, 'utf8'), rel);
+    const parsed = parseValidationMarkdown(readFileSync(file, 'utf8'), rel, mode);
     for (const a of parsed.allow) {
       if (!allowById.has(a.id)) allowById.set(a.id, []);
-      allowById.get(a.id).push({ source: a.source, bucket: a.bucket, row: a.row, checks: { outline: 'import-ready', rightCourse: 'import-ready' } });
+      const entry = { source: a.source, bucket: a.bucket, row: a.row };
+      // Oct 28 outline / right-course evidence exists only on import-ready rows.
+      if (a.verdict === 'import-ready') entry.checks = { outline: 'import-ready', rightCourse: 'import-ready' };
+      if (mode !== 'default') entry.verdict = a.verdict;
+      allowById.get(a.id).push(entry);
     }
     for (const r of parsed.reject) addReject(r);
   }
@@ -178,7 +233,8 @@ export function buildLists({ markdown = [], validate2km = [], root = '/' }) {
   for (const [id, rows] of [...allowById.entries()].sort()) if (!rejectById.has(id)) allow[id] = rows;
   const reject = Object.fromEntries([...rejectById.entries()].sort());
   const allowAlsoRejected = [...allowById.keys()].filter((id) => rejectById.has(id)).sort();
-  return { allow, reject, allowAlsoRejected, sources };
+  const fillMissing = [...rejectById.entries()].filter(([, rows]) => rows.some((r) => FILL_MISSING_RE.test(r.reason))).map(([id]) => id).sort();
+  return { mode, allow, reject, allowAlsoRejected, fillMissing, sources };
 }
 
 function parseArgs(argv) {
@@ -195,11 +251,13 @@ export function main(argv = process.argv.slice(2)) {
   const root = resolve(args['signal-root']);
   const files = findSignalFiles(root);
   if (files.markdown.length === 0) throw new Error(`no Signal Lab validation files under ${root}`);
-  const lists = buildLists({ ...files, root });
+  const mode = assertMode(args.mode || 'default');
+  const lists = buildLists({ ...files, root, mode });
   const generatedAt = new Date().toISOString();
-  writeFileSync(args['allow-out'], JSON.stringify({ generatedAt, root, kind: 'allowlist', sources: lists.sources, allowAlsoRejected: lists.allowAlsoRejected, ids: lists.allow }, null, 2));
-  writeFileSync(args['reject-out'], JSON.stringify({ generatedAt, root, kind: 'rejects', sources: lists.sources, ids: lists.reject }, null, 2));
-  console.log(`allow ${Object.keys(lists.allow).length}, reject ${Object.keys(lists.reject).length}, allow-also-rejected ${lists.allowAlsoRejected.length}, from ${lists.sources.length} files`);
+  const modeField = mode === 'default' ? {} : { mode };
+  writeFileSync(args['allow-out'], JSON.stringify({ generatedAt, root, kind: 'allowlist', ...modeField, sources: lists.sources, allowAlsoRejected: lists.allowAlsoRejected, ids: lists.allow }, null, 2));
+  writeFileSync(args['reject-out'], JSON.stringify({ generatedAt, root, kind: 'rejects', ...modeField, sources: lists.sources, ...(mode === 'default' ? {} : { fillMissing: lists.fillMissing }), ids: lists.reject }, null, 2));
+  console.log(`${mode === 'default' ? '' : `[${mode}] `}allow ${Object.keys(lists.allow).length}, reject ${Object.keys(lists.reject).length}, allow-also-rejected ${lists.allowAlsoRejected.length}, fill-missing ${lists.fillMissing.length}, from ${lists.sources.length} files`);
   return lists;
 }
 

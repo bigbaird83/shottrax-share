@@ -24,20 +24,31 @@
  * Trim-to-9 courses are excluded, not trimmed: the stored body must stay the
  * vendor's own response, which the Worker serves as-is.
  *
+ * --mode server-cache (Brian, Nov 17 2026, 7:43 and 7:45 PM CT: upload every
+ * reviewed course Signal Lab has not rejected or marked unusable, including
+ * partial, 9-hole and no-tee ones). Needs an allowlist built with
+ * `import-lists.mjs --mode server-cache`; each id carries its Signal verdict
+ * (import-ready, partial, trim-to-9). The Oct 28 checks and the evidence gate
+ * do not apply, trim-to-9 bodies are stored raw (never trimmed), and a
+ * coordinates body with greens but no tee is allowed. Still required: both
+ * bodies, valid JSON, no error/quota body, matching id, US, nonzero GPS, and at
+ * least one nonzero green. Never-overwrite, rejects-win, dedupe and fail-closed
+ * rules are the same as the default mode, which is unchanged.
+ *
  * Fail closed: a missing allowlist, reject list or key listing, an empty or
  * failed key listing, is an error and no output file is written.
  *
  * Usage:
  *   node scripts/import-raw-pulls.mjs --raw <dir> --allowlist <allowlist.json> --rejects <rejects.json>
  *     (--existing <keys.txt> | --list-remote) --out <bulk.json> --report <report.json>
- *     [--report-md <report.md>] [--undo <delete-keys.json>]
+ *     [--report-md <report.md>] [--undo <delete-keys.json>] [--mode server-cache]
  */
 import { execFileSync } from 'node:child_process';
 import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { checkCourse } from './import-course-checks.mjs';
-import { ALWAYS_REJECT } from './import-lists.mjs';
+import { ALWAYS_REJECT, assertMode, verdictFor } from './import-lists.mjs';
 
 /**
  * Thunderbird Country Club, Heber Springs AR. Never import it: the app paints
@@ -129,6 +140,15 @@ export function coordsHaveMap(payload) {
   }
   return false;
 }
+/** At least one hole with a nonzero green point (poi 1). */
+export function coordsHaveGreens(payload) {
+  const rows = Array.isArray(payload) ? payload : Array.isArray(payload?.coordinates) ? payload.coordinates : [];
+  return rows.some((node) => {
+    if (!node || typeof node !== 'object' || Number(node.poi) !== 1) return false;
+    const hole = Number(node.hole);
+    return Number.isInteger(hole) && hole >= 1 && nonZeroPoint(Number(node.latitude ?? node.lat), Number(node.longitude ?? node.lng));
+  });
+}
 function errorField(payload) {
   return payload.error != null && payload.error !== false;
 }
@@ -171,7 +191,12 @@ export function validateCourse(text, id) {
   return { ok: true, payload };
 }
 
-export function validateCoordinates(text, id) {
+/**
+ * Default: a hole with both a tee and a green is required (no_usable_map).
+ * allowNoTee (server-cache mode): greens without tees pass, flagged noTee;
+ * no nonzero green at all is still no_usable_map.
+ */
+export function validateCoordinates(text, id, { allowNoTee = false } = {}) {
   const parsed = parseObject(text);
   if (!parsed.payload) return { ok: false, reason: parsed.reason };
   const payload = parsed.payload;
@@ -179,8 +204,9 @@ export function validateCoordinates(text, id) {
   if (looksLikeQuota(payload)) return { ok: false, reason: 'quota_body', payload };
   if (bodyId(payload) !== id) return { ok: false, reason: 'id_mismatch', payload };
   if (zeroGps(payload)) return { ok: false, reason: 'zero_gps', payload };
-  if (!coordsHaveMap(payload)) return { ok: false, reason: 'no_usable_map', payload };
-  return { ok: true, payload };
+  if (coordsHaveMap(payload)) return { ok: true, payload, noTee: false };
+  if (allowNoTee && coordsHaveGreens(payload)) return { ok: true, payload, noTee: true };
+  return { ok: false, reason: 'no_usable_map', payload };
 }
 
 // ---- Scan ----
@@ -279,8 +305,13 @@ function bump(map, key, n = 1) {
  * Pure planning step. `scan` is scanRaw's result, `existing` a Set of key names
  * already in GOLFAPI_KV, `readText(file)` returns the file's text.
  */
-export function planImport({ scan, existing, allow, reject, reviewEvidence = new Map(), readText = (file) => readFileSync(file.path, 'utf8') }) {
+export function planImport({ scan, existing, allow, reject, reviewEvidence = new Map(), readText = (file) => readFileSync(file.path, 'utf8'), mode = 'default' }) {
   if (!(allow instanceof Set) || !(reject instanceof Map)) throw new Error('planImport needs an allow Set and a reject Map');
+  assertMode(mode);
+  const serverCache = mode === 'server-cache';
+  const validByVerdict = {};
+  const writtenByVerdict = {};
+  const noTeeIncluded = [];
   const rejectedByKind = {};
   const checkFailures = {};
   const acceptedEvidence = {};
@@ -296,6 +327,32 @@ export function planImport({ scan, existing, allow, reject, reviewEvidence = new
   const skip = (id, reason) => {
     bump(skipped, reason);
     (skippedIds[reason] ||= []).push(id);
+  };
+  // Only keys missing from the listing; an existing key is never rewritten.
+  const planWrites = (id, courseText, coordText) => {
+    const courseStored = existing.has(permanentKey('course', id));
+    const coordStored = existing.has(permanentKey('coordinates', id));
+    const writes = [];
+    if (!courseStored) {
+      writes.push({ key: permanentKey('course', id), value: envelope(courseText) });
+      keysByType.course += 1;
+    }
+    if (!coordStored) {
+      writes.push({ key: permanentKey('coordinates', id), value: envelope(coordText) });
+      keysByType.coordinates += 1;
+    }
+    if (!existing.has(usKey(id))) {
+      writes.push({ key: usKey(id), value: '1' });
+      keysByType.us += 1;
+    }
+    if (courseStored || coordStored) {
+      partial.push({
+        id,
+        alreadyStored: courseStored ? 'course' : 'coordinates',
+        writing: courseStored ? 'coordinates' : 'course',
+      });
+    }
+    return writes;
   };
 
   const ids = [...scan.ids.keys()].sort();
@@ -351,15 +408,34 @@ export function planImport({ scan, existing, allow, reject, reviewEvidence = new
       skip(id, course.reason);
       continue;
     }
-    const coords = validateCoordinates(coordText, id);
+    const coords = validateCoordinates(coordText, id, { allowNoTee: serverCache });
     if (!coords.ok) {
       skip(id, `coordinates_${coords.reason}`);
+      continue;
+    }
+    const evidence = reviewEvidence.get(id) || [];
+    if (serverCache) {
+      // Signal's verdict stands in for the Oct 28 checks; bodies stay raw.
+      const verdict = verdictFor(evidence);
+      if (!verdict) {
+        skip(id, 'no_signal_verdict');
+        continue;
+      }
+      const writes = planWrites(id, courseText, coordText);
+      valid += 1;
+      bump(validByVerdict, verdict);
+      acceptedEvidence[id] = evidence;
+      if (writes.length) {
+        idsWithWrites += 1;
+        bump(writtenByVerdict, verdict);
+        if (coords.noTee) noTeeIncluded.push({ id, verdict, name: course.payload.clubName || course.payload.courseName || '' });
+      }
+      bulk.push(...writes);
       continue;
     }
     // OSM outline / right-course evidence is not present in golfapi bodies.
     // Use only Signal's clean import-ready verdict, never validate-2km accepted
     // or a name heuristic. The list generator carries the original table row.
-    const evidence = reviewEvidence.get(id) || [];
     const outlinePass = evidence.some((e) => e.source && e.checks?.outline === 'import-ready');
     const identityPass = evidence.some((e) => e.source && e.checks?.rightCourse === 'import-ready');
     if (!outlinePass || !identityPass) {
@@ -377,27 +453,7 @@ export function planImport({ scan, existing, allow, reject, reviewEvidence = new
     }
     valid += 1;
     acceptedEvidence[id] = evidence;
-
-    const writes = [];
-    if (!courseStored) {
-      writes.push({ key: permanentKey('course', id), value: envelope(courseText) });
-      keysByType.course += 1;
-    }
-    if (!coordStored) {
-      writes.push({ key: permanentKey('coordinates', id), value: envelope(coordText) });
-      keysByType.coordinates += 1;
-    }
-    if (!existing.has(usKey(id))) {
-      writes.push({ key: usKey(id), value: '1' });
-      keysByType.us += 1;
-    }
-    if (courseStored || coordStored) {
-      partial.push({
-        id,
-        alreadyStored: courseStored ? 'course' : 'coordinates',
-        writing: courseStored ? 'coordinates' : 'course',
-      });
-    }
+    const writes = planWrites(id, courseText, coordText);
     if (writes.length) idsWithWrites += 1;
     bulk.push(...writes);
   }
@@ -426,6 +482,8 @@ export function planImport({ scan, existing, allow, reject, reviewEvidence = new
     bulkText,
     deleteKeys,
     report: {
+      mode,
+      ...(serverCache ? { validByVerdict, writtenByVerdict, noTeeIncluded } : {}),
       idsScanned: ids.length,
       idsWithCourseBody: ids.filter((id) => scan.ids.get(id).courses.length).length,
       idsWithCoordinatesBody: ids.filter((id) => scan.ids.get(id).coordinates.length).length,
@@ -523,6 +581,14 @@ function markdown(report, meta) {
   lines.push(`Existing keys: ${meta.existingSource} (${report.existingKeysConsidered} keys)`);
   lines.push(`Allowlist: ${meta.allowlist} (${report.allowlistSize} ids)`);
   lines.push(`Reject list: ${meta.rejects} (${report.rejectListSize} ids, plus ALWAYS_REJECT)`, '');
+  if (report.mode === 'server-cache') {
+    lines.push('## Mode: server-cache', '');
+    lines.push('Signal verdicts import-ready, partial and trim-to-9 (stored raw, not trimmed); Oct 28 checks not applied; greens without tees allowed.', '');
+    for (const [v, n] of Object.entries(report.writtenByVerdict).sort()) lines.push(`- written, ${v}: ${n} (valid ${report.validByVerdict[v] || 0})`);
+    lines.push(`- no-tee courses included (greens, no tee): ${report.noTeeIncluded.length}`);
+    if (meta.fillMissing) lines.push(`- fill missing only ids excluded (reject list): ${meta.fillMissing.length}`);
+    lines.push('');
+  }
   lines.push('## Counts', '');
   lines.push(`- IDs scanned: ${report.idsScanned}`);
   lines.push(`- IDs with a course body: ${report.idsWithCourseBody}`);
@@ -592,8 +658,14 @@ export function main(argv = process.argv.slice(2), { run } = {}) {
   if (!args.raw || !args.out || !args.report) {
     throw new Error('usage: --raw <dir> --allowlist <file> --rejects <file> (--existing <file> | --list-remote) --out <bulk.json> --report <report.json>');
   }
+  const mode = assertMode(args.mode || 'default');
   const allowFile = readIdList(args.allowlist, 'allowlist');
   const rejectFile = readIdList(args.rejects, 'rejects');
+  // The lists must come from the same mode: a server-cache allowlist holds
+  // partial and trim-to-9 ids the default mode must never see.
+  for (const [file, kind] of [[allowFile, 'allowlist'], [rejectFile, 'rejects']]) {
+    if ((file.mode || 'default') !== mode) throw new Error(`--${kind} was built for mode ${file.mode || 'default'}, not ${mode} (fail closed)`);
+  }
   const allow = new Set(Object.keys(allowFile.ids));
   const reject = new Map(Object.entries(rejectFile.ids));
   let existing;
@@ -615,12 +687,16 @@ export function main(argv = process.argv.slice(2), { run } = {}) {
   const mdPath = resolve(args['report-md'] || reportPath.replace(/\.json$/, '') + '.md');
 
   const scan = scanRaw(args.raw);
-  const plan = planImport({ scan, existing, allow, reject, reviewEvidence: new Map(Object.entries(allowFile.ids)) });
+  const plan = planImport({ scan, existing, allow, reject, reviewEvidence: new Map(Object.entries(allowFile.ids)), mode });
   const meta = {
     generatedAt: new Date().toISOString(),
+    mode,
     raw: resolve(args.raw),
     existingSource,
-    qualityPolicy: 'All holes: tee+green, 5-700 yd span, 15% card yardage, length vs par. OSM outline and right-course: Signal Lab import-ready row evidence; not independently re-reviewed. Trim/partial/ambiguous excluded, no bodies modified.',
+    qualityPolicy: mode === 'server-cache'
+      ? 'server-cache: Signal Lab verdict import-ready, partial or trim-to-9 on a one-id table row; rejected/unusable/excluded/bundled/conflict/fill-missing/validate-2km/ALWAYS_REJECT/unreviewed excluded. Oct 28 checks not applied. Both bodies, valid JSON, no error, US, nonzero GPS, at least one green; tees not required. No bodies modified (trim-to-9 stored raw).'
+      : 'All holes: tee+green, 5-700 yd span, 15% card yardage, length vs par. OSM outline and right-course: Signal Lab import-ready row evidence; not independently re-reviewed. Trim/partial/ambiguous excluded, no bodies modified.',
+    ...(mode === 'server-cache' ? { fillMissing: rejectFile.fillMissing || [] } : {}),
     signalSources: allowFile.sources || [],
     allowlist: resolve(args.allowlist),
     rejects: resolve(args.rejects),
@@ -635,6 +711,7 @@ export function main(argv = process.argv.slice(2), { run } = {}) {
   writeFileSync(reportPath, JSON.stringify({ ...meta, ...plan.report }, null, 2));
   writeFileSync(mdPath, markdown(plan.report, meta));
   const r = plan.report;
+  if (r.mode === 'server-cache') console.log(`[server-cache] written by verdict ${JSON.stringify(r.writtenByVerdict)}, no-tee included ${r.noTeeIncluded.length}`);
   console.log(`dry run: ${r.idsScanned} ids, ${r.valid} valid, ${r.keysToWrite.total} keys to write (${r.keysToWrite.course} course, ${r.keysToWrite.coordinates} coordinates, ${r.keysToWrite.us} us)`);
   console.log(`skipped: ${JSON.stringify(r.skipped)}`);
   console.log(`bulk: ${out} (${r.bulkFileBytes} bytes)`);

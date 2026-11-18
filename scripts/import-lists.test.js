@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, test } from 'vitest';
-import { ALWAYS_REJECT, bucketAllows, buildLists, findSignalFiles, main, parseValidate2km, parseValidationMarkdown } from './import-lists.mjs';
+import { ALWAYS_REJECT, allowedVerdict, bucketAllows, buildLists, findSignalFiles, main, parseValidate2km, parseValidationMarkdown } from './import-lists.mjs';
 
 const TABLE = `# OH national golfapi pull: validation (read-only)
 ## Counts
@@ -100,6 +100,37 @@ describe('import-lists: Signal Lab verdicts only', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test('server-cache verdicts: import-ready, partial, trim-to-9; reject-type words, fill-missing and prose never allow', () => {
+    const sc = (c) => allowedVerdict(c, 'server-cache');
+    assert.equal(sc('import-ready'), 'import-ready');
+    assert.equal(sc('**partial**'), 'partial');
+    assert.equal(sc('partial (greens only)'), 'partial');
+    assert.equal(sc('partial (back-9 pars wrong)'), 'partial');
+    assert.equal(sc('partial. vendor-9 copies, plus tees on the wrong hole: h3'), 'partial');
+    assert.equal(sc('trim-to-9'), 'trim-to-9');
+    assert.equal(sc('trim to 9, then import-ready'), 'trim-to-9');
+    assert.equal(sc('import-after-trim (9; vendor 9)'), 'trim-to-9');
+    for (const cell of ['rejected', 'unusable', 'unusable (reject)', 'exclude (duplicate row)', 'protected/exclude', 'partial, wrong course', 'partial, excluded', 'partial (bundled on main)', 'trim-to-9 (hold)', 'partial (duplicate of the Summit)', 'partial (greens only), verify location', 'trim to 9 + h7 tee fix: do not import', 'import-ready (fill missing only)', 'not pulled (in worker kv)', 'already pulled, import-ready via way/1', 'one course mapped twice']) {
+      assert.equal(sc(cell), null, cell);
+    }
+    // Default mode is unchanged: only a clean import-ready cell.
+    assert.equal(allowedVerdict('partial'), null);
+    assert.equal(allowedVerdict('trim-to-9'), null);
+    assert.equal(allowedVerdict('import-ready'), 'import-ready');
+    assert.throws(() => allowedVerdict('x', 'loose'), /unknown --mode/);
+
+    const { allow, reject } = parseValidationMarkdown(TABLE, 'OH-validation.md', 'server-cache');
+    assert.deepEqual(allow.map((a) => [a.id, a.verdict]).sort(), [
+      ['0121000000000000001', 'import-ready'],
+      ['0121000000000000002', 'trim-to-9'],
+      ['0121000000000000003', 'import-ready'],
+      ['0121000000000000004', 'partial'],
+      ['0121000000000000007', 'trim-to-9'],
+    ]);
+    const rejected = new Set(reject.map((r) => r.id));
+    for (const id of ['01214152102065792916', '0121000000000000005', '0121000000000000006', '0121000000000000008']) assert.ok(rejected.has(id), id);
   });
 
   test('no Signal Lab files is an error', () => {

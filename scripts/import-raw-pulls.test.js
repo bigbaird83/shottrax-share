@@ -13,6 +13,7 @@ import {
   planImport,
   scanRaw,
 } from './import-raw-pulls.mjs';
+import { buildLists, findSignalFiles } from './import-lists.mjs';
 
 // A fixture course that passes every Oct 28 check: 18 par-4 holes, back tee
 // (poi 12) 380 yd and front tee (poi 11) 340 yd from the green, matching the
@@ -570,6 +571,201 @@ describe("Brian's Oct 28 checks", () => {
     const result = only('890', courseBody('890'), copied);
     assert.equal(result.report.skipped.trim_to_9, 1);
     assert.equal(result.bulk.length, 0);
+  });
+});
+
+// ---- --mode server-cache (Brian, Nov 17 2026) through the real list builder. ----
+
+const SC = {
+  ready: '0129000000000000001',
+  partialPar: '0129000000000000002',
+  trim: '0129000000000000003',
+  readyCardFail: '0129000000000000004',
+  noTee: '0129000000000000005',
+  readyNoTee: '0129000000000000006',
+  zeroGps: '0129000000000000007',
+  missingPair: '0129000000000000008',
+  noGreens: '0129000000000000009',
+  rejected: '0129000000000000010',
+  unusable: '0129000000000000011',
+  conflict: '0129000000000000012',
+  fillMissing: '0129000000000000013',
+  wrongCourse: '0129000000000000014',
+  twoIdA: '0129000000000000015',
+  twoIdB: '0129000000000000016',
+  unreviewed: '0129000000000000017',
+  halfStored: '0129000000000000018',
+  prose: '0129000000000000019',
+  km2: '0129000000000000020',
+  excluded: '0129000000000000021',
+  errorBody: '0129000000000000022',
+};
+const SC_TABLE = `# ZZ national golfapi pull: validation
+## Per-course table
+| Course (OSM) | golfapi club / course, city | golfapi id | Verdict |
+|---|---|---|---|
+| A | A GC | ${SC.ready} | import-ready |
+| B | B GC | ${SC.partialPar} | partial (back-9 pars wrong) |
+| C | C GC | ${SC.trim} | trim-to-9 |
+| D | D GC | ${SC.readyCardFail} | import-ready |
+| E | E GC | ${SC.noTee} | partial (greens only) |
+| F | F GC | ${SC.readyNoTee} | import-ready |
+| G | G GC | ${SC.zeroGps} | partial |
+| H | H GC | ${SC.missingPair} | partial |
+| I | I GC | ${SC.noGreens} | import-after-trim (9) |
+| J | J GC | ${SC.rejected} | rejected |
+| K | K GC | ${SC.unusable} | unusable |
+| L | L GC | ${SC.conflict} | partial |
+| M | M GC | ${SC.fillMissing} | import-ready (fill missing only) |
+| N | N GC | ${SC.wrongCourse} | partial, wrong course |
+| O | O GC | ${SC.twoIdA} + ${SC.twoIdB} | partial |
+| P | P GC | ${SC.halfStored} | partial |
+| Q | Q GC | ${SC.km2} | partial |
+| R | R GC | ${SC.excluded} | exclude (duplicate row) |
+| S | S GC | ${SC.errorBody} | partial |
+
+### Partial courses
+- ${SC.prose}: partial, greens look fine.
+`;
+const SC_CONFLICT = `| Course | id | Bucket |\n|---|---|---|\n| L again | ${SC.conflict} | rejected |\n`;
+
+function serverCacheFixture() {
+  const root = join(dir, 'signal');
+  mkdirSync(join(root, 'national'), { recursive: true });
+  mkdirSync(join(root, 'raw/national/ZZ'), { recursive: true });
+  writeFileSync(join(root, 'national/ZZ-validation.md'), SC_TABLE);
+  writeFileSync(join(root, 'national/ZZ-older-validation.md'), SC_CONFLICT);
+  writeFileSync(join(root, 'raw/national/ZZ/validate-2km.json'), JSON.stringify([{ id: SC.km2, result: 'REJECTED: green center 6.1 km from OSM' }]));
+
+  const copiedNine = coordBody(SC.trim);
+  const front = copiedNine.coordinates.filter((r) => r.hole <= 9);
+  copiedNine.coordinates = [...front, ...front.map((r) => ({ ...r, hole: r.hole + 9 }))];
+  const allHoles = (opts) => Object.fromEntries(Array.from({ length: 18 }, (_, i) => [i + 1, opts]));
+  const longCard = courseBody(SC.readyCardFail);
+  for (const t of longCard.tees) for (let n = 1; n <= 18; n += 1) t[`length${n}`] = 600;
+
+  pair('raw', SC.ready);
+  pair('raw', SC.partialPar, courseBody(SC.partialPar, { parsMen: [3, ...Array(17).fill(4)] }));
+  pair('raw', SC.trim, courseBody(SC.trim), copiedNine);
+  pair('raw', SC.readyCardFail, longCard);
+  pair('raw', SC.noTee, courseBody(SC.noTee), coordBody(SC.noTee, {}, allHoles({ tees: false })));
+  pair('raw', SC.readyNoTee, courseBody(SC.readyNoTee), coordBody(SC.readyNoTee, {}, allHoles({ tees: false })));
+  pair('raw', SC.zeroGps, courseBody(SC.zeroGps, { hasGPS: '0' }));
+  put(`raw/${SC.missingPair}.courses.json`, pyText(courseBody(SC.missingPair)));
+  pair('raw', SC.noGreens, courseBody(SC.noGreens), coordBody(SC.noGreens, {}, allHoles({ green: false })));
+  pair('raw', SC.errorBody, courseBody(SC.errorBody, { error: 'Course not found' }));
+  for (const id of ['rejected', 'unusable', 'conflict', 'fillMissing', 'wrongCourse', 'twoIdA', 'twoIdB', 'unreviewed', 'halfStored', 'prose', 'km2', 'excluded']) pair('raw', SC[id]);
+  return root;
+}
+function planMode(mode, existing = []) {
+  const root = join(dir, 'signal');
+  const lists = buildLists({ ...findSignalFiles(root), root, mode });
+  const result = planImport({
+    scan: scanRaw(join(dir, 'raw')),
+    existing: new Set(existing),
+    allow: new Set(Object.keys(lists.allow)),
+    reject: new Map(Object.entries(lists.reject)),
+    reviewEvidence: new Map(Object.entries(lists.allow)),
+    mode,
+  });
+  return { lists, result, ids: new Set(result.bulk.map((r) => r.key.split(':').pop())) };
+}
+
+describe('--mode server-cache', () => {
+  test('partial, trim-to-9, Oct 28 failures and no-tee courses are written in server-cache mode only', () => {
+    serverCacheFixture();
+    const server = planMode('server-cache');
+    const strict = planMode('default');
+    const included = [SC.ready, SC.partialPar, SC.trim, SC.readyCardFail, SC.noTee, SC.readyNoTee, SC.halfStored];
+    assert.deepEqual([...server.ids].sort(), included.sort());
+    assert.deepEqual([...strict.ids], [SC.ready], 'default mode is the strict #66 behavior');
+    assert.equal(strict.result.report.skipped.trim_to_9, undefined, 'the default list never even allows the trim row');
+    assert.equal(strict.result.report.skipped.coordinates_no_usable_map, 1, 'default keeps the no-tee skip (import-ready no-tee row)');
+    assert.equal(strict.result.report.skipped.oct28_card_yards_15pct, 1);
+    assert.deepEqual(server.result.report.writtenByVerdict, { 'import-ready': 3, partial: 3, 'trim-to-9': 1 });
+    assert.deepEqual(server.result.report.noTeeIncluded.map((r) => r.id).sort(), [SC.noTee, SC.readyNoTee]);
+    assert.equal(server.result.report.skipped.oct28_card_yards_15pct, undefined);
+  });
+
+  test('trim-to-9 bodies are stored byte-identical, not trimmed', () => {
+    serverCacheFixture();
+    const { result } = planMode('server-cache');
+    for (const kind of ['courses', 'coordinates']) {
+      const disk = readFileSync(join(dir, `raw/${SC.trim}.${kind}.json`), 'utf8');
+      const key = `golfapi:permanent:${kind === 'courses' ? 'course' : 'coordinates'}:${SC.trim}`;
+      assert.equal(JSON.parse(result.bulk.find((r) => r.key === key).value).body, disk);
+    }
+  });
+
+  test('zero GPS, missing pair, no greens and error bodies stay out', () => {
+    serverCacheFixture();
+    const { result, ids } = planMode('server-cache');
+    for (const id of [SC.zeroGps, SC.missingPair, SC.noGreens, SC.errorBody]) assert.equal(ids.has(id), false, id);
+    assert.equal(result.report.skipped.zero_gps, 1);
+    assert.equal(result.report.skipped.missing_pair, 1);
+    assert.equal(result.report.skipped.coordinates_no_usable_map, 1);
+    assert.equal(result.report.skipped.error_field, 1);
+  });
+
+  test('rejected, unusable, excluded, conflict, fill-missing, 2-id, prose, validate-2km and unreviewed ids stay out', () => {
+    serverCacheFixture();
+    const { lists, result, ids } = planMode('server-cache');
+    for (const id of ['rejected', 'unusable', 'excluded', 'conflict', 'fillMissing', 'wrongCourse', 'twoIdA', 'twoIdB', 'prose', 'km2', 'unreviewed']) {
+      assert.equal(ids.has(SC[id]), false, id);
+    }
+    assert.ok(lists.allowAlsoRejected.includes(SC.conflict), 'an id on an allow-type and a reject-type row is conflict-blocked');
+    assert.ok(lists.allowAlsoRejected.includes(SC.km2));
+    assert.deepEqual(lists.fillMissing, [SC.fillMissing]);
+    assert.equal(lists.allow[SC.prose], undefined, 'prose never allows');
+    assert.equal(lists.reject[SC.prose], undefined, 'a trim/partial word in prose no longer rejects');
+    assert.equal(result.report.skipped.not_allowlisted, 2, 'prose id and the unreviewed id');
+  });
+
+  test('an existing key is never rewritten', () => {
+    serverCacheFixture();
+    const stored = [`golfapi:permanent:course:${SC.halfStored}`, `golfapi:permanent:course:${SC.ready}`, `golfapi:permanent:coordinates:${SC.ready}`, `golfapi:us:${SC.ready}`];
+    const { result } = planMode('server-cache', stored);
+    const keys = new Set(result.bulk.map((r) => r.key));
+    for (const key of stored) assert.equal(keys.has(key), false, key);
+    assert.equal(result.report.skipped.already_stored, 1);
+    // halfStored has its course stored: only coordinates and the US marker are written.
+    assert.deepEqual([...keys].filter((k) => k.endsWith(SC.halfStored)).sort(), [`golfapi:permanent:coordinates:${SC.halfStored}`, `golfapi:us:${SC.halfStored}`]);
+  });
+
+  test('main refuses lists built for the other mode', () => {
+    pair('t', '0129000000000000099');
+    const io = cliFiles({ allow: ['0129000000000000099'] });
+    try {
+      assert.throws(() => main(io.args({ mode: 'server-cache' })), /built for mode default, not server-cache/);
+      const scList = { kind: 'allowlist', mode: 'server-cache', ids: { '0129000000000000099': [{ source: 'x-validation.md', verdict: 'partial' }] } };
+      writeFileSync(io.allowlist, JSON.stringify(scList));
+      assert.throws(() => main(io.args()), /built for mode server-cache, not default/);
+      writeFileSync(io.rejects, JSON.stringify({ kind: 'rejects', mode: 'server-cache', ids: {} }));
+      assert.throws(() => main(io.args({ mode: 'bogus' })), /unknown --mode bogus/);
+      const log = console.log;
+      console.log = () => {};
+      try {
+        main(io.args({ mode: 'server-cache' }));
+      } finally {
+        console.log = log;
+      }
+      const report = JSON.parse(readFileSync(io.report, 'utf8'));
+      assert.equal(report.mode, 'server-cache');
+      assert.deepEqual(report.writtenByVerdict, { partial: 1 });
+      // A server-cache allowlist row without a Signal verdict is not imported.
+      writeFileSync(io.allowlist, JSON.stringify({ ...scList, ids: { '0129000000000000099': [{ source: 'x-validation.md' }] } }));
+      console.log = () => {};
+      try {
+        main(io.args({ mode: 'server-cache' }));
+      } finally {
+        console.log = log;
+      }
+      const noVerdict = JSON.parse(readFileSync(io.report, 'utf8'));
+      assert.equal(noVerdict.keysToWrite.total, 0);
+      assert.equal(noVerdict.skipped.no_signal_verdict, 1);
+    } finally {
+      io.cleanup();
+    }
   });
 });
 
