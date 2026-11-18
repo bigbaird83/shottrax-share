@@ -32,7 +32,9 @@ const TABLE = `# OH national golfapi pull: validation (read-only)
 describe('import-lists: Signal Lab verdicts only', () => {
   test('bucketAllows takes only a clean import-ready cell', () => {
     assert.equal(bucketAllows('import-ready'), true);
-    assert.equal(bucketAllows('**import-ready (fill missing only)**'), true);
+    assert.equal(bucketAllows('**import-ready (fill missing only)**'), false);
+    assert.equal(bucketAllows('import-ready (fill-missing only)'), false);
+    assert.equal(bucketAllows('import-ready (way/419135913)'), true);
     assert.equal(bucketAllows('trim to 9, then import-ready'), false);
     assert.equal(bucketAllows('import-ready after trim'), false);
     assert.equal(bucketAllows('already pulled, import-ready via way/1'), false);
@@ -41,9 +43,10 @@ describe('import-lists: Signal Lab verdicts only', () => {
 
   test('table rows allow or reject by their bucket; prose never allows', () => {
     const { allow, reject } = parseValidationMarkdown(TABLE, 'OH-validation.md');
-    assert.deepEqual(allow.map((a) => a.id).sort(), ['0121000000000000001', '0121000000000000003', '0121000000000000008']);
+    assert.deepEqual(allow.map((a) => a.id).sort(), ['0121000000000000001', '0121000000000000003']);
     const rejected = new Set(reject.map((r) => r.id));
-    for (const id of ['01214152102065792916', '0121000000000000002', '0121000000000000004', '0121000000000000005', '0121000000000000006', '0121000000000000007']) {
+    // ...008 is "import-ready (fill missing only)": a hole-fill verdict, so a reject.
+    for (const id of ['01214152102065792916', '0121000000000000002', '0121000000000000004', '0121000000000000005', '0121000000000000006', '0121000000000000007', '0121000000000000008']) {
       assert.ok(rejected.has(id), id);
     }
     // Prose under "Import-ready with notes" neither allows nor rejects.
@@ -72,7 +75,8 @@ describe('import-lists: Signal Lab verdicts only', () => {
       const files = findSignalFiles(root);
       assert.equal(files.markdown.length, 2, 'only *-validation.md / *-review.md files are Signal sources');
       const lists = buildLists({ ...files, root });
-      assert.deepEqual(Object.keys(lists.allow).sort(), ['0121000000000000003', '0121000000000000008']);
+      assert.deepEqual(Object.keys(lists.allow).sort(), ['0121000000000000003']);
+      assert.ok(lists.reject['0121000000000000008'], 'fill missing only is rejected');
       assert.ok(lists.reject['0121000000000000001']);
       assert.ok(lists.reject['0121263749725147']);
       assert.deepEqual(lists.allowAlsoRejected, ['0121000000000000001', '0121263749725147']);

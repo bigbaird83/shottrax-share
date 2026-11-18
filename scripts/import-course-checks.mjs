@@ -8,9 +8,9 @@
  *   clubhouse pin (< 5 yd), with a tee-to-green span of 5-700 yd
  *   (golfapi.ts mapGolfApiCourseToHydrate + pickTee, holeCamera.ts
  *   COURSE_CARD_MIN/MAX_HOLE_SPAN_YARDS);
- * - tee points within 15% of the scorecard yardage (scorecardCheck.ts
- *   scorecardHoleCheck, SCORECARD_TOLERANCE / CARD_YARDS_TOLERANCE 0.15,
- *   including the 2-tee rule);
+ * - hole-level 15% card yardage: some tee point on each hole within 15% of
+ *   some card yardage (SCORECARD_TOLERANCE / CARD_YARDS_TOLERANCE 0.15), with
+ *   the scorecardCheck.ts 2-tee order rule (see scorecardHoleResult);
  * - hole length fits par (cardChecks.ts: par 3 over 280 yd or par 5 under
  *   380 yd is a par-length issue; par must be 3-6);
  * - OSM outline and right-course checks need OSM geometry that is not in the
@@ -68,56 +68,40 @@ function num(value) {
 function within(measured, card) {
   return Math.abs(measured - card) <= card * SCORECARD_TOLERANCE;
 }
-function teeKey(name) {
-  const key = String(name ?? '').trim().toLowerCase().replace(/\s+tees?$/, '');
-  return key && key !== 'default' ? key : null;
-}
 
-/** scorecardCheck.ts scorecardHoleCheck (returns true when the hole passes). */
-export function scorecardHolePasses({ tees, green, card }) {
+/**
+ * Hole-level 15% rule (Signal Lab ruling on #66, Nov 17): a hole passes when
+ * ANY of its tee points is within 15% of ANY card yardage for that hole. The
+ * 2-tee order rule from scorecardCheck.ts still applies when both golfapi tees
+ * (poi 12 back, poi 11 front) fit: the back tee's longest fit must not be
+ * shorter than the front tee's shortest fit (a swapped pair fails). A hole
+ * with no card yardage passes. Returns { ok, tees: [{ role, yards, fits }], card }.
+ */
+export function scorecardHoleResult({ tees, green, card }) {
   const yards = (card ?? []).filter((c) => Number.isFinite(c.yards) && c.yards > 0);
-  if (yards.length === 0 || !isCourseCardLatLng(green)) return true;
+  if (yards.length === 0 || !isCourseCardLatLng(green)) return { ok: true, tees: [], card: yards };
   const points = [];
   for (const t of tees) {
     if (!isCourseCardLatLng(t.point)) continue;
-    const dup = points.find((p) => (p.name ?? null) === (t.name ?? null) && metersBetween(p.point, t.point) <= SAME_TEE_POINT_M);
+    const dup = points.find((p) => (p.role ?? null) === (t.role ?? null) && metersBetween(p.point, t.point) <= SAME_TEE_POINT_M);
     if (!dup) points.push(t);
   }
-  const measured = points.map((t) => ({ name: t.name ?? null, role: t.role ?? null, measured: haversineYards(t.point, green) }));
-  if (measured.length === 0) return true;
-  if (measured.length === 1) return yards.some((c) => within(measured[0].measured, c.yards));
-  if (measured.length === 2 && yards.length > 1 && !measured.some((t) => teeKey(t.name) && yards.some((c) => teeKey(c.name) === teeKey(t.name)))) {
-    const [a, b] = measured;
-    const labelled = a.role != null && b.role != null && a.role !== b.role;
-    const [longer, shorter] = labelled ? (a.role === 'back' ? [a, b] : [b, a]) : a.measured >= b.measured ? [a, b] : [b, a];
-    const longFits = yards.filter((c) => within(longer.measured, c.yards)).map((c) => c.yards);
-    const shortFits = yards.filter((c) => within(shorter.measured, c.yards)).map((c) => c.yards);
-    if (longFits.length === 0 || shortFits.length === 0) return false;
-    return Math.max(...longFits) >= Math.min(...shortFits);
+  const measured = points.map((t) => {
+    const m = haversineYards(t.point, green);
+    return { role: t.role ?? null, yards: m, fits: yards.filter((c) => within(m, c.yards)).map((c) => c.yards) };
+  });
+  if (measured.length === 0) return { ok: true, tees: measured, card: yards };
+  let ok = measured.some((t) => t.fits.length > 0);
+  const back = measured.find((t) => t.role === 'back');
+  const front = measured.find((t) => t.role === 'front');
+  if (ok && back && front && back.fits.length > 0 && front.fits.length > 0) {
+    ok = Math.max(...back.fits) >= Math.min(...front.fits);
   }
-  let ok = true;
-  const restTees = [...measured];
-  const restCard = [...yards];
-  for (const tee of measured) {
-    const key = teeKey(tee.name);
-    if (!key) continue;
-    const at = restCard.findIndex((c) => teeKey(c.name) === key);
-    if (at < 0) continue;
-    const [c] = restCard.splice(at, 1);
-    restTees.splice(restTees.indexOf(tee), 1);
-    if (!within(tee.measured, c.yards)) ok = false;
-  }
-  if (restTees.length > 0 && restCard.length === 1) {
-    if (!restTees.some((t) => within(t.measured, restCard[0].yards))) ok = false;
-  } else if (restTees.length > 0 && restCard.length > 1) {
-    restTees.sort((x, y) => y.measured - x.measured);
-    restCard.sort((x, y) => y.yards - x.yards);
-    const pairs = restTees.length === restCard.length
-      ? restTees.map((t, i) => [t, restCard[i]])
-      : [[restTees[0], restCard[0]], ...(restTees.length > 1 ? [[restTees[restTees.length - 1], restCard[restCard.length - 1]]] : [])];
-    for (const [t, c] of pairs) if (!within(t.measured, c.yards)) ok = false;
-  }
-  return ok;
+  return { ok, tees: measured, card: yards };
+}
+
+export function scorecardHolePasses(args) {
+  return scorecardHoleResult(args).ok;
 }
 
 /** golfapi.ts parseTeeSets */
@@ -188,6 +172,7 @@ export function checkCourse(course, coordinates) {
   const sets = teeSets(course.tees);
   const pars = Array.isArray(course.parsMen) ? course.parsMen : [];
   const greens = new Map();
+  const cardFails = [];
   for (let n = 1; n <= numHoles; n += 1) {
     const at = rows.filter((r) => r.hole === n);
     const greenRow = at.find((r) => r.poi === 1 && r.location === 2);
@@ -200,7 +185,15 @@ export function checkCourse(course, coordinates) {
     if (span < MIN_HOLE_SPAN_YARDS || span > MAX_HOLE_SPAN_YARDS) return { ok: false, check: 'tee_green_span', hole: n, detail: `${Math.round(span)} yd` };
     const card = sets.filter((s) => (s.lengths[n - 1] ?? 0) > 0).map((s) => ({ yards: s.lengths[n - 1], name: s.name }));
     const teePoints = teeRows.map((r) => ({ point: { lat: r.lat, lng: r.lng }, role: r.poi === 12 ? 'back' : 'front' }));
-    if (!scorecardHolePasses({ tees: teePoints, green, card })) return { ok: false, check: 'card_yards_15pct', hole: n };
+    const scored = scorecardHoleResult({ tees: teePoints, green, card });
+    if (!scored.ok) {
+      cardFails.push({
+        hole: n,
+        tees: scored.tees.map((t) => ({ role: t.role, yards: Math.round(t.yards) })),
+        card: card.map((c) => ({ name: c.name, yards: c.yards })),
+      });
+      continue;
+    }
     const par = num(pars[n - 1]);
     if (par == null || !Number.isInteger(par) || par < 3 || par > 6) return { ok: false, check: 'par_missing', hole: n };
     if ((par === 3 && span > PAR3_LONG_YARDS) || (par === 5 && span < PAR5_SHORT_YARDS)) {
@@ -208,6 +201,7 @@ export function checkCourse(course, coordinates) {
     }
 
   }
+  if (cardFails.length) return { ok: false, check: 'card_yards_15pct', hole: cardFails[0].hole, holes: cardFails };
   if (numHoles === 18) {
     for (let n = 10; n <= 18; n += 1) {
       if (metersBetween(greens.get(n), greens.get(n - 9)) <= TRIM_TO_9_GREEN_M) return { ok: false, check: 'trim_to_9', hole: n };

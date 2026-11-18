@@ -224,10 +224,44 @@ export function pickFile(files) {
 
 // ---- Plan ----
 
+function canonical(value) {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${canonical(value[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/** Body without the per-call credit counter, for comparing copies of one id. */
+export function bodyFingerprint(text) {
+  try {
+    const payload = JSON.parse(text);
+    if (payload && typeof payload === 'object' && !Array.isArray(payload)) delete payload.apiRequestsLeft;
+    return canonical(payload);
+  } catch {
+    return `unparsed:${text}`;
+  }
+}
+
+/**
+ * The same id pulled into several folders is emitted once. Copies may differ
+ * only in apiRequestsLeft; any other difference is a hard error.
+ */
+export function assertSameBodies(id, kind, files, readText) {
+  const [first, ...rest] = files;
+  const want = bodyFingerprint(readText(first));
+  for (const other of rest) {
+    if (bodyFingerprint(readText(other)) !== want) {
+      throw new Error(`duplicate ${kind} bodies for ${id} differ beyond apiRequestsLeft: ${first.rel} vs ${other.rel}`);
+    }
+  }
+}
+
 /** Which kind of Signal Lab verdict put an id on the reject list (for the report). */
 export function rejectKind(entries, id) {
   const text = (entries || []).map((e) => `${e.source} ${e.reason}`).join(' ').toLowerCase();
   if (Object.prototype.hasOwnProperty.call(ALWAYS_REJECT, id) || text.includes('always_reject')) return 'signal_gate_list';
+  if (/fill[- ]missing/.test(text)) return 'fill_missing_only';
   if (text.includes('validate-2km')) return 'validate_2km';
   if (/unusable/.test(text)) return 'unusable';
   if (/reject|wrong/.test(text)) return 'rejected';
@@ -269,6 +303,7 @@ export function planImport({ scan, existing, allow, reject, reviewEvidence = new
     const files = scan.ids.get(id);
     for (const kind of ['courses', 'coordinates']) {
       if (files[kind].length > 1) {
+        assertSameBodies(id, KINDS[kind], files[kind], readText);
         const chosen = pickFile(files[kind]);
         duplicates.push({
           id,
@@ -337,7 +372,7 @@ export function planImport({ scan, existing, allow, reject, reviewEvidence = new
     if (!checked.ok) {
       const reason = checked.check === 'trim_to_9' ? 'trim_to_9' : `oct28_${checked.check}`;
       skip(id, reason);
-      (checkFailures[reason] ||= []).push({ id, hole: checked.hole ?? null, detail: checked.detail ?? null });
+      (checkFailures[reason] ||= []).push({ id, name: course.payload.clubName || course.payload.courseName || '', hole: checked.hole ?? null, detail: checked.detail ?? null, ...(checked.holes ? { holes: checked.holes } : {}) });
       continue;
     }
     valid += 1;
@@ -507,6 +542,19 @@ function markdown(report, meta) {
     lines.push(`- ${reason}: ${rows.length} (e.g. ${rows.slice(0, 5).map((r) => `${r.id}${r.hole ? ` h${r.hole}` : ''}`).join(', ')})`);
   }
   if (!Object.keys(report.checkFailures).length) lines.push('- none');
+  const cardRows = report.checkFailures.oct28_card_yards_15pct || [];
+  if (cardRows.length) {
+    lines.push('', '## 15% card-yardage failures by course', '');
+    lines.push('A hole fails when no tee point is within 15% of any card yardage (or the back/front pair is swapped).', '');
+    for (const row of cardRows) {
+      lines.push(`- ${row.id} ${row.name}: ${row.holes.length} failing hole(s)`);
+      for (const h of row.holes) {
+        const tees = h.tees.map((t) => `${t.role || 'tee'} ${t.yards}`).join(', ') || 'none';
+        const card = h.card.map((c) => `${c.name} ${c.yards}`).join(', ');
+        lines.push(`  - h${h.hole}: measured ${tees} yd; card ${card}`);
+      }
+    }
+  }
   lines.push('', '## Keys to write', '');
   lines.push(`- golfapi:permanent:course: ${report.keysToWrite.course}`);
   lines.push(`- golfapi:permanent:coordinates: ${report.keysToWrite.coordinates}`);

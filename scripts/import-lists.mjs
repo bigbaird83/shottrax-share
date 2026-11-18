@@ -6,7 +6,8 @@
  *
  * - ALLOW: an id on a markdown table row (exactly one id on the row) whose
  *   bucket/verdict cell says import-ready and nothing else (no trim, partial,
- *   reject, unusable, exclude, duplicate, "do not"). Prose mentions never allow.
+ *   reject, unusable, exclude, duplicate, "do not", "fill missing only").
+ *   Prose mentions never allow.
  * - REJECT (always wins): every other id on a bucket/verdict table row; every
  *   id in prose under a heading or on a line that names a non-import bucket;
  *   validate-2km.json rows whose result is not "accepted"; and the fixed list
@@ -58,6 +59,8 @@ function cleanCell(cell) {
 export function bucketAllows(cell) {
   const text = cleanCell(cell).toLowerCase();
   if (!/^import[- ]ready\b/.test(text)) return false;
+  // "fill missing only" is a hole-fill verdict, not a whole-course copy (Signal Lab, Nov 17).
+  if (/fill[- ]missing/.test(text)) return false;
   return !NOT_IMPORT_WORDS.test(text);
 }
 

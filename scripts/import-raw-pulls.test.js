@@ -251,21 +251,41 @@ describe('import-raw-pulls dry run', () => {
     ]);
   });
 
-  test('duplicate ids pick the newest file, ties by path, and are reported', () => {
-    pair('national/IN/a', '700', courseBody('700', { clubName: 'Old' }), coordBody('700'), 1_700_000_000);
-    pair('national/MI/b', '700', courseBody('700', { clubName: 'New' }), coordBody('700'), 1_700_000_500);
-    pair('z', '701', courseBody('701', { clubName: 'Z' }), coordBody('701'), 1_700_000_000);
-    pair('a', '701', courseBody('701', { clubName: 'A' }), coordBody('701'), 1_700_000_000);
+  test('a duplicate id across folders is emitted once when copies differ only in apiRequestsLeft', () => {
+    pair('national/IN/a', '700', courseBody('700', { apiRequestsLeft: '10.0' }), coordBody('700', { apiRequestsLeft: '9.0' }), 1_700_000_000);
+    pair('national/MI/b', '700', courseBody('700', { apiRequestsLeft: '8.0' }), coordBody('700', { apiRequestsLeft: '7.0' }), 1_700_000_500);
+    pair('z', '701', courseBody('701'), coordBody('701'), 1_700_000_000);
+    pair('a', '701', courseBody('701'), coordBody('701'), 1_700_000_000);
     const first = plan();
     const second = plan();
     assert.equal(first.bulkText, second.bulkText);
-    const name = (id) => JSON.parse(JSON.parse(first.bulk.find((r) => r.key === `golfapi:permanent:course:${id}`).value).body).clubName;
-    assert.equal(name('700'), 'New');
-    assert.equal(name('701'), 'A');
+    assert.deepEqual(keysOf(first), [
+      'golfapi:permanent:coordinates:700',
+      'golfapi:permanent:coordinates:701',
+      'golfapi:permanent:course:700',
+      'golfapi:permanent:course:701',
+      'golfapi:us:700',
+      'golfapi:us:701',
+    ]);
+    const credits = (id) => JSON.parse(JSON.parse(first.bulk.find((r) => r.key === `golfapi:permanent:course:${id}`).value).body).apiRequestsLeft;
+    assert.equal(credits('700'), '8.0', 'newest copy');
     assert.equal(first.report.duplicates.count, 4);
     const d700 = first.report.duplicates.items.find((d) => d.id === '700' && d.kind === 'course');
     assert.equal(d700.chosen, 'national/MI/b/700.courses.json');
     assert.deepEqual(d700.others, ['national/IN/a/700.courses.json']);
+  });
+
+  test('duplicate copies that differ beyond apiRequestsLeft are a hard error', () => {
+    pair('national/IN/a', '710', courseBody('710', { clubName: 'Old' }));
+    pair('national/MI/b', '710', courseBody('710', { clubName: 'New' }));
+    assert.throws(() => plan(), /duplicate course bodies for 710 differ beyond apiRequestsLeft/);
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir);
+    const moved = coordBody('711');
+    moved.coordinates[0].latitude += 0.0001;
+    pair('national/IN/a', '711', courseBody('711'), coordBody('711'));
+    pair('national/MI/b', '711', courseBody('711'), moved);
+    assert.throws(() => plan(), /duplicate coordinates bodies for 711/);
   });
 
   test('existing key list reads plain lines or wrangler JSON', () => {
@@ -454,14 +474,66 @@ describe("Brian's Oct 28 checks", () => {
     assert.equal(only('853', courseBody('853'), short).report.skipped.oct28_missing_tee_or_green, 1);
   });
 
-  test('a tee more than 15% off the card fails; inside 15% passes', () => {
-    // 380-yd card, back tee measured 450 yd (18% long), front tee still fits Red.
-    const off = only('860', courseBody('860'), coordBody('860', {}, { 3: { backYards: 450, frontYards: 340 } }));
-    assert.equal(off.report.skipped.oct28_card_yards_15pct, 1);
-    assert.equal(off.report.checkFailures.oct28_card_yards_15pct[0].hole, 3);
+  test('15% is hole-level: one good tee passes the hole, every tee off fails it', () => {
+    // Back tee 450 yd (18% over Blue 380, 32% over Red 340); front tee 340 fits Red.
+    const oneGood = only('860', courseBody('860'), coordBody('860', {}, { 3: { backYards: 450, frontYards: 340 } }));
+    assert.equal(oneGood.report.valid, 1);
     rmSync(join(dir, 't'), { recursive: true });
-    const near = only('861', courseBody('861'), coordBody('861', {}, { 3: { backYards: 420, frontYards: 340 } }));
-    assert.equal(near.report.valid, 1);
+    // Both tees more than 15% off every card yardage (back 460, front 200 vs 380 / 340).
+    const allOff = only('861', courseBody('861'), coordBody('861', {}, { 3: { backYards: 460, frontYards: 200 }, 7: { backYards: 470, frontYards: 190 } }));
+    assert.equal(allOff.report.skipped.oct28_card_yards_15pct, 1);
+    const fail = allOff.report.checkFailures.oct28_card_yards_15pct[0];
+    assert.deepEqual(fail.holes.map((h) => h.hole), [3, 7]);
+    const measured = Object.fromEntries(fail.holes[0].tees.map((t) => [t.role, t.yards]));
+    assert.ok(Math.abs(measured.back - 460) <= 2 && Math.abs(measured.front - 200) <= 2, JSON.stringify(measured));
+    assert.deepEqual(fail.holes[0].card, [{ name: 'Blue', yards: 380 }, { name: 'Red', yards: 340 }]);
+    rmSync(join(dir, 't'), { recursive: true });
+    // Single-tee hole: only the back tee exists and it is 18% off.
+    const lone = coordBody('862');
+    lone.coordinates = lone.coordinates.filter((r) => !(r.hole === 5 && r.poi === 11));
+    for (const r of lone.coordinates) if (r.hole === 5 && r.poi === 12) r.latitude -= (70 * 0.9144) / 111_320;
+    assert.equal(only('862', courseBody('862'), lone).report.skipped.oct28_card_yards_15pct, 1);
+  });
+
+  test('card yardage is read for the same hole number (length1 is hole 1)', () => {
+    const card = courseBody('865', { parsMen: [3, ...Array(17).fill(4)] });
+    card.tees[0].length1 = 160;
+    card.tees[1].length1 = 130;
+    const coords = coordBody('865', {}, { 1: { backYards: 160, frontYards: 130 } });
+    assert.equal(only('865', card, coords).report.valid, 1);
+  });
+
+  test('2-tee order rule: a swapped back/front pair fails even when both fit', () => {
+    // Hole 2 card Blue 400 / Red 300; the 400-yd point is labelled front and the 300-yd point back.
+    const card = courseBody('863');
+    card.tees[0].length2 = 400;
+    card.tees[1].length2 = 300;
+    const inOrder = coordBody('863', {}, { 2: { backYards: 400, frontYards: 300 } });
+    assert.equal(only('863', card, inOrder).report.valid, 1);
+    rmSync(join(dir, 't'), { recursive: true });
+    const swapped = coordBody('863', {}, { 2: { backYards: 400, frontYards: 300 } });
+    for (const r of swapped.coordinates) if (r.hole === 2 && (r.poi === 11 || r.poi === 12)) r.poi = r.poi === 11 ? 12 : 11;
+    assert.equal(only('863', card, swapped).report.skipped.oct28_card_yards_15pct, 1);
+  });
+
+  test('report.md lists failing holes with measured and card yards', () => {
+    pair('t', '864', courseBody('864'), coordBody('864', {}, { 3: { backYards: 460, frontYards: 200 } }));
+    const io = cliFiles({ allow: ['864'] });
+    try {
+      const log = console.log;
+      console.log = () => {};
+      try {
+        main(io.args());
+      } finally {
+        console.log = log;
+      }
+      const md = readFileSync(join(io.dir, 'report.md'), 'utf8');
+      assert.match(md, /## 15% card-yardage failures by course/);
+      assert.match(md, /- 864 Club 864: 1 failing hole\(s\)/);
+      assert.match(md, /h3: measured (front 2\d\d, back 4\d\d|back 4\d\d, front 2\d\d) yd; card Blue 380, Red 340/);
+    } finally {
+      io.cleanup();
+    }
   });
 
   test('hole length must fit par (par 3 over 280 yd, par 5 under 380 yd)', () => {
