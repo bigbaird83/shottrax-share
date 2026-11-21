@@ -11,16 +11,21 @@ Every call uses the friends `X-Friend-Key`. The caller needs a friend code alrea
 | `POST /v1/leagues/join` | `{ code, name }` | `{ league, joined }` |
 | `GET /v1/leagues/members` | `?league=<id>` | `{ league, code, members: [{ memberId, name, role, joinedAt }] }` |
 | `GET /v1/leagues/standings` | `?league=<id>` | `{ season, rounds, rows: [{ memberId, name, rank, tied, rounds, avgNet, skins, points }] }` |
+| `POST /v1/leagues/members/remove` | `{ leagueId, memberId }` | `{ removed, league }`. Organizer only. |
+| `POST /v1/leagues/code/reset` | `{ leagueId }` | `{ code, league }`. Organizer only. |
+| `POST /v1/leagues/claims` | `{ code, spotMemberId?, name? }` | Not built yet: 501 `not_implemented` when the code lets the caller in. |
 
 - `game`: strokePlay, skins, stableford, matchPlay, nassau. `scoring`: gross or net. `carryOver` only with skins.
 - Names: 1-24 characters, spaces collapsed. `yourName` and the join `name` also set the caller's Friends name (one name per player).
 - League name: 1-32 characters (placeholder limit; the mockups give none).
 - Season dates are `YYYY-MM-DD`, start on or before end.
 - `roundDay` (optional): the weekly round day the organizer picks, an integer 0 (Sunday) to 6 (Saturday). Missing or `null` means no round day. Every `league` answer carries `roundDay` (`null` when none, including leagues made before this field). The app works out the next date in the course's local calendar.
-- Codes: friend-code alphabet and validator, 8 characters, never expire. Preview and join use the friend code guess limit (8 per key, 24 per IP per hour), but only failed or unknown-code attempts count: a successful preview or join (200) gives its guess back. A caller already at the limit gets 429 even with a valid code, until the hour window resets. If the per-IP limit refuses, the per-key slot is given back.
+- Codes: friend-code alphabet and validator, 8 characters. A code lasts until the organizer resets it; the reset deletes the old `lg:code` row, so the old code is unknown to everyone. Preview and join use the friend code guess limit (8 per key, 24 per IP per hour), but only failed or unknown-code attempts count: a successful preview or join (200) gives its guess back. A caller already at the limit gets 429 even with a valid code, until the hour window resets. If the per-IP limit refuses, the per-key slot is given back.
 - Cap: 20 players including the owner. One SQLite Durable Object per league (`LeagueRoster`) checks the cap and inserts in one transaction. Over the cap: 409 `league_full`. A repeat join is a no-op.
 - A block either way between the caller and the owner: preview and join get 404 `code_not_found`, the same as a bad code, and the guess still counts. Members and standings get 404 `not_found`, even for someone who joined before the block.
 - Members and standings: members only; anyone else gets 404.
+- Decision 8 (Brian, Nov 17 2026): a removed player rejoins only with a new code. The roster keeps the code each member was removed under (`removedUnder`, in the league's Durable Object, never KV). When that person presents that code, preview, join and claims answer 404 `code_not_found`, the same as an unknown code, and the guess counts. Anyone else can still use that code. After a reset the new code lets the removed player in. A claim whose code lets the caller in gives its guess back.
+- Remove and reset: anyone but the organizer gets 403 `forbidden`, and the organizer cannot remove themselves (403). A missing league or member is 404 `not_found`. Both share the member read limit.
 - New leagues: 30 per IP per hour. Member/standings reads: 60 per key and per IP per hour.
 - KV holds only `lg:code:<CODE>` -> league id.
 

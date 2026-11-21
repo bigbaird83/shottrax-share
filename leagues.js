@@ -10,7 +10,12 @@
  * inserts in one transaction, so two joins can never make 21.
  * KV holds only lg:code:<CODE> -> leagueId. No names, scores or members in KV.
  *
- * Not here yet (later PRs): resetting the code, removing members, the owner
+ * Decision 8 (Brian, Nov 17 2026): a removed player rejoins only with a new code.
+ * The organizer can remove a member and reset the code; the roster keeps the
+ * code each member was removed under, and that person's old code reads as an
+ * unknown code (404 code_not_found) on preview, join and claims.
+ *
+ * Not here yet (later PRs): leaving, claims beyond the decision-8 gate, the owner
  * adding friends directly, posting league rounds, and the /l/ landing page.
  * The round_results table is created now so standings has one source; nothing
  * writes it until rounds post to a league (PR 4).
@@ -87,7 +92,18 @@ const ROSTER_SCHEMA = [
     skins INTEGER,
     PRIMARY KEY (round_id, member_id)
   )`,
+  // Decision 8: the league code each removed member was removed under. Overwritten on a later removal.
+  `CREATE TABLE IF NOT EXISTS removed (
+    member_id TEXT PRIMARY KEY,
+    removed_under TEXT NOT NULL,
+    removed_at INTEGER NOT NULL
+  )`,
 ];
+
+/** Decision 8: a code lets a caller in unless it is the code they were removed under. */
+export function codeLetsIn({ code, removedUnder }) {
+  return removedUnder == null || removedUnder !== code;
+}
 
 export function isLeaguePath(pathname) {
   return pathname === "/v1/leagues" || pathname.startsWith("/v1/leagues/");
@@ -98,6 +114,9 @@ const LEAGUE_ROUTES = {
   "/v1/leagues/preview": { POST: previewLeague },
   "/v1/leagues/join": { POST: joinLeague },
   "/v1/leagues/members": { GET: listMembers },
+  "/v1/leagues/members/remove": { POST: removeMember },
+  "/v1/leagues/code/reset": { POST: resetLeagueCode },
+  "/v1/leagues/claims": { POST: claimSpot },
   "/v1/leagues/standings": { GET: getStandings },
 };
 
@@ -199,6 +218,57 @@ async function joinLeague(request, url, env, cors) {
   await saveOwnName(found.boards, found.caller, name);
   await found.refundGuess();
   return friendJson(200, { league: answer.league, joined: answer.joined }, cors);
+}
+
+/**
+ * Body { code, spotMemberId?, name? }. Claims are not built yet: this route exists so
+ * decision 8 holds on it. A code that does not let the caller in is 404 code_not_found
+ * (guess used); one that does gives the guess back and answers 501 not_implemented.
+ * Nothing is stored.
+ */
+async function claimSpot(request, url, env, cors) {
+  const found = await leagueForCode(request, env, cors, ["code", "spotMemberId", "name"]);
+  if (found.response) return found.response;
+  await found.refundGuess();
+  return friendJson(501, { error: "not_implemented" }, cors);
+}
+
+/**
+ * Body { leagueId, memberId }. Organizer only (403 forbidden otherwise); the organizer
+ * cannot remove themselves. Missing league or member: 404 not_found. The roster keeps the
+ * current code as the member's removedUnder (decision 8).
+ */
+async function removeMember(request, url, env, cors) {
+  const ready = await readyOrganizerWrite(request, env, cors, ["leagueId", "memberId"]);
+  if (ready.response) return ready.response;
+  const memberId = ready.body.memberId;
+  if (typeof memberId !== "string" || memberId.length < 1 || memberId.length > 64) {
+    return friendJson(400, { error: "invalid_body" }, cors);
+  }
+  const answer = await rosterCall(env, ready.leagueId, {
+    op: "remove",
+    now: Date.now(),
+    callerId: ready.caller.ownerId,
+    memberId,
+  });
+  if (!answer.ok) return friendJson(answer.error === "forbidden" ? 403 : 404, { error: answer.error }, cors);
+  return friendJson(200, { removed: memberId, league: answer.league }, cors);
+}
+
+/**
+ * Body { leagueId }. Organizer only. Gives the league a new code and deletes the old
+ * lg:code row, so the old code is unknown to everyone. removedUnder is kept: the new
+ * code differs, so codeLetsIn lets a removed player back in with it.
+ */
+async function resetLeagueCode(request, url, env, cors) {
+  const ready = await readyOrganizerWrite(request, env, cors, ["leagueId"]);
+  if (ready.response) return ready.response;
+  const code = await unusedLeagueCode(ready.boards);
+  const answer = await rosterCall(env, ready.leagueId, { op: "reset", callerId: ready.caller.ownerId, code });
+  if (!answer.ok) return friendJson(answer.error === "forbidden" ? 403 : 404, { error: answer.error }, cors);
+  await leaguePut(ready.boards, leagueKvKey("code", code), ready.leagueId);
+  if (answer.oldCode && answer.oldCode !== code) await leagueDelete(ready.boards, leagueKvKey("code", answer.oldCode));
+  return friendJson(200, { code, league: answer.league }, cors);
 }
 
 /** GET ?league=<id>. Members only. Names are each player's own typed name; the code is shown to any member (screen 8). */
@@ -343,9 +413,12 @@ export class LeagueRoster {
     if (op === "create") return rosterJson(this.ctx.storage.transactionSync(() => this.#create(body)));
     if (op === "join") return rosterJson(this.ctx.storage.transactionSync(() => this.#join(body)));
     if (op === "preview") return rosterJson(this.#preview(body));
+    if (op === "remove") return rosterJson(this.ctx.storage.transactionSync(() => this.#remove(body)));
+    if (op === "reset") return rosterJson(this.ctx.storage.transactionSync(() => this.#reset(body)));
     if (op === "owner") {
       const row = this.#league();
-      return rosterJson(row ? { ok: true, ownerId: row.owner_id } : { ok: false, error: "not_found" });
+      if (!row) return rosterJson({ ok: false, error: "not_found" });
+      return rosterJson({ ok: true, ownerId: row.owner_id, removedUnder: this.#removedUnder(body.callerId) });
     }
     if (op === "members") return rosterJson(this.#members(body));
     if (op === "standings") return rosterJson(this.#standings(body));
@@ -366,6 +439,18 @@ export class LeagueRoster {
   #league() {
     const rows = this.#sql("SELECT * FROM league WHERE id = 1");
     return rows.length === 1 ? rows[0] : null;
+  }
+
+  #removedUnder(memberId) {
+    if (typeof memberId !== "string") return null;
+    const rows = this.#sql("SELECT removed_under FROM removed WHERE member_id = ?", memberId);
+    return rows.length === 1 ? rows[0].removed_under : null;
+  }
+
+  #role(memberId) {
+    if (typeof memberId !== "string") return null;
+    const rows = this.#sql("SELECT role FROM member WHERE member_id = ?", memberId);
+    return rows.length === 1 ? rows[0].role : null;
   }
 
   #count() {
@@ -435,6 +520,8 @@ export class LeagueRoster {
     const row = this.#league();
     // A reset (later PR) changes league.code; an old code must not join.
     if (!row || row.code !== code) return { ok: false, error: "not_found" };
+    // Decision 8: the code this player was removed under does not let them back in.
+    if (!codeLetsIn({ code, removedUnder: this.#removedUnder(member.memberId) })) return { ok: false, error: "not_found" };
     if (this.#isMember(member.memberId)) {
       this.ctx.storage.sql.exec("UPDATE member SET name = ? WHERE member_id = ?", member.name, member.memberId);
       return { ok: true, joined: false, league: this.#publicLeague(row) };
@@ -447,6 +534,34 @@ export class LeagueRoster {
       now,
     );
     return { ok: true, joined: true, league: this.#publicLeague(row) };
+  }
+
+  /** Organizer only (canRemoveMember: actor is organizer and the member is not the owner). */
+  #remove({ callerId, memberId, now }) {
+    const row = this.#league();
+    if (!row) return { ok: false, error: "not_found" };
+    if (this.#role(callerId) !== "owner") return { ok: false, error: "forbidden" };
+    const role = this.#role(memberId);
+    if (role == null) return { ok: false, error: "not_found" };
+    if (role === "owner") return { ok: false, error: "forbidden" };
+    this.ctx.storage.sql.exec("DELETE FROM member WHERE member_id = ?", memberId);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO removed (member_id, removed_under, removed_at) VALUES (?, ?, ?)
+       ON CONFLICT(member_id) DO UPDATE SET removed_under = excluded.removed_under, removed_at = excluded.removed_at`,
+      memberId,
+      row.code,
+      now,
+    );
+    return { ok: true, league: this.#publicLeague(row) };
+  }
+
+  /** Organizer only. Answers the old code so the Worker can delete its KV row. */
+  #reset({ callerId, code }) {
+    const row = this.#league();
+    if (!row) return { ok: false, error: "not_found" };
+    if (this.#role(callerId) !== "owner") return { ok: false, error: "forbidden" };
+    this.ctx.storage.sql.exec("UPDATE league SET code = ? WHERE id = 1", code);
+    return { ok: true, oldCode: row.code, league: this.#publicLeague(this.#league()) };
   }
 
   #members({ callerId }) {
@@ -511,11 +626,31 @@ async function readyMemberRead(request, url, env, cors) {
   return { ...ready, leagueId };
 }
 
+/** Body-carrying organizer calls (remove, reset): friend key, a valid leagueId, and the member read limit. */
+async function readyOrganizerWrite(request, env, cors, allowed) {
+  const ready = await readyCaller(request, env, cors);
+  if (ready.response) return ready;
+  const parsed = await readJsonObject(request, LEAGUE_BODY_LIMIT, false);
+  if (parsed.error) return { response: friendJson(parsed.status, { error: parsed.error }, cors) };
+  if (unknownFields(parsed.value, allowed)) return { response: friendJson(400, { error: "invalid_body" }, cors) };
+  const leagueId = parsed.value.leagueId;
+  if (typeof leagueId !== "string" || !LEAGUE_ID_RE.test(leagueId)) {
+    return { response: friendJson(400, { error: "invalid_body" }, cors) };
+  }
+  const limited = await consumeReadLimit(request, env, ready.friendKey, "keylgread:", "iplgread:", cors);
+  if (limited) return { response: limited };
+  return { ...ready, body: parsed.value, leagueId };
+}
+
 async function blockedEitherWay(boards, ownerId, callerId) {
   return (await hasBlock(boards, ownerId, callerId)) || (await hasBlock(boards, callerId, ownerId));
 }
 
-/** Code entry for preview and join: the friend-code validator and guess limits. A blocked caller reads as not found. */
+/**
+ * Code entry for preview, join and claims: the friend-code validator and guess limits.
+ * A blocked caller, or a removed player presenting the code they were removed under
+ * (decision 8), reads as an unknown code and the guess is not given back.
+ */
 async function leagueForCode(request, env, cors, allowed) {
   const ready = await readyCaller(request, env, cors);
   if (ready.response) return ready;
@@ -532,10 +667,14 @@ async function leagueForCode(request, env, cors, allowed) {
   if (typeof leagueId !== "string" || !LEAGUE_ID_RE.test(leagueId)) {
     return { response: friendJson(404, { error: "code_not_found" }, cors) };
   }
-  const owner = await rosterCall(env, leagueId, { op: "owner" });
+  const owner = await rosterCall(env, leagueId, { op: "owner", callerId: ready.caller.ownerId });
   if (!owner.ok) return { response: friendJson(404, { error: "code_not_found" }, cors) };
   // A block either way (PLAN.md): same answer as a bad code, so the block is not revealed.
   if (await blockedEitherWay(ready.boards, owner.ownerId, ready.caller.ownerId)) {
+    return { response: friendJson(404, { error: "code_not_found" }, cors) };
+  }
+  // Decision 8: the same answer as an unknown code, so the removal is not revealed.
+  if (!codeLetsIn({ code, removedUnder: owner.removedUnder ?? null })) {
     return { response: friendJson(404, { error: "code_not_found" }, cors) };
   }
   return { ...ready, body: parsed.value, code, leagueId, refundGuess: guess.refund };
@@ -611,6 +750,11 @@ async function leagueGet(boards, key) {
 async function leaguePut(boards, key, value) {
   assertLeagueNamespace(key);
   await boards.put(key, value);
+}
+
+async function leagueDelete(boards, key) {
+  assertLeagueNamespace(key);
+  await boards.delete(key);
 }
 
 function rosterJson(body, status = 200) {
