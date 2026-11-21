@@ -475,6 +475,166 @@ describe("leagues", () => {
     ]);
   });
 
+  describe("decision 8: a removed player rejoins only with a new code", () => {
+    const NOT_FOUND = { status: 404, json: { error: "code_not_found" } };
+
+    async function joined(code, p, name = "Player K") {
+      const res = await call("/v1/leagues/join", { friend: p.friend, body: { code, name } });
+      expect(res.status).toBe(200);
+    }
+
+    async function remove(actor, leagueId, memberId) {
+      return call("/v1/leagues/members/remove", { friend: actor.friend, body: { leagueId, memberId } });
+    }
+
+    async function resetCode(actor, leagueId) {
+      return call("/v1/leagues/code/reset", { friend: actor.friend, body: { leagueId } });
+    }
+
+    async function removedSetup() {
+      const owner = await player(1);
+      const { code, league } = await created(owner);
+      const guest = await player(2);
+      await joined(code, guest);
+      const res = await remove(owner, league.id, guest.ownerId);
+      expect(res.status).toBe(200);
+      return { owner, code, league, guest };
+    }
+
+    it("the old code is an unknown code on preview, join and claims for the removed player", async () => {
+      const { owner, code, league, guest } = await removedSetup();
+      const members = await call(`/v1/leagues/members?league=${league.id}`, { method: "GET", friend: owner.friend });
+      expect(members.json.members.map((m) => m.memberId)).toEqual([owner.ownerId]);
+      expect(await call("/v1/leagues/preview", { friend: guest.friend, body: { code } })).toEqual(NOT_FOUND);
+      expect(await call("/v1/leagues/join", { friend: guest.friend, body: { code, name: "Player K" } })).toEqual(NOT_FOUND);
+      const claim = await call("/v1/leagues/claims", {
+        friend: guest.friend,
+        body: { code, spotMemberId: "spot-1", name: "Player K" },
+      });
+      expect(claim).toEqual(NOT_FOUND);
+      // Stored in the league's roster object, not in KV.
+      expect([...kv.keys()].filter((k) => k.startsWith("lg:"))).toEqual([`lg:code:${code}`]);
+      const stored = rosters.get(`league:${league.id}`).db.prepare("SELECT member_id, removed_under FROM removed").all();
+      expect(stored.map((r) => ({ ...r }))).toEqual([{ member_id: guest.ownerId, removed_under: code }]);
+    });
+
+    it("the same old code still works for anyone who was not removed under it", async () => {
+      const { code, league } = await removedSetup();
+      for (const n of [3, 4]) {
+        const other = await player(n);
+        const preview = await call("/v1/leagues/preview", { friend: other.friend, body: { code } });
+        expect(preview.status).toBe(200);
+        expect(preview.json.league.id).toBe(league.id);
+        const join = await call("/v1/leagues/join", { friend: other.friend, body: { code, name: `Player ${n}` } });
+        expect(join.status).toBe(200);
+        expect(join.json.joined).toBe(true);
+      }
+    });
+
+    it("after a reset the old code is unknown to everyone and the new code lets the removed player in", async () => {
+      const { owner, code, league, guest } = await removedSetup();
+      const reset = await resetCode(owner, league.id);
+      expect(reset.status).toBe(200);
+      expect(reset.json.code).toMatch(CODE_RE);
+      expect(reset.json.code).not.toBe(code);
+      const fresh = reset.json.code;
+      expect([...kv.keys()].filter((k) => k.startsWith("lg:"))).toEqual([`lg:code:${fresh}`]);
+      expect(kv.get(`lg:code:${fresh}`)).toBe(league.id);
+      const other = await player(3);
+      for (const p of [guest, other, owner]) {
+        expect(await call("/v1/leagues/preview", { friend: p.friend, body: { code } })).toEqual(NOT_FOUND);
+      }
+      expect((await call("/v1/leagues/preview", { friend: guest.friend, body: { code: fresh } })).status).toBe(200);
+      const join = await call("/v1/leagues/join", { friend: guest.friend, body: { code: fresh, name: "Player K" } });
+      expect(join.status).toBe(200);
+      expect(join.json.joined).toBe(true);
+      const claim = await call("/v1/leagues/claims", { friend: guest.friend, body: { code: fresh } });
+      expect(claim).toEqual({ status: 501, json: { error: "not_implemented" } });
+      const members = await call(`/v1/leagues/members?league=${league.id}`, { method: "GET", friend: owner.friend });
+      expect(members.json.code).toBe(fresh);
+      expect(members.json.members.map((m) => m.memberId).sort()).toEqual([owner.ownerId, guest.ownerId].sort());
+    });
+
+    it("only the organizer can reset the code", async () => {
+      const owner = await player(1);
+      const { code, league } = await created(owner);
+      const guest = await player(2);
+      await joined(code, guest);
+      expect(await resetCode(guest, league.id)).toEqual({ status: 403, json: { error: "forbidden" } });
+      expect(kv.get(`lg:code:${code}`)).toBe(league.id);
+    });
+
+    for (const route of ["preview", "join", "claims"]) {
+      it(`a decision-8 404 on ${route} uses a guess and gives none back`, async () => {
+        const { code, guest } = await removedSetup();
+        // The join in setup was a success, so all 8 guesses are left.
+        const body = route === "join" ? { code, name: "Player K" } : { code };
+        expect(await call(`/v1/leagues/${route}`, { friend: guest.friend, body })).toEqual(NOT_FOUND);
+        for (let i = 0; i < 7; i += 1) {
+          expect((await call("/v1/leagues/preview", { friend: guest.friend, body: { code: "AAAABBBB" } })).status).toBe(404);
+        }
+        expect((await call("/v1/leagues/preview", { friend: guest.friend, body: { code: "AAAABBBB" } })).status).toBe(429);
+      });
+    }
+
+    it("a claim with a code that lets the caller in gives its guess back", async () => {
+      const owner = await player(1);
+      const { code } = await created(owner);
+      const guest = await player(2);
+      const claim = await call("/v1/leagues/claims", { friend: guest.friend, body: { code, spotMemberId: "spot-1", name: "Player K" } });
+      expect(claim).toEqual({ status: 501, json: { error: "not_implemented" } });
+      for (let i = 0; i < 8; i += 1) {
+        expect((await call("/v1/leagues/preview", { friend: guest.friend, body: { code: "AAAABBBB" } })).status).toBe(404);
+      }
+      expect((await call("/v1/leagues/preview", { friend: guest.friend, body: { code: "AAAABBBB" } })).status).toBe(429);
+    });
+
+    it("a blocked caller's claim reads as an unknown code", async () => {
+      const owner = await player(1);
+      const { code } = await created(owner);
+      const guest = await player(2);
+      kv.set(`fr:block:${owner.ownerId}:${guest.ownerId}`, "1");
+      expect(await call("/v1/leagues/claims", { friend: guest.friend, body: { code } })).toEqual(NOT_FOUND);
+    });
+
+    it("only the organizer removes, never themselves, and only existing members", async () => {
+      const owner = await player(1);
+      const { code, league } = await created(owner);
+      const guest = await player(2);
+      const third = await player(3);
+      await joined(code, guest);
+      await joined(code, third, "Player L");
+      expect(await remove(guest, league.id, third.ownerId)).toEqual({ status: 403, json: { error: "forbidden" } });
+      expect(await remove(guest, league.id, owner.ownerId)).toEqual({ status: 403, json: { error: "forbidden" } });
+      expect(await remove(owner, league.id, owner.ownerId)).toEqual({ status: 403, json: { error: "forbidden" } });
+      expect(await remove(owner, league.id, "no-such-member")).toEqual({ status: 404, json: { error: "not_found" } });
+      const otherLeague = "A".repeat(22);
+      expect(await remove(owner, otherLeague, guest.ownerId)).toEqual({ status: 404, json: { error: "not_found" } });
+      const members = await call(`/v1/leagues/members?league=${league.id}`, { method: "GET", friend: owner.friend });
+      expect(members.json.members).toHaveLength(3);
+      // Nobody was removed, so the code still lets everyone in.
+      expect((await call("/v1/leagues/preview", { friend: third.friend, body: { code } })).status).toBe(200);
+    });
+
+    it("adds the removed table to a league made before decision 8", async () => {
+      const owner = await player(1);
+      const { code, league } = await created(owner);
+      const guest = await player(2);
+      await joined(code, guest);
+      const state = rosters.get(`league:${league.id}`);
+      state.db.exec("DROP TABLE removed");
+      const roster = new LeagueRoster(state, {});
+      const res = await roster.fetch(
+        new Request("https://league-roster.internal/roster", {
+          method: "POST",
+          body: JSON.stringify({ op: "remove", now: 1, callerId: owner.ownerId, memberId: guest.ownerId }),
+        }),
+      );
+      expect((await res.json()).ok).toBe(true);
+      expect(state.db.prepare("SELECT removed_under FROM removed").all().map((r) => r.removed_under)).toEqual([code]);
+    });
+  });
+
   it("unknown league routes and methods", async () => {
     expect((await call("/v1/leagues/reset", {})).status).toBe(404);
     expect((await call("/v1/leagues/members", { method: "POST", body: {} })).status).toBe(405);
