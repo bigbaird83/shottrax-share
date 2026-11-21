@@ -633,6 +633,43 @@ describe("leagues", () => {
       expect((await res.json()).ok).toBe(true);
       expect(state.db.prepare("SELECT removed_under FROM removed").all().map((r) => r.removed_under)).toEqual([code]);
     });
+
+    it("removing the same player again under a new code overwrites removed_under", async () => {
+      const { owner, league, guest } = await removedSetup();
+      const reset = await resetCode(owner, league.id);
+      expect(reset.status).toBe(200);
+      const fresh = reset.json.code;
+      await joined(fresh, guest);
+      expect((await remove(owner, league.id, guest.ownerId)).status).toBe(200);
+      expect(await call("/v1/leagues/preview", { friend: guest.friend, body: { code: fresh } })).toEqual(NOT_FOUND);
+      expect(await call("/v1/leagues/join", { friend: guest.friend, body: { code: fresh, name: "Player K" } })).toEqual(
+        NOT_FOUND,
+      );
+      const stored = rosters.get(`league:${league.id}`).db.prepare("SELECT member_id, removed_under FROM removed").all();
+      expect(stored.map((r) => ({ ...r }))).toEqual([{ member_id: guest.ownerId, removed_under: fresh }]);
+    });
+
+    it("the roster's own join refuses a removed member presenting the code they were removed under", async () => {
+      const { code, league, guest } = await removedSetup();
+      const state = rosters.get(`league:${league.id}`);
+      const roster = new LeagueRoster(state, {});
+      const res = await roster.fetch(
+        new Request("https://league-roster.internal/roster", {
+          method: "POST",
+          body: JSON.stringify({ op: "join", now: 2, code, member: { memberId: guest.ownerId, name: "Player K" } }),
+        }),
+      );
+      expect((await res.json()).ok).toBe(false);
+      const members = state.db.prepare("SELECT member_id FROM member").all().map((r) => r.member_id);
+      expect(members).not.toContain(guest.ownerId);
+    });
+
+    it("a reset keeps the removal record", async () => {
+      const { owner, code, league, guest } = await removedSetup();
+      expect((await resetCode(owner, league.id)).status).toBe(200);
+      const stored = rosters.get(`league:${league.id}`).db.prepare("SELECT member_id, removed_under FROM removed").all();
+      expect(stored.map((r) => ({ ...r }))).toEqual([{ member_id: guest.ownerId, removed_under: code }]);
+    });
   });
 
   it("unknown league routes and methods", async () => {
