@@ -41,6 +41,8 @@ export const FRIEND_GUESS_WINDOW_MS = 60 * 60 * 1000;
 export const FRIEND_CAP = 50;
 /** New leagues per IP per hour. Same number as friend code mints. */
 export const LEAGUE_CREATE_IP_LIMIT = 30;
+/** League live polling (GET /v1/leagues/rounds, about every 60 s): its own bucket, so it never eats the member/standings budget. */
+export const LEAGUE_LIVE_LIMIT = 240;
 /** Shared scorecard creates per IP per hour (shared-games.js). */
 export const SHARED_GAME_CREATE_IP_LIMIT = 30;
 /** Shared scorecard reads per key and per IP per hour. */
@@ -138,6 +140,11 @@ function limitForDurableObjectName(name) {
   if (name.startsWith("iplgnew:")) return LEAGUE_CREATE_IP_LIMIT;
   if (name.startsWith("iplgread:")) return FRIEND_READ_IP_LIMIT;
   if (name.startsWith("keylgread:")) return FRIEND_READ_KEY_LIMIT;
+  // League rounds: score writes share the shared-scorecard write budget; live polls have their own.
+  if (name.startsWith("iplgwrite:")) return SHARED_GAME_WRITE_LIMIT;
+  if (name.startsWith("keylgwrite:")) return SHARED_GAME_WRITE_LIMIT;
+  if (name.startsWith("iplglive:")) return LEAGUE_LIVE_LIMIT;
+  if (name.startsWith("keylglive:")) return LEAGUE_LIVE_LIMIT;
   // Shared scorecard (shared-games.js). These must not fall through to the 8-guess default:
   // a racing burst of score writes is larger than that.
   if (name.startsWith("ipsgnew:")) return SHARED_GAME_CREATE_IP_LIMIT;
