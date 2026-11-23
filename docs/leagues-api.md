@@ -224,7 +224,9 @@ The members list returns those four extra fields on no-app rows only; app rows s
 
 **Claimer joined while pending (Brian, Nov 23 2026).** Joining with the code doesn't touch the pending claim, and the organizer can still approve it. Approving then **merges** the spot into the claimer's existing member row. That row stays as it is (their name, role and join time). The spot's row is deleted, so there's no duplicate and the roster shrinks by one; the 20-player cap is never checked for a merge. Results, cells, history, last seen and round players/teams move exactly as above, and host-entered cells stay `host`. Declining leaves their joined spot alone.
 
-Refusals change nothing: a pending claim whose spot row is gone 404 `not_found` (the remove route can't leave one, see below); the claimer already has a row in a round the spot played 409 `conflict`.
+**A round both played (Brian, Nov 23 2026, 2:17 PM CT).** When the claimer and the spot played the same round (the claimer joined, or is a former member), approve doesn't refuse. For each round both played, the claimer's own result, cells and history are kept, and the spot's are dropped: its `round_results` row, cells, history, and its place in the round's players and teams. Standings are derived from the remaining rows, so that round is scored again without the spot. Rounds only the spot played move over as above, with host-entered cells staying `host`. There's no duplicate member row, and no cap check.
+
+The only refusal is a pending claim whose spot row is gone: 404 `not_found`, nothing changed. The remove route can't leave one, see below.
 
 **Decline (W11)**: the spot stays unclaimed and is offered again; the same person may claim again.
 
@@ -248,7 +250,7 @@ W5 (the round-started push) never goes to a no-app player. W1 takes each player'
 
 Removing a no-app player deletes the unclaimed spot and keeps its past rounds (decision 8); no `removed` row is written for a no-app id.
 
-**A pending claim on a removed spot (Brian, Nov 23 2026)** is cancelled in the same roster transaction (status `cancelled`, so no orphan claim, and approving it later is 403 `forbidden`). The claimer's `lg:claim:<ownerId>` pointer is deleted when it names that claim, so `/claims/mine` answers nulls and the claimer can claim again. The claimer, and only the claimer, gets one push, best effort: title `"{League}: claim cancelled"`, body `"{Spot}'s spot was removed, so your claim was cancelled."` (**placeholder wording, no approved mockup string yet**), data `{ kind:'league_claim_cancelled', leagueId, claimId }`. No push when the claimer and the organizer are blocked either way or the claimer has no valid token; a push failure never fails the remove. The remove answer is unchanged: `{ removed, league }`.
+**A pending claim on a removed spot (Brian, Nov 23 2026)** is cancelled in the same roster transaction (status `cancelled`, so no orphan claim, and approving it later is 403 `forbidden`). The claimer's `lg:claim:<ownerId>` pointer is deleted when it names that claim, so `/claims/mine` answers nulls and the claimer can claim again. The claimer, and only the claimer, gets one push, best effort: title the league name only (e.g. `"Saturday Crew"`), body `"The organizer removed {Spot}'s spot, so your claim was cancelled."` (Brian, Nov 23 2026, 2:17 PM CT), data `{ kind:'league_claim_cancelled', leagueId, claimId }`. It is sent **even when the claimer and the organizer are blocked either way** (Brian, same answer); the other league pushes (W5, W14) keep their block skip. No push without a valid token; a push failure never fails the remove. The app has no handler for `league_claim_cancelled` yet (a later app PR). The remove answer is unchanged: `{ removed, league }`.
 
 **Live rounds (Brian, Nov 23 2026):** remove, leave and hand-over are allowed anytime, including during a live round. Nothing blocks them and the round (players, cells, history) is not touched.
 
