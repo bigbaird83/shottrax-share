@@ -6,7 +6,7 @@
 import live from "./live-shottrax-share.js";
 import { coverageFromOverlayResponse, handleGolfProxy, GolfapiCounter, runGolfapiStockpile, STOCKPILE_CRON } from "./golf-proxy.js";
 import { FriendGuessLimiter, handleFriends, isFriendPath } from "./friends.js";
-import { LeagueRoster, handleLeagues, isLeaguePath } from "./leagues.js";
+import { LeagueRoster, handleLeagueFriendRequest, handleLeagues, isLeagueFriendRequestPath, isLeaguePath } from "./leagues.js";
 import { SharedGame, handleSharedGames, isSharedGamePath } from "./shared-games.js";
 import { handleCourseCorrections, isCourseCorrectionsPath } from "./course-corrections.js";
 
@@ -151,6 +151,12 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const { pathname } = url;
+    // The league roster's friend request lives under /v1/friends/ but needs the league roster.
+    if (isLeagueFriendRequestPath(pathname)) {
+      const cors = friendCors();
+      if (request.method === "OPTIONS") return new Response(null, { headers: cors });
+      return handleLeagueFriendRequest(request, url, env, cors);
+    }
     if (isFriendPath(pathname)) {
       const cors = friendCors();
       if (request.method === "OPTIONS") return new Response(null, { headers: cors });

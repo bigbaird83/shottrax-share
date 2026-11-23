@@ -22,8 +22,14 @@
  * of the league's point values and Add/Replace mode (decision 23: never rescore past rounds).
  * Scoring is the app's engine, ported in league-scoring.js.
  *
- * Not here yet (later PRs): leaving, claims beyond the decision-8 gate, no-app players,
- * renames, the owner adding friends directly, member handicaps, and the /l/ landing page.
+ * W-B (ShotTraxx #900 W6–W14; Brian, Nov 22 2026 "Yes, build those routes" for W16, W17 and the
+ * roster friend request): players without the app (W6), renaming them (W7), claimable spots on the
+ * preview (W8), claims (W9–W13, stored in the league's own roster object), the claim push (W14),
+ * leaving (W16: not a removal, the same code lets them back in) and handing over then leaving (W17).
+ * POST /v1/friends/request-by-member is the roster's friend request: the same rules as
+ * POST /v1/friends/requests after its code lookup (friends.js requestAfterLookup).
+ *
+ * Not here yet (later PRs): member handicaps and the /l/ landing page.
  */
 import {
   EXPO_PUSH_URL,
@@ -44,6 +50,7 @@ import {
   readFriendKey,
   readInviteName,
   readJsonObject,
+  requestAfterLookup,
   reserveGuess,
   unknownFields,
   validCourseName,
@@ -89,6 +96,16 @@ const LEAGUE_BODY_LIMIT = 2048;
 const LEAGUE_ID_RE = /^[A-Za-z0-9_-]{22}$/;
 /** A round id is its league id, "_", and 16 random characters (39 in all). */
 const ROUND_ID_RE = /^[A-Za-z0-9_-]{22}_[A-Za-z0-9_-]{16}$/;
+/** A claim id has the same shape: its league id, "_", and 16 random characters, so W10–W12 route by it. */
+const CLAIM_ID_RE = ROUND_ID_RE;
+/**
+ * A no-app player's member id: "noapp_", the league id, "_", and 16 random characters (45 in all).
+ * Never 22 characters, so it can never equal a Friends ownerId; W7 routes to the league by it.
+ */
+const NOAPP_ID_RE = /^noapp_([A-Za-z0-9_-]{22})_[A-Za-z0-9_-]{16}$/;
+const NOAPP = "noApp";
+/** The roster's friend request (App leaguesApiHttp.ts MEMBER_REQUEST_ROUTE). Routed here by entry.js. */
+export const LEAGUE_FRIEND_REQUEST_PATH = "/v1/friends/request-by-member";
 const LEAGUE_KV_PREFIX = "lg:";
 
 const ROSTER_SCHEMA = [
@@ -181,6 +198,17 @@ const ROSTER_SCHEMA = [
     removed_under TEXT NOT NULL,
     removed_at INTEGER NOT NULL
   )`,
+  // W9–W13: claims on this league's no-app spots. Never deleted; the status changes once.
+  `CREATE TABLE IF NOT EXISTS claim (
+    claim_id TEXT PRIMARY KEY,
+    spot_member_id TEXT NOT NULL,
+    spot_name TEXT NOT NULL,
+    claimer_id TEXT NOT NULL,
+    claimer_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    decided_at INTEGER
+  )`,
 ];
 
 /** Decision 8: a code lets a caller in unless it is the code they were removed under. */
@@ -198,8 +226,16 @@ const LEAGUE_ROUTES = {
   "/v1/leagues/join": { POST: joinLeague },
   "/v1/leagues/members": { GET: listMembers },
   "/v1/leagues/members/remove": { POST: removeMember },
+  "/v1/leagues/members/no-app": { POST: addNoAppPlayer },
+  "/v1/leagues/members/rename": { POST: renameNoAppPlayer },
+  "/v1/leagues/members/leave": { POST: leaveLeague },
+  "/v1/leagues/members/handover": { POST: handOverAndLeave },
   "/v1/leagues/code/reset": { POST: resetLeagueCode },
-  "/v1/leagues/claims": { POST: claimSpot },
+  "/v1/leagues/claims": { POST: claimSpot, GET: listClaims },
+  "/v1/leagues/claims/mine": { GET: myLatestClaim },
+  "/v1/leagues/claims/approve": { POST: claimAction("approve") },
+  "/v1/leagues/claims/decline": { POST: claimAction("decline") },
+  "/v1/leagues/claims/cancel": { POST: claimAction("cancel") },
   "/v1/leagues/standings": { GET: getStandings },
   "/v1/leagues/rounds": { POST: startRound, GET: liveRound },
   "/v1/leagues/rounds/score": { POST: scoreRound },
@@ -214,6 +250,17 @@ export async function handleLeagues(request, url, env, cors) {
   const handler = route[request.method];
   if (!handler) return friendJson(405, { error: "method_not_allowed" }, cors);
   return handler(request, url, env, cors);
+}
+
+export function isLeagueFriendRequestPath(pathname) {
+  return pathname === LEAGUE_FRIEND_REQUEST_PATH;
+}
+
+/** POST /v1/friends/request-by-member (entry.js sends that one path here, ahead of friends.js). */
+export async function handleLeagueFriendRequest(request, url, env, cors) {
+  if (!isLeagueFriendRequestPath(url.pathname)) return null;
+  if (request.method !== "POST") return friendJson(405, { error: "method_not_allowed" }, cors);
+  return requestByMember(request, url, env, cors);
 }
 
 /**
@@ -292,14 +339,27 @@ async function createLeague(request, url, env, cors) {
   return friendJson(200, { league: answer.league, code }, cors);
 }
 
-/** Body { code }. Screen 9 step 2 / screen 12: name, owner's name, course, count / 20, season. No member list. */
+/**
+ * Body { code }. Screen 9 step 2 / screen 12: name, owner's name, course, count / 20, season. No member list.
+ * W8: `spots` lists the unclaimed no-app spots without a pending claim (screen 15). It is sent only
+ * when there is at least one, so a league without any answers { league } exactly as before.
+ */
 async function previewLeague(request, url, env, cors) {
   const found = await leagueForCode(request, env, cors, ["code"]);
   if (found.response) return found.response;
   const answer = await rosterCall(env, found.leagueId, { op: "preview", callerId: found.caller.ownerId });
   if (!answer.ok) return friendJson(404, { error: "code_not_found" }, cors);
   await found.refundGuess();
-  return friendJson(200, { league: answer.league }, cors);
+  const spots = [];
+  for (const spot of answer.spots || []) {
+    spots.push({
+      memberId: spot.memberId,
+      name: spot.name,
+      addedByName: await adderName(found.boards, spot),
+      addedAt: spot.addedAt,
+    });
+  }
+  return friendJson(200, spots.length > 0 ? { league: answer.league, spots } : { league: answer.league }, cors);
 }
 
 /**
@@ -327,16 +387,242 @@ async function joinLeague(request, url, env, cors) {
 }
 
 /**
- * Body { code, spotMemberId?, name? }. Claims are not built yet: this route exists so
- * decision 8 holds on it. A code that does not let the caller in is 404 code_not_found
- * (guess used); one that does gives the guess back and answers 501 not_implemented.
- * Nothing is stored.
+ * W9. Body { code, spotMemberId, name }. The same code lookup, removed-under check (decision 8)
+ * and guess buckets as join: a code that does not let the caller in is 404 code_not_found (guess
+ * used); one that does gives the guess back. The claimer is NOT a member while the claim is pending.
+ * Refusals, in the app's claimRefusal order: 400 name_required, 409 already_member, 400 invalid_body
+ * (not a no-app spot), 409 already_pending (one pending claim per person, across leagues), 409
+ * spot_pending. Stores the claim in the league's roster and the caller's lg:claim:<ownerId> pointer
+ * (for /claims/mine), then sends the claim push (W14), best effort.
  */
 async function claimSpot(request, url, env, cors) {
   const found = await leagueForCode(request, env, cors, ["code", "spotMemberId", "name"]);
   if (found.response) return found.response;
   await found.refundGuess();
-  return friendJson(501, { error: "not_implemented" }, cors);
+  const name = cleanPlayerName(found.body.name);
+  if (!name) return friendJson(400, { error: "name_required" }, cors);
+  const spotMemberId = found.body.spotMemberId;
+  if (typeof spotMemberId !== "string" || spotMemberId.length < 1 || spotMemberId.length > 64) {
+    return friendJson(400, { error: "invalid_body" }, cors);
+  }
+  const claimerId = found.caller.ownerId;
+  // One pending claim per person: the pointer names their latest claim, which is the only one that
+  // can still be pending (a new claim is refused while it is). This league's own claims are checked
+  // inside the roster's transaction.
+  let pendingElsewhere = false;
+  const latest = await leagueGet(found.boards, leagueKvKey("claim", claimerId));
+  const latestLeague = leagueIdOfClaim(latest);
+  if (latestLeague && latestLeague !== found.leagueId) {
+    const other = await rosterCall(env, latestLeague, { op: "claimGet", claimId: latest });
+    pendingElsewhere = other.ok === true && other.claim.claimerId === claimerId && other.claim.status === "pending";
+  }
+  const claimId = `${found.leagueId}_${randomOwnerId().slice(0, 16)}`;
+  const answer = await rosterCall(env, found.leagueId, {
+    op: "claim",
+    now: Date.now(),
+    code: found.code,
+    claimId,
+    claimerId,
+    claimerName: name,
+    spotMemberId,
+    pendingElsewhere,
+  });
+  if (!answer.ok) {
+    if (answer.error === "not_found") return friendJson(404, { error: "code_not_found" }, cors);
+    return friendJson(memberErrorStatus(answer.error), { error: answer.error }, cors);
+  }
+  await leaguePut(found.boards, leagueKvKey("claim", claimerId), claimId);
+  try {
+    await sendClaimPush(env, found.boards, answer.push);
+  } catch {
+    // Best effort (W14): the claim is already stored.
+  }
+  return friendJson(200, { claim: answer.claim }, cors);
+}
+
+/**
+ * W10 approve / W11 decline (organizer) and W12 cancel (the claimer). Body { claimId }. The claim id
+ * names its league. A claim that is not pending, or a caller who may not act, is 403 forbidden; an
+ * unknown claim is 404 not_found. W10 is one roster transaction: the spot's member row becomes the
+ * claimer, and the spot's id is rewritten to the claimer's everywhere in the league (results, cells,
+ * history, last seen, round players and teams). Approving a spot that is gone is 404 and changes nothing.
+ */
+function claimAction(action) {
+  return async function claimActionRoute(request, url, env, cors) {
+    const ready = await readyCaller(request, env, cors);
+    if (ready.response) return ready.response;
+    const parsed = await readJsonObject(request, LEAGUE_BODY_LIMIT, false);
+    if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+    if (unknownFields(parsed.value, ["claimId"]) || typeof parsed.value.claimId !== "string") {
+      return friendJson(400, { error: "invalid_body" }, cors);
+    }
+    const limited = await consumeReadLimit(request, env, ready.friendKey, "keylgread:", "iplgread:", cors);
+    if (limited) return limited;
+    const leagueId = leagueIdOfClaim(parsed.value.claimId);
+    if (!leagueId) return friendJson(404, { error: "not_found" }, cors);
+    const answer = await rosterCall(env, leagueId, {
+      op: "claimAction",
+      action,
+      now: Date.now(),
+      callerId: ready.caller.ownerId,
+      claimId: parsed.value.claimId,
+    });
+    if (!answer.ok) return friendJson(memberErrorStatus(answer.error), { error: answer.error }, cors);
+    return friendJson(200, { claim: answer.claim }, cors);
+  };
+}
+
+/** W13. GET ?league=<id>. Organizer only (403 forbidden): every claim on the league, pending first. */
+async function listClaims(request, url, env, cors) {
+  const ready = await readyMemberRead(request, url, env, cors);
+  if (ready.response) return ready.response;
+  const answer = await rosterCall(env, ready.leagueId, { op: "claims", callerId: ready.caller.ownerId });
+  if (!answer.ok) return friendJson(memberErrorStatus(answer.error), { error: answer.error }, cors);
+  return friendJson(200, { claims: answer.claims }, cors);
+}
+
+/**
+ * W13. GET /v1/leagues/claims/mine. The caller's latest claim (any status) and the league it is in,
+ * in the preview's shape (no owner id), or { claim: null, league: null }. Read from the caller's
+ * lg:claim:<ownerId> pointer, then the league's roster.
+ */
+async function myLatestClaim(request, url, env, cors) {
+  const ready = await readyCaller(request, env, cors);
+  if (ready.response) return ready.response;
+  if ([...url.searchParams.keys()].length > 0) return friendJson(400, { error: "invalid_body" }, cors);
+  const limited = await consumeReadLimit(request, env, ready.friendKey, "keylgread:", "iplgread:", cors);
+  if (limited) return limited;
+  const none = friendJson(200, { claim: null, league: null }, cors);
+  const claimId = await leagueGet(ready.boards, leagueKvKey("claim", ready.caller.ownerId));
+  const leagueId = leagueIdOfClaim(claimId);
+  if (!leagueId) return none;
+  const answer = await rosterCall(env, leagueId, { op: "claimGet", claimId });
+  if (!answer.ok || answer.claim.claimerId !== ready.caller.ownerId) return none;
+  return friendJson(200, { claim: answer.claim, league: answer.league }, cors);
+}
+
+/**
+ * W6. Body { leagueId, name }. Any member adds a player without the app (decision 2). The id is
+ * made here (NOAPP_ID_RE). No-app rows count toward the 20 (decision 5), checked in the roster's
+ * transaction: 409 league_full. 403 forbidden for a non-member, 400 name_required for a bad name.
+ */
+async function addNoAppPlayer(request, url, env, cors) {
+  const ready = await readyMemberWrite(request, env, cors, ["leagueId", "name"]);
+  if (ready.response) return ready.response;
+  const answer = await rosterCall(env, ready.leagueId, {
+    op: "noAppAdd",
+    now: Date.now(),
+    callerId: ready.caller.ownerId,
+    memberId: `noapp_${ready.leagueId}_${randomOwnerId().slice(0, 16)}`,
+    name: cleanPlayerName(ready.body.name),
+  });
+  if (!answer.ok) return friendJson(memberErrorStatus(answer.error), { error: answer.error }, cors);
+  return friendJson(200, { member: await publicMember(ready.boards, answer.member) }, cors);
+}
+
+/**
+ * W7. Body { memberId, name }. A no-app player only; the organizer or the member who added them
+ * (decision 10), else 403 forbidden. The member id names its league; an id that names no no-app
+ * spot is 404 not_found.
+ */
+async function renameNoAppPlayer(request, url, env, cors) {
+  const ready = await readyCaller(request, env, cors);
+  if (ready.response) return ready.response;
+  const parsed = await readJsonObject(request, LEAGUE_BODY_LIMIT, false);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  const body = parsed.value;
+  if (unknownFields(body, ["memberId", "name"]) || typeof body.memberId !== "string") return friendJson(400, { error: "invalid_body" }, cors);
+  const limited = await consumeReadLimit(request, env, ready.friendKey, "keylgread:", "iplgread:", cors);
+  if (limited) return limited;
+  const leagueId = leagueIdOfNoApp(body.memberId);
+  if (!leagueId || (await ownerBlocked(env, ready, leagueId))) return friendJson(404, { error: "not_found" }, cors);
+  const answer = await rosterCall(env, leagueId, {
+    op: "noAppRename",
+    callerId: ready.caller.ownerId,
+    memberId: body.memberId,
+    name: cleanPlayerName(body.name),
+  });
+  if (!answer.ok) return friendJson(memberErrorStatus(answer.error), { error: answer.error }, cors);
+  return friendJson(200, { member: await publicMember(ready.boards, answer.member) }, cors);
+}
+
+/**
+ * W16. Body { leagueId }. Any member except the organizer (403 forbidden: decision 8, hand over
+ * first). Deletes the caller's member row only: no removed row, so the same code lets them back in
+ * (screen 10: "You can rejoin with the league code"), and their past rounds stay in the standings.
+ * Not a member, no league, or blocked either way with the owner: 404 not_found.
+ */
+async function leaveLeague(request, url, env, cors) {
+  const ready = await readyMemberWrite(request, env, cors, ["leagueId"]);
+  if (ready.response) return ready.response;
+  const answer = await rosterCall(env, ready.leagueId, { op: "leave", callerId: ready.caller.ownerId });
+  if (!answer.ok) return friendJson(memberErrorStatus(answer.error), { error: answer.error }, cors);
+  return friendJson(200, { left: ready.caller.ownerId }, cors);
+}
+
+/**
+ * W17. Body { leagueId, memberId }. The organizer hands over to a current member with the app
+ * (decision 5: no-app players can't be organizer) and leaves, in one roster transaction. 403 when
+ * the caller is not the organizer; 404 when the target is not a current member; 400 when the target
+ * is the caller or a no-app player. No removed row; rounds and results are not touched.
+ * Answers { left, league } with the league after the change (new ownerId / ownerName).
+ */
+async function handOverAndLeave(request, url, env, cors) {
+  const ready = await readyOrganizerWrite(request, env, cors, ["leagueId", "memberId"]);
+  if (ready.response) return ready.response;
+  const memberId = ready.body.memberId;
+  if (typeof memberId !== "string" || memberId.length < 1 || memberId.length > 64 || memberId === ready.caller.ownerId) {
+    return friendJson(400, { error: "invalid_body" }, cors);
+  }
+  const answer = await rosterCall(env, ready.leagueId, { op: "handover", callerId: ready.caller.ownerId, memberId });
+  if (!answer.ok) return friendJson(memberErrorStatus(answer.error), { error: answer.error }, cors);
+  return friendJson(200, { left: ready.caller.ownerId, league: answer.league }, cors);
+}
+
+/**
+ * POST /v1/friends/request-by-member. Body { league, memberId } (the app's body exactly). Both the
+ * caller and the target must be current members of the league, and the target must have the app.
+ * Then exactly POST /v1/friends/requests after its code lookup (requestAfterLookup), answered as the
+ * app's outcomes. Uses no friend-code guess: the league read buckets limit it.
+ */
+async function requestByMember(request, url, env, cors) {
+  const ready = await readyCaller(request, env, cors);
+  if (ready.response) return ready.response;
+  const parsed = await readJsonObject(request, LEAGUE_BODY_LIMIT, false);
+  if (parsed.error) return friendJson(parsed.status, { error: parsed.error }, cors);
+  const body = parsed.value;
+  if (unknownFields(body, ["league", "memberId"])) return friendJson(400, { error: "invalid_body" }, cors);
+  if (typeof body.league !== "string" || !LEAGUE_ID_RE.test(body.league)) return friendJson(400, { error: "invalid_body" }, cors);
+  if (typeof body.memberId !== "string" || body.memberId.length < 1 || body.memberId.length > 64) {
+    return friendJson(400, { error: "invalid_body" }, cors);
+  }
+  const callerId = ready.caller.ownerId;
+  if (body.memberId === callerId) return friendJson(400, { error: "invalid_body" }, cors);
+  const limited = await consumeReadLimit(request, env, ready.friendKey, "keylgread:", "iplgread:", cors);
+  if (limited) return limited;
+  if (await ownerBlocked(env, ready, body.league)) return friendJson(404, { error: "not_found" }, cors);
+  const pair = await rosterCall(env, body.league, { op: "memberPair", callerId, memberId: body.memberId });
+  if (!pair.ok) return friendJson(memberErrorStatus(pair.error), { error: pair.error }, cors);
+  const outcome = await requestAfterLookup(ready.boards, callerId, body.memberId);
+  if (outcome === "blocked") return friendJson(409, { error: "blocked" }, cors);
+  return friendJson(200, { outcome: MEMBER_REQUEST_OUTCOMES[outcome] }, cors);
+}
+
+/** requestAfterLookup → the app's MemberRequestOutcome. A quiet block reads as sent. */
+const MEMBER_REQUEST_OUTCOMES = Object.freeze({
+  sent: "sent",
+  quiet: "sent",
+  outgoing: "already_sent",
+  friends: "already_friends",
+  incoming: "they_asked",
+});
+
+/** Status per roster refusal for the W-B routes. */
+function memberErrorStatus(error) {
+  if (error === "forbidden") return 403;
+  if (error === "not_found") return 404;
+  if (["league_full", "already_member", "already_pending", "spot_pending", "conflict"].includes(error)) return 409;
+  return 400;
 }
 
 /**
@@ -358,6 +644,17 @@ async function removeMember(request, url, env, cors) {
     memberId,
   });
   if (!answer.ok) return friendJson(answer.error === "forbidden" ? 403 : 404, { error: answer.error }, cors);
+  // Brian, Nov 23 2026: removing a no-app spot cancels its pending claim. The claimer's pointer is
+  // cleared when it names that claim, and the claimer (only) is told, best effort.
+  for (const cancelled of answer.cancelledClaims || []) {
+    const pointer = leagueKvKey("claim", cancelled.claimerId);
+    if ((await leagueGet(ready.boards, pointer)) === cancelled.claimId) await leagueDelete(ready.boards, pointer);
+    try {
+      await sendClaimCancelledPush(env, ready.boards, cancelled);
+    } catch {
+      // Best effort: the removal and the cancel are already stored.
+    }
+  }
   return friendJson(200, { removed: memberId, league: answer.league }, cors);
 }
 
@@ -384,11 +681,7 @@ async function listMembers(request, url, env, cors) {
   const answer = await rosterCall(env, ready.leagueId, { op: "members", callerId: ready.caller.ownerId });
   if (!answer.ok) return friendJson(404, { error: "not_found" }, cors);
   const members = [];
-  for (const member of answer.members) {
-    // One name per player: a later Friends name change shows here too.
-    const current = readInviteName(await friendGet(ready.boards, friendKvKey("ownname", member.memberId)));
-    members.push({ ...member, name: current || member.name });
-  }
+  for (const member of answer.members) members.push(await publicMember(ready.boards, member));
   return friendJson(200, { league: answer.league, code: answer.code, members }, cors);
 }
 
@@ -400,7 +693,8 @@ async function getStandings(request, url, env, cors) {
   if (!answer.ok) return friendJson(404, { error: "not_found" }, cors);
   const names = new Map();
   for (const member of answer.members) {
-    const current = readInviteName(await friendGet(ready.boards, friendKvKey("ownname", member.memberId)));
+    // A no-app id is not a Friends account: its roster name is its only name.
+    const current = member.kind === NOAPP ? null : readInviteName(await friendGet(ready.boards, friendKvKey("ownname", member.memberId)));
     names.set(member.memberId, current || member.name);
   }
   const table = leagueStandings({
@@ -700,6 +994,43 @@ function leagueIdOfRound(roundId) {
   return typeof roundId === "string" && ROUND_ID_RE.test(roundId) ? roundId.slice(0, 22) : null;
 }
 
+function leagueIdOfClaim(claimId) {
+  return typeof claimId === "string" && CLAIM_ID_RE.test(claimId) ? claimId.slice(0, 22) : null;
+}
+
+function leagueIdOfNoApp(memberId) {
+  const match = typeof memberId === "string" ? NOAPP_ID_RE.exec(memberId) : null;
+  return match ? match[1] : null;
+}
+
+/**
+ * A members-list row. App rows are exactly as before (memberId, name, role, joinedAt; the name is
+ * the player's current Friends name). No-app rows add kind, addedBy, addedByName and addedAt.
+ */
+async function publicMember(boards, member) {
+  if (member.kind !== NOAPP) {
+    // One name per player: a later Friends name change shows here too.
+    const current = readInviteName(await friendGet(boards, friendKvKey("ownname", member.memberId)));
+    return { memberId: member.memberId, name: current || member.name, role: member.role, joinedAt: member.joinedAt };
+  }
+  return {
+    memberId: member.memberId,
+    name: member.name,
+    role: member.role,
+    joinedAt: member.joinedAt,
+    kind: NOAPP,
+    addedBy: member.addedBy,
+    addedByName: await adderName(boards, member),
+    addedAt: member.addedAt,
+  };
+}
+
+/** The adder's current Friends name, else their roster name, else null (they left). */
+async function adderName(boards, spot) {
+  const current = typeof spot.addedBy === "string" ? readInviteName(await friendGet(boards, friendKvKey("ownname", spot.addedBy))) : null;
+  return current || spot.adderRosterName || null;
+}
+
 /** Status per refusal, as the app's fake Worker maps them. */
 function roundErrorStatus(error) {
   if (error === "forbidden" || error === "host_entered") return 403;
@@ -721,8 +1052,9 @@ async function readyLeague(request, env, cors, ready, leagueId, keyPrefix, ipPre
 
 /**
  * W5, best effort after W1 is stored (the same pattern as shared-games sendInvitePushes): every
- * member except the starter, skipping anyone blocked either way with the starter and anyone with
- * no valid push token. The data is ids only.
+ * member with the app except the starter (the roster leaves no-app players out of memberIds),
+ * skipping anyone blocked either way with the starter and anyone with no valid push token.
+ * The data is ids only.
  */
 async function sendRoundStartPushes(env, boards, push) {
   if (!push || !Array.isArray(push.memberIds)) return;
@@ -743,6 +1075,53 @@ async function sendRoundStartPushes(env, boards, push) {
       data: { kind: "league_round_start", leagueId: push.leagueId, roundId: push.roundId },
     });
   }
+  await postExpo(env, messages);
+}
+
+/**
+ * W14, best effort after W9 is stored: one push to the organizer only (the league's owner when the
+ * claim was stored). None when either has blocked the other or the organizer has no valid push
+ * token. Title and body are the app's approved 18c strings (leagueCopy.ts leagueClaimPushTitle /
+ * leagueClaimPushBody); the data is ids only.
+ */
+async function sendClaimPush(env, boards, push) {
+  if (!push || typeof push.ownerId !== "string") return;
+  if (push.ownerId === push.claimerId) return;
+  if (await blockedEitherWay(boards, push.ownerId, push.claimerId)) return;
+  const token = await friendGet(boards, friendKvKey("push", push.ownerId));
+  if (typeof token !== "string" || !PUSH_TOKEN_RE.test(token)) return;
+  await postExpo(env, [
+    {
+      to: token,
+      title: `${push.leagueName}: claim request`,
+      body: `${push.claimerName} wants to claim ${push.spotName}'s spot. Tap to review.`,
+      sound: "default",
+      data: { kind: "league_claim_request", leagueId: push.leagueId, claimId: push.claimId },
+    },
+  ]);
+}
+
+/**
+ * Brian, Nov 23 2026: the organizer removed a no-app spot that had a pending claim. One push to the
+ * claimer only, none without a valid token. Sent even when the claimer and the organizer are
+ * blocked either way (Brian, Nov 23, 2:17 PM CT); the other league pushes keep their block skip.
+ * Title: the league name only. Body: Brian's wording, 2:17 PM CT.
+ */
+async function sendClaimCancelledPush(env, boards, cancelled) {
+  const token = await friendGet(boards, friendKvKey("push", cancelled.claimerId));
+  if (typeof token !== "string" || !PUSH_TOKEN_RE.test(token)) return;
+  await postExpo(env, [
+    {
+      to: token,
+      title: cancelled.leagueName,
+      body: `The organizer removed ${cancelled.spotName}'s spot, so your claim was cancelled.`,
+      sound: "default",
+      data: { kind: "league_claim_cancelled", leagueId: cancelled.leagueId, claimId: cancelled.claimId },
+    },
+  ]);
+}
+
+async function postExpo(env, messages) {
   if (messages.length === 0) return;
   const headers = { "Content-Type": "application/json", Accept: "application/json" };
   if (env && typeof env.EXPO_ACCESS_TOKEN === "string" && env.EXPO_ACCESS_TOKEN.length > 0) {
@@ -751,7 +1130,7 @@ async function sendRoundStartPushes(env, boards, push) {
   try {
     await fetch(EXPO_PUSH_URL, { method: "POST", headers, body: JSON.stringify(messages) });
   } catch {
-    // Best effort: the round is already stored.
+    // Best effort: what the push is about is already stored.
   }
 }
 
@@ -885,6 +1264,15 @@ export class LeagueRoster {
     if (op === "roundLive") return rosterJson(this.ctx.storage.transactionSync(() => this.#roundLive(body)));
     if (op === "roundFinish") return rosterJson(this.ctx.storage.transactionSync(() => this.#roundFinishOp(body)));
     if (op === "settings") return rosterJson(this.ctx.storage.transactionSync(() => this.#settings(body)));
+    if (op === "noAppAdd") return rosterJson(this.ctx.storage.transactionSync(() => this.#noAppAdd(body)));
+    if (op === "noAppRename") return rosterJson(this.ctx.storage.transactionSync(() => this.#noAppRename(body)));
+    if (op === "leave") return rosterJson(this.ctx.storage.transactionSync(() => this.#leave(body)));
+    if (op === "handover") return rosterJson(this.ctx.storage.transactionSync(() => this.#handover(body)));
+    if (op === "memberPair") return rosterJson(this.#memberPair(body));
+    if (op === "claim") return rosterJson(this.ctx.storage.transactionSync(() => this.#claim(body)));
+    if (op === "claimAction") return rosterJson(this.ctx.storage.transactionSync(() => this.#claimAction(body)));
+    if (op === "claimGet") return rosterJson(this.#claimGet(body));
+    if (op === "claims") return rosterJson(this.#claims(body));
     return rosterJson({ ok: false, error: "invalid_body" }, 400);
   }
 
@@ -896,6 +1284,11 @@ export class LeagueRoster {
     // Leagues made before game points (W-C): null = the defaults, and Add.
     if (!columns.includes("game_points")) this.ctx.storage.sql.exec("ALTER TABLE league ADD COLUMN game_points TEXT");
     if (!columns.includes("points_mode")) this.ctx.storage.sql.exec("ALTER TABLE league ADD COLUMN points_mode TEXT");
+    // No-app players (W6): null kind = an app member, so every older row reads as one. Additive only.
+    const memberColumns = this.#sql("SELECT name FROM pragma_table_info('member')").map((c) => c.name);
+    if (!memberColumns.includes("kind")) this.ctx.storage.sql.exec("ALTER TABLE member ADD COLUMN kind TEXT");
+    if (!memberColumns.includes("added_by")) this.ctx.storage.sql.exec("ALTER TABLE member ADD COLUMN added_by TEXT");
+    if (!memberColumns.includes("added_at")) this.ctx.storage.sql.exec("ALTER TABLE member ADD COLUMN added_at INTEGER");
   }
 
   /**
@@ -937,6 +1330,29 @@ export class LeagueRoster {
 
   #isMember(memberId) {
     return typeof memberId === "string" && this.#sql("SELECT member_id FROM member WHERE member_id = ?", memberId).length === 1;
+  }
+
+  /** The member row with the adder's roster name, or null. */
+  #memberRow(memberId) {
+    if (typeof memberId !== "string") return null;
+    const rows = this.#sql(
+      "SELECT m.*, a.name AS adder_name FROM member m LEFT JOIN member a ON a.member_id = m.added_by WHERE m.member_id = ?",
+      memberId,
+    );
+    return rows.length === 1 ? rows[0] : null;
+  }
+
+  /** A member row for the Worker. App rows carry the four fields they always had. */
+  #memberOut(m) {
+    const out = { memberId: m.member_id, name: m.name, role: m.role, joinedAt: Number(m.joined_at) };
+    if (m.kind !== NOAPP) return out;
+    return {
+      ...out,
+      kind: NOAPP,
+      addedBy: m.added_by ?? null,
+      addedAt: m.added_at == null ? null : Number(m.added_at),
+      adderRosterName: m.adder_name ?? null,
+    };
   }
 
   #publicLeague(row) {
@@ -993,9 +1409,18 @@ export class LeagueRoster {
     const row = this.#league();
     if (!row) return { ok: false, error: "not_found" };
     const league = this.#publicLeague(row);
-    // The preview is for joining: no owner id, no member list.
+    // The preview is for joining: no owner id, no member list. W8: the claimable no-app spots only.
     delete league.ownerId;
-    return { ok: true, league };
+    const spots = this.#sql(
+      `SELECT m.*, a.name AS adder_name FROM member m LEFT JOIN member a ON a.member_id = m.added_by
+       WHERE m.kind = ? AND NOT EXISTS (SELECT 1 FROM claim c WHERE c.spot_member_id = m.member_id AND c.status = 'pending')
+       ORDER BY m.joined_at, m.member_id`,
+      NOAPP,
+    ).map((m) => {
+      const out = this.#memberOut(m);
+      return { memberId: out.memberId, name: out.name, addedBy: out.addedBy, adderRosterName: out.adderRosterName, addedAt: out.addedAt };
+    });
+    return { ok: true, league, spots };
   }
 
   #join({ code, member, now }) {
@@ -1026,7 +1451,27 @@ export class LeagueRoster {
     const role = this.#role(memberId);
     if (role == null) return { ok: false, error: "not_found" };
     if (role === "owner") return { ok: false, error: "forbidden" };
+    const noApp = this.#memberRow(memberId).kind === NOAPP;
     this.ctx.storage.sql.exec("DELETE FROM member WHERE member_id = ?", memberId);
+    // Decision 8: removing a no-app player deletes the unclaimed spot; its round_results stay.
+    // Nobody can present a code as a no-app id, so no removed row is written for one.
+    // Brian, Nov 23 2026: a pending claim on the spot is cancelled with it (no orphan claim).
+    if (noApp) {
+      const cancelledClaims = this.#sql("SELECT * FROM claim WHERE spot_member_id = ? AND status = 'pending'", memberId).map((c) => ({
+        claimId: c.claim_id,
+        claimerId: c.claimer_id,
+        spotName: c.spot_name,
+        organizerId: callerId,
+        leagueId: row.league_id,
+        leagueName: row.name,
+      }));
+      this.ctx.storage.sql.exec(
+        "UPDATE claim SET status = 'cancelled', decided_at = ? WHERE spot_member_id = ? AND status = 'pending'",
+        now,
+        memberId,
+      );
+      return { ok: true, league: this.#publicLeague(row), cancelledClaims };
+    }
     this.ctx.storage.sql.exec(
       `INSERT INTO removed (member_id, removed_under, removed_at) VALUES (?, ?, ?)
        ON CONFLICT(member_id) DO UPDATE SET removed_under = excluded.removed_under, removed_at = excluded.removed_at`,
@@ -1049,16 +1494,21 @@ export class LeagueRoster {
   #members({ callerId }) {
     const row = this.#league();
     if (!row || !this.#isMember(callerId)) return { ok: false, error: "not_found" };
-    const members = this.#sql("SELECT member_id, name, role, joined_at FROM member ORDER BY joined_at, member_id").map(
-      (m) => ({ memberId: m.member_id, name: m.name, role: m.role, joinedAt: Number(m.joined_at) }),
-    );
+    const members = this.#sql(
+      `SELECT m.*, a.name AS adder_name FROM member m LEFT JOIN member a ON a.member_id = m.added_by
+       ORDER BY m.joined_at, m.member_id`,
+    ).map((m) => this.#memberOut(m));
     return { ok: true, league: this.#publicLeague(row), code: row.code, members };
   }
 
   #standings({ callerId }) {
     const row = this.#league();
     if (!row || !this.#isMember(callerId)) return { ok: false, error: "not_found" };
-    const members = this.#sql("SELECT member_id, name FROM member").map((m) => ({ memberId: m.member_id, name: m.name }));
+    const members = this.#sql("SELECT member_id, name, kind FROM member").map((m) => ({
+      memberId: m.member_id,
+      name: m.name,
+      ...(m.kind === NOAPP ? { kind: NOAPP } : {}),
+    }));
     const byRound = new Map();
     for (const r of this.#sql("SELECT * FROM round_results ORDER BY round_id, member_id")) {
       let round = byRound.get(r.round_id);
@@ -1135,16 +1585,18 @@ export class LeagueRoster {
     if (!this.#isMember(callerId)) return { ok: false, error: "forbidden" };
     // Decision 1: one live round per league, checked inside this transaction.
     if (this.#sql("SELECT round_id FROM league_round WHERE finished = 0 LIMIT 1").length > 0) return { ok: false, error: "round_live" };
-    const roster = new Map(this.#sql("SELECT member_id, name FROM member").map((m) => [m.member_id, m.name]));
+    const rosterRows = this.#sql("SELECT member_id, name, kind FROM member");
+    const roster = new Map(rosterRows.map((m) => [m.member_id, m.name]));
+    const noApp = new Set(rosterRows.filter((m) => m.kind === NOAPP).map((m) => m.member_id));
     if (start.players.some((p) => !roster.has(p.memberId))) return { ok: false, error: "invalid_body" };
-    // Names and kind from the roster, never the body. Every member has the app until no-app players (W-B).
+    // Names and kind from the roster, never the body. A no-app player is always host-entered (as the app's fake).
     const players = start.players.map((p) => ({
       memberId: p.memberId,
       name: roster.get(p.memberId),
-      kind: "app",
+      kind: noApp.has(p.memberId) ? NOAPP : "app",
       groupNo: p.groupNo,
       courseHandicap: p.courseHandicap,
-      hostEnters: p.hostEnters,
+      hostEnters: noApp.has(p.memberId) ? true : p.hostEnters,
     }));
     this.ctx.storage.sql.exec(
       `INSERT INTO league_round (round_id, host_id, started_at, played_on, course, holes, game, scoring, carry_over, teams_mode, teams, players, game_points, points_mode, finished, finished_at)
@@ -1177,7 +1629,8 @@ export class LeagueRoster {
         course: start.course,
         starterId: callerId,
         starterName: roster.get(callerId),
-        memberIds: [...roster.keys()].sort(),
+        // W5 never goes to a no-app player: they have no phone on the league.
+        memberIds: [...roster.keys()].filter((id) => !noApp.has(id)).sort(),
       },
     };
   }
@@ -1311,6 +1764,246 @@ export class LeagueRoster {
     if (pointsMode !== undefined) this.ctx.storage.sql.exec("UPDATE league SET points_mode = ? WHERE id = 1", pointsMode);
     return { ok: true, league: this.#publicLeague(this.#league()) };
   }
+
+  // ------------------------------------------------------------------------------------------
+  // W-B: no-app players (W6, W7), leave (W16), hand over (W17), the roster friend request, claims (W9–W13).
+
+  /** W6. Any member (403), then the name (400 name_required), then the 20-player cap, in this transaction. */
+  #noAppAdd({ callerId, memberId, name, now }) {
+    if (!this.#league()) return { ok: false, error: "not_found" };
+    if (!this.#isMember(callerId)) return { ok: false, error: "forbidden" };
+    if (!name) return { ok: false, error: "name_required" };
+    // Decision 5: every roster row counts, no-app players included.
+    if (this.#count() >= LEAGUE_MAX_PLAYERS) return { ok: false, error: "league_full" };
+    this.ctx.storage.sql.exec(
+      "INSERT INTO member (member_id, name, role, joined_at, kind, added_by, added_at) VALUES (?, ?, 'member', ?, ?, ?, ?)",
+      memberId,
+      name,
+      now,
+      NOAPP,
+      callerId,
+      now,
+    );
+    return { ok: true, member: this.#memberOut(this.#memberRow(memberId)) };
+  }
+
+  /** W7 (decision 10, the app's canRenameMember): a no-app player; the organizer or their adder, while a member. */
+  #noAppRename({ callerId, memberId, name }) {
+    if (!this.#league()) return { ok: false, error: "not_found" };
+    const member = this.#memberRow(memberId);
+    if (!member) return { ok: false, error: "not_found" };
+    const callerRole = this.#role(callerId);
+    if (callerRole == null || member.kind !== NOAPP) return { ok: false, error: "forbidden" };
+    if (callerRole !== "owner" && member.added_by !== callerId) return { ok: false, error: "forbidden" };
+    if (!name) return { ok: false, error: "name_required" };
+    this.ctx.storage.sql.exec("UPDATE member SET name = ? WHERE member_id = ?", name, memberId);
+    return { ok: true, member: this.#memberOut(this.#memberRow(memberId)) };
+  }
+
+  /** W16. Not the organizer (decision 8). The caller's member row only: no removed row, nothing else touched. */
+  #leave({ callerId }) {
+    if (!this.#league()) return { ok: false, error: "not_found" };
+    const role = this.#role(callerId);
+    if (role == null) return { ok: false, error: "not_found" };
+    if (role === "owner") return { ok: false, error: "forbidden" };
+    this.ctx.storage.sql.exec("DELETE FROM member WHERE member_id = ?", callerId);
+    return { ok: true };
+  }
+
+  /** W17, one transaction: the target becomes the owner, league.owner_id follows, the caller's row goes. */
+  #handover({ callerId, memberId }) {
+    if (!this.#league()) return { ok: false, error: "not_found" };
+    if (this.#role(callerId) !== "owner") return { ok: false, error: "forbidden" };
+    if (memberId === callerId) return { ok: false, error: "invalid_body" };
+    const target = this.#memberRow(memberId);
+    if (!target) return { ok: false, error: "not_found" };
+    // Decision 5: a no-app player can't be organizer.
+    if (target.kind === NOAPP) return { ok: false, error: "invalid_body" };
+    this.ctx.storage.sql.exec("UPDATE member SET role = 'owner' WHERE member_id = ?", memberId);
+    this.ctx.storage.sql.exec("UPDATE league SET owner_id = ? WHERE id = 1", memberId);
+    this.ctx.storage.sql.exec("DELETE FROM member WHERE member_id = ?", callerId);
+    return { ok: true, league: this.#publicLeague(this.#league()) };
+  }
+
+  /** The roster friend request: both current members (404), the target with the app (400). */
+  #memberPair({ callerId, memberId }) {
+    if (!this.#league() || !this.#isMember(callerId)) return { ok: false, error: "not_found" };
+    const target = this.#memberRow(memberId);
+    if (!target) return { ok: false, error: "not_found" };
+    if (target.kind === NOAPP || memberId === callerId) return { ok: false, error: "invalid_body" };
+    return { ok: true };
+  }
+
+  #claimRow(claimId) {
+    if (typeof claimId !== "string") return null;
+    const rows = this.#sql("SELECT * FROM claim WHERE claim_id = ?", claimId);
+    return rows.length === 1 ? rows[0] : null;
+  }
+
+  /** The claim as the app's parseClaim reads it (contract W9 field order). */
+  #claimOut(c) {
+    return {
+      claimId: c.claim_id,
+      leagueId: this.#league().league_id,
+      spotMemberId: c.spot_member_id,
+      spotName: c.spot_name,
+      claimerId: c.claimer_id,
+      claimerName: c.claimer_name,
+      status: c.status,
+      createdAt: Number(c.created_at),
+    };
+  }
+
+  /** W9, in the app's claimRefusal order. The code is checked again here, as join does. */
+  #claim({ code, claimId, claimerId, claimerName, spotMemberId, pendingElsewhere, now }) {
+    const row = this.#league();
+    if (!row || row.code !== code) return { ok: false, error: "not_found" };
+    if (!codeLetsIn({ code, removedUnder: this.#removedUnder(claimerId) })) return { ok: false, error: "not_found" };
+    if (this.#isMember(claimerId)) return { ok: false, error: "already_member" };
+    const spot = this.#memberRow(spotMemberId);
+    if (!spot || spot.kind !== NOAPP) return { ok: false, error: "invalid_body" };
+    if (pendingElsewhere || this.#sql("SELECT 1 FROM claim WHERE claimer_id = ? AND status = 'pending'", claimerId).length > 0) {
+      return { ok: false, error: "already_pending" };
+    }
+    if (this.#sql("SELECT 1 FROM claim WHERE spot_member_id = ? AND status = 'pending'", spotMemberId).length > 0) {
+      return { ok: false, error: "spot_pending" };
+    }
+    this.ctx.storage.sql.exec(
+      `INSERT INTO claim (claim_id, spot_member_id, spot_name, claimer_id, claimer_name, status, created_at, decided_at)
+       VALUES (?, ?, ?, ?, ?, 'pending', ?, NULL)`,
+      claimId,
+      spotMemberId,
+      spot.name,
+      claimerId,
+      claimerName,
+      now,
+    );
+    return {
+      ok: true,
+      claim: this.#claimOut(this.#claimRow(claimId)),
+      push: { ownerId: row.owner_id, leagueId: row.league_id, leagueName: row.name, claimId, claimerId, claimerName, spotName: spot.name },
+    };
+  }
+
+  /** W10–W12 (the app's claimActionAllowed): pending only; cancel by the claimer, approve / decline by the organizer. */
+  #claimAction({ action, callerId, claimId, now }) {
+    if (!this.#league()) return { ok: false, error: "not_found" };
+    const claim = this.#claimRow(claimId);
+    if (!claim) return { ok: false, error: "not_found" };
+    if (claim.status !== "pending") return { ok: false, error: "forbidden" };
+    const allowed = action === "cancel" ? callerId === claim.claimer_id : this.#role(callerId) === "owner";
+    if (!allowed) return { ok: false, error: "forbidden" };
+    if (action === "approve") {
+      const moved = this.#moveSpotToClaimer(claim);
+      if (moved) return { ok: false, error: moved };
+    }
+    const status = action === "approve" ? "approved" : action === "decline" ? "declined" : "cancelled";
+    this.ctx.storage.sql.exec("UPDATE claim SET status = ?, decided_at = ? WHERE claim_id = ?", status, now, claimId);
+    return { ok: true, claim: this.#claimOut(this.#claimRow(claimId)) };
+  }
+
+  /**
+   * W10 (decision 3): the spot's member row becomes the claimer (id, the name they sent, kind null,
+   * adder fields cleared; role and joined_at kept), and the spot's id becomes the claimer's in every
+   * row that holds a member id: round_results (member and a solo unit), round_cell, round_history,
+   * last_seen, and each league_round's players, teams and host. entered_by is never changed, so
+   * host-entered cells stay 'host' (decision 4). Runs inside the approve transaction.
+   * Brian, Nov 23 2026: when the claimer joined with the code while the claim was pending, the spot
+   * merges into their member row instead: that row is kept as it is, the spot's row is deleted (so
+   * there is no duplicate and the roster shrinks by one; the cap is never checked), and everything
+   * else moves exactly as above.
+   * Brian, Nov 23 2026, 2:17 PM CT: for every round both the claimer and the spot played, the
+   * claimer's own results, cells and history are kept and the spot's are dropped (its result row,
+   * cells, history, its place in the round's players and teams). Standings are derived from the
+   * remaining rows, so that round is scored without the spot. Rounds only the spot played move over.
+   * Answers not_found and changes nothing when the spot is gone.
+   */
+  #moveSpotToClaimer(claim) {
+    const from = claim.spot_member_id;
+    const to = claim.claimer_id;
+    const spot = this.#memberRow(from);
+    if (!spot || spot.kind !== NOAPP) return "not_found";
+    const merge = this.#isMember(to);
+    const roundsOf = (id) => {
+      const ids = new Set(this.#sql("SELECT DISTINCT round_id FROM round_results WHERE member_id = ?", id).map((r) => r.round_id));
+      for (const r of this.#sql("SELECT DISTINCT round_id FROM round_cell WHERE member_id = ?", id)) ids.add(r.round_id);
+      for (const r of this.#sql("SELECT round_id, players FROM league_round")) {
+        if (JSON.parse(r.players).some((p) => p.memberId === id)) ids.add(r.round_id);
+      }
+      return ids;
+    };
+    const claimerRounds = roundsOf(to);
+    const shared = new Set([...roundsOf(from)].filter((id) => claimerRounds.has(id)));
+    const exec = (query, ...bindings) => this.ctx.storage.sql.exec(query, ...bindings);
+    // Rounds both played: drop the spot's entries, keep the claimer's.
+    for (const roundId of shared) {
+      exec("DELETE FROM round_results WHERE round_id = ? AND member_id = ?", roundId, from);
+      exec("DELETE FROM round_cell WHERE round_id = ? AND member_id = ?", roundId, from);
+      exec("DELETE FROM round_history WHERE round_id = ? AND member_id = ?", roundId, from);
+    }
+    if (merge) {
+      exec("DELETE FROM member WHERE member_id = ?", from);
+    } else {
+      exec(
+        "UPDATE member SET member_id = ?, name = ?, kind = NULL, added_by = NULL, added_at = NULL WHERE member_id = ?",
+        to,
+        claim.claimer_name,
+        from,
+      );
+    }
+    exec("UPDATE round_results SET unit = ? WHERE member_id = ? AND unit = ?", to, from, from);
+    exec("UPDATE round_results SET member_id = ? WHERE member_id = ?", to, from);
+    exec("UPDATE round_cell SET member_id = ? WHERE member_id = ?", to, from);
+    exec("UPDATE round_cell SET by_id = ? WHERE by_id = ?", to, from);
+    exec("UPDATE round_history SET member_id = ? WHERE member_id = ?", to, from);
+    exec("UPDATE round_history SET by_id = ? WHERE by_id = ?", to, from);
+    if (this.#sql("SELECT 1 FROM last_seen WHERE member_id = ?", to).length > 0) exec("DELETE FROM last_seen WHERE member_id = ?", from);
+    else exec("UPDATE last_seen SET member_id = ? WHERE member_id = ?", to, from);
+    for (const r of this.#sql("SELECT round_id, host_id, players, teams FROM league_round")) {
+      const players = JSON.parse(r.players);
+      if (!players.some((p) => p.memberId === from) && r.host_id !== from) continue;
+      const drop = shared.has(r.round_id);
+      // As the app's moveRoundMember: the player keeps their place and hostEnters; kind becomes app.
+      // In a shared round the spot is dropped instead (the claimer is already a player there).
+      const nextPlayers = drop
+        ? players.filter((p) => p.memberId !== from)
+        : players.map((p) => (p.memberId === from ? { ...p, memberId: to, kind: "app" } : p));
+      const teams =
+        r.teams == null
+          ? null
+          : JSON.parse(r.teams)
+              .map((t) => ({ ...t, memberIds: drop ? t.memberIds.filter((id) => id !== from) : t.memberIds.map((id) => (id === from ? to : id)) }))
+              .filter((t) => t.memberIds.length > 0);
+      exec(
+        "UPDATE league_round SET players = ?, teams = ?, host_id = ? WHERE round_id = ?",
+        JSON.stringify(nextPlayers),
+        teams == null ? null : JSON.stringify(teams),
+        r.host_id === from ? to : r.host_id,
+        r.round_id,
+      );
+    }
+    return null;
+  }
+
+  /** One claim and the league in the preview's shape (for /claims/mine and W9's pending check). */
+  #claimGet({ claimId }) {
+    const row = this.#league();
+    const claim = row ? this.#claimRow(claimId) : null;
+    if (!claim) return { ok: false, error: "not_found" };
+    const league = this.#publicLeague(row);
+    delete league.ownerId;
+    return { ok: true, claim: this.#claimOut(claim), league };
+  }
+
+  /** W13 organizer list: pending first, then the rest, each oldest first. */
+  #claims({ callerId }) {
+    if (!this.#league()) return { ok: false, error: "not_found" };
+    if (this.#role(callerId) !== "owner") return { ok: false, error: "forbidden" };
+    const claims = this.#sql(
+      "SELECT * FROM claim ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, created_at, rowid",
+    ).map((c) => this.#claimOut(c));
+    return { ok: true, claims };
+  }
 }
 
 async function readyCaller(request, env, cors) {
@@ -1356,6 +2049,23 @@ async function readyOrganizerWrite(request, env, cors, allowed) {
   const limited = await consumeReadLimit(request, env, ready.friendKey, "keylgread:", "iplgread:", cors);
   if (limited) return { response: limited };
   return { ...ready, body: parsed.value, leagueId };
+}
+
+/**
+ * Member writes that carry { leagueId, ... } (W6, W16): the organizer-write checks, then the
+ * owner-block rule readyMemberRead uses (404 when the caller and owner are blocked either way).
+ */
+async function readyMemberWrite(request, env, cors, allowed) {
+  const ready = await readyOrganizerWrite(request, env, cors, allowed);
+  if (ready.response) return ready;
+  if (await ownerBlocked(env, ready, ready.leagueId)) return { response: friendJson(404, { error: "not_found" }, cors) };
+  return ready;
+}
+
+/** True when the league does not exist or its owner and the caller are blocked either way. */
+async function ownerBlocked(env, ready, leagueId) {
+  const owner = await rosterCall(env, leagueId, { op: "owner" });
+  return !owner.ok || (await blockedEitherWay(ready.boards, owner.ownerId, ready.caller.ownerId));
 }
 
 async function blockedEitherWay(boards, ownerId, callerId) {
@@ -1448,14 +2158,20 @@ async function unusedLeagueCode(boards) {
   throw new Error("league_code_exhausted");
 }
 
+/**
+ * lg:code:<CODE> -> leagueId, and (W13) lg:claim:<ownerId> -> the claim id of that person's latest
+ * claim. Nothing else about leagues is in KV.
+ */
 function leagueKvKey(kind, id) {
-  if (kind !== "code") throw new Error("league_namespace");
+  if (kind !== "code" && kind !== "claim") throw new Error("league_namespace");
   if (typeof id !== "string" || id.length < 1) throw new Error("league_namespace");
   return `${LEAGUE_KV_PREFIX}${kind}:${id}`;
 }
 
 function assertLeagueNamespace(key) {
-  if (typeof key !== "string" || !key.startsWith(`${LEAGUE_KV_PREFIX}code:`)) throw new Error("league_namespace");
+  if (typeof key !== "string" || !(key.startsWith(`${LEAGUE_KV_PREFIX}code:`) || key.startsWith(`${LEAGUE_KV_PREFIX}claim:`))) {
+    throw new Error("league_namespace");
+  }
 }
 
 async function leagueGet(boards, key) {
