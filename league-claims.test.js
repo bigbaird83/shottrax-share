@@ -241,9 +241,18 @@ describe("W10 POST /v1/leagues/claims/approve", () => {
     for (const h of hist) expect(h.entered_by).toBe("host");
   });
 
-  it("approve after the spot was removed is 404 and changes nothing", async () => {
+  it("approve after the spot was removed is 403 (the remove cancelled the claim, Brian Nov 23) and changes nothing", async () => {
     const { a, c, n, league } = await claimedWithRounds();
     expect((await w.call("/v1/leagues/members/remove", { friend: a.friend, body: { leagueId: league.id, memberId: n.memberId } })).status).toBe(200);
+    const before = dumpRoster(league.id);
+    expect(await act(a, "approve", c.claimId)).toMatchObject({ status: 403, json: { error: "forbidden" } });
+    expect(dumpRoster(league.id)).toBe(before);
+  });
+
+  it("approve of a pending claim whose spot row is gone is 404 and changes nothing", async () => {
+    const { a, c, n, league } = await claimedWithRounds();
+    // Only reachable outside the remove route (which cancels the claim): drop the spot row directly.
+    w.roster(league.id).db.prepare("DELETE FROM member WHERE member_id = ?").run(n.memberId);
     const before = dumpRoster(league.id);
     expect(await act(a, "approve", c.claimId)).toMatchObject({ status: 404, json: { error: "not_found" } });
     expect(dumpRoster(league.id)).toBe(before);

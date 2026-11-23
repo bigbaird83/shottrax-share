@@ -644,6 +644,17 @@ async function removeMember(request, url, env, cors) {
     memberId,
   });
   if (!answer.ok) return friendJson(answer.error === "forbidden" ? 403 : 404, { error: answer.error }, cors);
+  // Brian, Nov 23 2026: removing a no-app spot cancels its pending claim. The claimer's pointer is
+  // cleared when it names that claim, and the claimer (only) is told, best effort.
+  for (const cancelled of answer.cancelledClaims || []) {
+    const pointer = leagueKvKey("claim", cancelled.claimerId);
+    if ((await leagueGet(ready.boards, pointer)) === cancelled.claimId) await leagueDelete(ready.boards, pointer);
+    try {
+      await sendClaimCancelledPush(env, ready.boards, cancelled);
+    } catch {
+      // Best effort: the removal and the cancel are already stored.
+    }
+  }
   return friendJson(200, { removed: memberId, league: answer.league }, cors);
 }
 
@@ -1090,6 +1101,26 @@ async function sendClaimPush(env, boards, push) {
   ]);
 }
 
+/**
+ * Brian, Nov 23 2026: the organizer removed a no-app spot that had a pending claim. One push to the
+ * claimer only; none when the claimer and the organizer are blocked either way or the claimer has
+ * no valid token. The title and body are placeholder wording (no approved mockup string yet).
+ */
+async function sendClaimCancelledPush(env, boards, cancelled) {
+  if (await blockedEitherWay(boards, cancelled.organizerId, cancelled.claimerId)) return;
+  const token = await friendGet(boards, friendKvKey("push", cancelled.claimerId));
+  if (typeof token !== "string" || !PUSH_TOKEN_RE.test(token)) return;
+  await postExpo(env, [
+    {
+      to: token,
+      title: `${cancelled.leagueName}: claim cancelled`,
+      body: `${cancelled.spotName}'s spot was removed, so your claim was cancelled.`,
+      sound: "default",
+      data: { kind: "league_claim_cancelled", leagueId: cancelled.leagueId, claimId: cancelled.claimId },
+    },
+  ]);
+}
+
 async function postExpo(env, messages) {
   if (messages.length === 0) return;
   const headers = { "Content-Type": "application/json", Accept: "application/json" };
@@ -1424,7 +1455,23 @@ export class LeagueRoster {
     this.ctx.storage.sql.exec("DELETE FROM member WHERE member_id = ?", memberId);
     // Decision 8: removing a no-app player deletes the unclaimed spot; its round_results stay.
     // Nobody can present a code as a no-app id, so no removed row is written for one.
-    if (noApp) return { ok: true, league: this.#publicLeague(row) };
+    // Brian, Nov 23 2026: a pending claim on the spot is cancelled with it (no orphan claim).
+    if (noApp) {
+      const cancelledClaims = this.#sql("SELECT * FROM claim WHERE spot_member_id = ? AND status = 'pending'", memberId).map((c) => ({
+        claimId: c.claim_id,
+        claimerId: c.claimer_id,
+        spotName: c.spot_name,
+        organizerId: callerId,
+        leagueId: row.league_id,
+        leagueName: row.name,
+      }));
+      this.ctx.storage.sql.exec(
+        "UPDATE claim SET status = 'cancelled', decided_at = ? WHERE spot_member_id = ? AND status = 'pending'",
+        now,
+        memberId,
+      );
+      return { ok: true, league: this.#publicLeague(row), cancelledClaims };
+    }
     this.ctx.storage.sql.exec(
       `INSERT INTO removed (member_id, removed_under, removed_at) VALUES (?, ?, ?)
        ON CONFLICT(member_id) DO UPDATE SET removed_under = excluded.removed_under, removed_at = excluded.removed_at`,
@@ -1860,16 +1907,19 @@ export class LeagueRoster {
    * adder fields cleared; role and joined_at kept), and the spot's id becomes the claimer's in every
    * row that holds a member id: round_results (member and a solo unit), round_cell, round_history,
    * last_seen, and each league_round's players, teams and host. entered_by is never changed, so
-   * host-entered cells stay 'host' (decision 4). Runs inside the approve transaction. Answers a
-   * refusal and changes nothing when: the spot is gone (not_found); the claimer is already a member
-   * (already_member); or the claimer already has a row in a round the spot played (conflict).
+   * host-entered cells stay 'host' (decision 4). Runs inside the approve transaction.
+   * Brian, Nov 23 2026: when the claimer joined with the code while the claim was pending, the spot
+   * merges into their member row instead: that row is kept as it is, the spot's row is deleted (so
+   * there is no duplicate and the roster shrinks by one; the cap is never checked), and everything
+   * else moves exactly as above. Answers a refusal and changes nothing when the spot is gone
+   * (not_found) or the claimer already has a row in a round the spot played (conflict).
    */
   #moveSpotToClaimer(claim) {
     const from = claim.spot_member_id;
     const to = claim.claimer_id;
     const spot = this.#memberRow(from);
     if (!spot || spot.kind !== NOAPP) return "not_found";
-    if (this.#isMember(to)) return "already_member";
+    const merge = this.#isMember(to);
     const roundsOf = (id) => {
       const ids = new Set(this.#sql("SELECT DISTINCT round_id FROM round_results WHERE member_id = ?", id).map((r) => r.round_id));
       for (const r of this.#sql("SELECT DISTINCT round_id FROM round_cell WHERE member_id = ?", id)) ids.add(r.round_id);
@@ -1881,12 +1931,16 @@ export class LeagueRoster {
     const claimerRounds = roundsOf(to);
     if ([...roundsOf(from)].some((id) => claimerRounds.has(id))) return "conflict";
     const exec = (query, ...bindings) => this.ctx.storage.sql.exec(query, ...bindings);
-    exec(
-      "UPDATE member SET member_id = ?, name = ?, kind = NULL, added_by = NULL, added_at = NULL WHERE member_id = ?",
-      to,
-      claim.claimer_name,
-      from,
-    );
+    if (merge) {
+      exec("DELETE FROM member WHERE member_id = ?", from);
+    } else {
+      exec(
+        "UPDATE member SET member_id = ?, name = ?, kind = NULL, added_by = NULL, added_at = NULL WHERE member_id = ?",
+        to,
+        claim.claimer_name,
+        from,
+      );
+    }
     exec("UPDATE round_results SET unit = ? WHERE member_id = ? AND unit = ?", to, from, from);
     exec("UPDATE round_results SET member_id = ? WHERE member_id = ?", to, from);
     exec("UPDATE round_cell SET member_id = ? WHERE member_id = ?", to, from);
