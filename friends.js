@@ -785,35 +785,55 @@ async function sendRequest(request, env, cors) {
   if (typeof ownerId !== "string" || ownerId.length === 0) {
     return friendJson(404, { error: "code_not_found" }, cors);
   }
-  if (await hasBlock(boards, caller.ownerId, ownerId)) {
-    return friendJson(409, { error: "blocked" }, cors);
-  }
+  const outcome = await requestAfterLookup(boards, caller.ownerId, ownerId);
+  if (outcome === "blocked") return friendJson(409, { error: "blocked" }, cors);
+  if (outcome === "friends") return friendJson(200, { status: "friends", ownerId, already: "friends" }, cors);
+  if (outcome === "outgoing") return friendJson(200, { status: "pending", ownerId, already: "outgoing" }, cors);
+  if (outcome === "incoming") return friendJson(200, { status: "pending", ownerId, already: "incoming" }, cors);
+  // "quiet" and "sent" answer the same, so a quiet block is not revealed.
+  return friendJson(200, { status: "pending", ownerId }, cors);
+}
+
+/**
+ * The part of a friend request after the target is known. Shared by POST /v1/friends/requests
+ * (after its code lookup) and the league roster request (leagues.js request-by-member), so the
+ * two can't drift. Answers one of:
+ * - "blocked": the caller blocked the target. Nothing written.
+ * - "quiet": the target blocked the caller. Only the caller's outgoing note is stored; the
+ *   target has no fr:req: to accept.
+ * - "friends": already friends. Any leftover note is dropped.
+ * - "outgoing": the caller's request is already pending. Nothing new is written.
+ * - "incoming": the target already asked the caller. No second request.
+ * - "sent": the request was written.
+ */
+export async function requestAfterLookup(boards, callerId, ownerId) {
+  if (await hasBlock(boards, callerId, ownerId)) return "blocked";
   // Quiet block: same pending body as a real request. The note is the
   // sender's outgoing row only. The recipient has no fr:req: to accept.
-  if (await hasBlock(boards, ownerId, caller.ownerId)) {
-    await storeOutgoingNote(boards, caller.ownerId, ownerId);
-    return friendJson(200, { status: "pending", ownerId }, cors);
+  if (await hasBlock(boards, ownerId, callerId)) {
+    await storeOutgoingNote(boards, callerId, ownerId);
+    return "quiet";
   }
   // No duplicates: an existing friend or a pending request in either direction
-  // is reported with `already` and nothing new is written.
-  if (await areFriends(boards, caller.ownerId, ownerId)) {
-    await deleteOutgoingNote(boards, caller.ownerId, ownerId);
-    return friendJson(200, { status: "friends", ownerId, already: "friends" }, cors);
+  // is reported and nothing new is written.
+  if (await areFriends(boards, callerId, ownerId)) {
+    await deleteOutgoingNote(boards, callerId, ownerId);
+    return "friends";
   }
-  const reqKey = requestKey(ownerId, caller.ownerId);
+  const reqKey = requestKey(ownerId, callerId);
   const pending = await friendGet(boards, reqKey);
   if (typeof pending === "string" && pending.length > 0) {
-    await deleteOutgoingNote(boards, caller.ownerId, ownerId);
-    return friendJson(200, { status: "pending", ownerId, already: "outgoing" }, cors);
+    await deleteOutgoingNote(boards, callerId, ownerId);
+    return "outgoing";
   }
-  const reverse = await friendGet(boards, requestKey(caller.ownerId, ownerId));
+  const reverse = await friendGet(boards, requestKey(callerId, ownerId));
   if (typeof reverse === "string" && reverse.length > 0) {
     // They already asked you: no second request. Accept theirs instead.
-    return friendJson(200, { status: "pending", ownerId, already: "incoming" }, cors);
+    return "incoming";
   }
   await friendPut(boards, reqKey, "pending");
-  await deleteOutgoingNote(boards, caller.ownerId, ownerId);
-  return friendJson(200, { status: "pending", ownerId }, cors);
+  await deleteOutgoingNote(boards, callerId, ownerId);
+  return "sent";
 }
 
 async function acceptRequest(request, env, cors) {

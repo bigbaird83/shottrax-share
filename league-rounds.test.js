@@ -585,11 +585,16 @@ describe("rate limits", () => {
 });
 
 describe("back-compat", () => {
-  it("claims is still 501 and unknown league routes are still 404", async () => {
+  it("claims answers W9 (no longer 501), the W-B routes exist, and unknown league routes are still 404", async () => {
     const setup = await w.league(1);
     const guest = await w.player(2);
-    expect(await w.call("/v1/leagues/claims", { friend: guest.friend, body: { code: setup.code } })).toMatchObject({ status: 501, json: { error: "not_implemented" } });
-    for (const path of ["/v1/leagues/members/no-app", "/v1/leagues/members/rename", "/v1/leagues/leave", "/v1/leagues/claims/approve", "/v1/leagues/rounds/x"]) {
+    // W-B replaced the 501 stub: a body without a name is W9's 400 name_required.
+    expect(await w.call("/v1/leagues/claims", { friend: guest.friend, body: { code: setup.code } })).toMatchObject({ status: 400, json: { error: "name_required" } });
+    // W-B built these: an empty body is 400 invalid_body.
+    for (const path of ["/v1/leagues/members/no-app", "/v1/leagues/members/rename", "/v1/leagues/claims/approve"]) {
+      expect(await w.call(path, { friend: setup.people[0].friend, body: {} }), path).toMatchObject({ status: 400, json: { error: "invalid_body" } });
+    }
+    for (const path of ["/v1/leagues/leave", "/v1/leagues/rounds/x"]) {
       expect(await w.call(path, { friend: setup.people[0].friend, body: {} })).toMatchObject({ status: 404, json: { error: "unknown_route" } });
     }
     expect((await w.call("/v1/leagues/rounds/score", { method: "GET", friend: setup.people[0].friend })).status).toBe(405);

@@ -548,8 +548,9 @@ describe("leagues", () => {
       const join = await call("/v1/leagues/join", { friend: guest.friend, body: { code: fresh, name: "Player K" } });
       expect(join.status).toBe(200);
       expect(join.json.joined).toBe(true);
+      // W9 (W-B replaced the 501 stub): the new code lets them in, so the next check is the name.
       const claim = await call("/v1/leagues/claims", { friend: guest.friend, body: { code: fresh } });
-      expect(claim).toEqual({ status: 501, json: { error: "not_implemented" } });
+      expect(claim).toEqual({ status: 400, json: { error: "name_required" } });
       const members = await call(`/v1/leagues/members?league=${league.id}`, { method: "GET", friend: owner.friend });
       expect(members.json.code).toBe(fresh);
       expect(members.json.members.map((m) => m.memberId).sort()).toEqual([owner.ownerId, guest.ownerId].sort());
@@ -582,7 +583,8 @@ describe("leagues", () => {
       const { code } = await created(owner);
       const guest = await player(2);
       const claim = await call("/v1/leagues/claims", { friend: guest.friend, body: { code, spotMemberId: "spot-1", name: "Player K" } });
-      expect(claim).toEqual({ status: 501, json: { error: "not_implemented" } });
+      // W9 (W-B replaced the 501 stub): "spot-1" is not a no-app spot in this league.
+      expect(claim).toEqual({ status: 400, json: { error: "invalid_body" } });
       for (let i = 0; i < 8; i += 1) {
         expect((await call("/v1/leagues/preview", { friend: guest.friend, body: { code: "AAAABBBB" } })).status).toBe(404);
       }
