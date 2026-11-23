@@ -1,6 +1,6 @@
 # Leagues API
 
-PR 1 (create, preview, join, members, standings, remove, reset) was built from the approved league mockups (Brian, Oct 29 2026, 8:44 AM CT). League rounds (W1–W5), settings (W15) and game points (W-C) follow below.
+PR 1 (create, preview, join, members, standings, remove, reset) was built from the approved league mockups (Brian, Oct 29 2026, 8:44 AM CT). League rounds (W1–W5), settings (W15) and game points (W-C) follow below, then [W-B](#w-b-no-app-players-claims-leave-and-hand-over): no-app players, claims, leave, hand over and the roster friend request.
 
 **Not deployed.** A deploy is a manual `npx wrangler deploy` and needs Brian's OK. No new Durable Object class, no migration, no secret, no `[vars]` change.
 
@@ -9,13 +9,21 @@ Every call uses the friends `X-Friend-Key`. The caller needs a friend code alrea
 | Call | Body / query | Answer |
 | --- | --- | --- |
 | `POST /v1/leagues` | `{ name, yourName, game, scoring, carryOver, homeCourse, seasonStarts, seasonEnds, roundDay?, gamePoints?, pointsMode? }` | `{ league, code }` |
-| `POST /v1/leagues/preview` | `{ code }` | `{ league }` (no member list, no owner id) |
+| `POST /v1/leagues/preview` | `{ code }` | `{ league }` (no member list, no owner id), plus `spots` when the league has a claimable no-app spot (W8) |
 | `POST /v1/leagues/join` | `{ code, name }` | `{ league, joined }` |
-| `GET /v1/leagues/members` | `?league=<id>` | `{ league, code, members: [{ memberId, name, role, joinedAt }] }` |
+| `GET /v1/leagues/members` | `?league=<id>` | `{ league, code, members: [{ memberId, name, role, joinedAt }] }`; no-app rows add `kind:'noApp', addedBy, addedByName, addedAt` |
 | `GET /v1/leagues/standings` | `?league=<id>` | `{ season, rounds, rows: [{ memberId, name, rank, tied, rounds, avgNet, skins, points }] }` |
 | `POST /v1/leagues/members/remove` | `{ leagueId, memberId }` | `{ removed, league }`. Organizer only. |
 | `POST /v1/leagues/code/reset` | `{ leagueId }` | `{ code, league }`. Organizer only. |
-| `POST /v1/leagues/claims` | `{ code, spotMemberId?, name? }` | Not built yet: 501 `not_implemented` when the code lets the caller in. |
+| `POST /v1/leagues/members/no-app` (W6) | `{ leagueId, name }` | `{ member }`. Any member. |
+| `POST /v1/leagues/members/rename` (W7) | `{ memberId, name }` | `{ member }`. No-app only; organizer or adder. |
+| `POST /v1/leagues/members/leave` (W16) | `{ leagueId }` | `{ left }`. Anyone but the organizer. |
+| `POST /v1/leagues/members/handover` (W17) | `{ leagueId, memberId }` | `{ left, league }`. Organizer only. |
+| `POST /v1/leagues/claims` (W9) | `{ code, spotMemberId, name }` | `{ claim }` |
+| `POST /v1/leagues/claims/approve` / `decline` / `cancel` (W10–W12) | `{ claimId }` | `{ claim }` |
+| `GET /v1/leagues/claims` (W13) | `?league=<id>` | `{ claims }`. Organizer only. |
+| `GET /v1/leagues/claims/mine` (W13) | — | `{ claim, league }` (each may be `null`) |
+| `POST /v1/friends/request-by-member` | `{ league, memberId }` | `{ outcome }` |
 | `POST /v1/leagues/rounds` (W1) | see [League rounds](#league-rounds) | `{ round }` |
 | `POST /v1/leagues/rounds/score` (W2) | `{ roundId, memberId, hole, strokes, rev }` | `{ cell }` |
 | `GET /v1/leagues/rounds` (W3) | `?league=<id>&since=<ms>` | `{ round, lastSeen, now }` |
@@ -34,7 +42,7 @@ Every call uses the friends `X-Friend-Key`. The caller needs a friend code alrea
 - Decision 8 (Brian, Nov 17 2026): a removed player rejoins only with a new code. The roster keeps the code each member was removed under (`removedUnder`, in the league's Durable Object, never KV). When that person presents that code, preview, join and claims answer 404 `code_not_found`, the same as an unknown code, and the guess counts. Anyone else can still use that code. After a reset the new code lets the removed player in. A claim whose code lets the caller in gives its guess back.
 - Remove and reset: anyone but the organizer gets 403 `forbidden`, and the organizer cannot remove themselves (403). A missing league or member is 404 `not_found`. Both share the member read limit.
 - New leagues: 30 per IP per hour. Member/standings reads: 60 per key and per IP per hour.
-- KV holds only `lg:code:<CODE>` -> league id. Rounds live only in the league's Durable Object.
+- KV holds only `lg:code:<CODE>` -> league id and (W-B) `lg:claim:<ownerId>` -> that person's latest claim id. Rounds, members and claims live only in the league's Durable Object.
 - Every `league` answer (create, preview, join, members, reset, remove, settings) carries `gamePoints` and `pointsMode`, resolved with the defaults (see [Game points](#game-points)).
 
 ## Standings
@@ -172,3 +180,90 @@ Scored at finish from the round's own snapshot:
 - "Ties split the points (halves count)." The Worker keeps ties **exact** (2 points split 3 ways = 2/3) and compares points with a 1e-9 tolerance; the app shows the nearest half (Brian, Nov 22 2026: "Keep nearest half as shown now").
 
 Storage: `round_results` gains three nullable columns — `game_points REAL` (null = 0), `points_mode TEXT` (null = Add) and `incomplete INTEGER` — added with `ALTER TABLE` the first time a round finishes in that league. `league` gains `game_points TEXT` and `points_mode TEXT` in `#ensure()`. Nothing is dropped or rewritten.
+
+## W-B: no-app players, claims, leave and hand over
+
+**Not deployed. Needs #70 deployed first.** A deploy is a manual `npx wrangler deploy` and needs Brian's OK. No new Durable Object class, no migration, no secret, no `[vars]` change.
+
+Approvals: W6–W14 OK to build since Nov 18 2026 (ShotTraxx #900 decision table, item 1). W16, W17 and request-by-member: Brian, Nov 22 2026 ("Yes, build those routes"). Product rules: decisions 2, 3, 4, 5, 8 and 10 (Nov 17 2026). Contract: ShotTraxx #900 rows W6–W14; the app's `leagueFakeWorker.ts`, `leagueClaims.ts` and `leagueMembers.ts` at ShotTraxx 4efe08b6. Errors are `{ "error": "<code>" }`; 401 `friend_key_required`, 429 with `Retry-After`, unknown fields 400 `invalid_body`, as everywhere.
+
+### Ids
+
+- **No-app member id**: `noapp_` + the league id (22) + `_` + 16 random characters from `[A-Za-z0-9_-]` (45 in all). Made by the Worker. Never 22 characters, so it can never equal a Friends `ownerId`. W7 routes to the league by it.
+- **Claim id**: the league id (22) + `_` + 16 random characters (39 in all), like a round id. W10–W12 route by it.
+- **Claim pointer**: KV `lg:claim:<ownerId>` -> the caller's latest claim id, written by W9. `/claims/mine` reads it; W9 reads it to keep one pending claim per person across leagues.
+
+### Storage
+
+- `member` gains three nullable columns with additive `ALTER TABLE` in `#ensure()`: `kind` (null = an app member, `'noApp'`), `added_by`, `added_at`. Every older row reads as an app member.
+- A new `claim` table (`CREATE TABLE IF NOT EXISTS`): `claim_id, spot_member_id, spot_name, claimer_id, claimer_name, status, created_at, decided_at`. Claims are never deleted.
+
+### W6 `POST /v1/leagues/members/no-app`
+
+`{ leagueId, name }`. Any member (decision 2); a non-member is 403 `forbidden`. `name` is 1–24 characters, spaces collapsed, else 400 `name_required`. No-app players count toward the 20 (decision 5), checked in the roster transaction: 409 `league_full`. Answers `{ member: { memberId, name, role:'member', joinedAt, kind:'noApp', addedBy, addedByName, addedAt } }`. `addedByName` is the adder's current Friends name, falling back to their roster name (null if they've left).
+
+The members list returns those four extra fields on no-app rows only; app rows stay exactly `{ memberId, name, role, joinedAt }`.
+
+### W7 `POST /v1/leagues/members/rename`
+
+`{ memberId, name }`. A no-app player only; the organizer or the member who added them, while they are a member (decision 10), else 403 `forbidden`. A blank name is 400 `name_required`. An id that names no no-app spot is 404 `not_found` (an app member's id names no league, so it is 404 too). Answers `{ member }`.
+
+### W8 preview spots
+
+`POST /v1/leagues/preview` adds `spots: [{ memberId, name, addedByName, addedAt }]`: the no-app spots with no pending claim, in roster order. `spots` is sent only when there is at least one, so a league without any answers `{ league }` exactly as before (the app reads a missing `spots` as none).
+
+### W9 `POST /v1/leagues/claims`
+
+`{ code, spotMemberId, name }`. The same code lookup, removed-under check (decision 8) and guess limit as join: a code that doesn't let the caller in is 404 `code_not_found` and uses the guess; one that does gives it back. Then, in the app's `claimRefusal` order: 400 `name_required`; 409 `already_member`; 400 `invalid_body` (not a no-app spot of this league); 409 `already_pending` (the caller has a pending claim, in any league); 409 `spot_pending`. Answers `{ claim: { claimId, leagueId, spotMemberId, spotName, claimerId, claimerName, status:'pending', createdAt } }`. The claimer is **not** a member while it is pending.
+
+### W10–W12 `POST /v1/leagues/claims/approve` | `decline` | `cancel`
+
+`{ claimId }`. Only a pending claim can change; approve and decline are the organizer's, cancel is the claimer's. Anything else is 403 `forbidden`; an unknown claim id is 404 `not_found`. Answers `{ claim }` with status `approved`, `declined` or `cancelled`.
+
+**Approve (W10)** is one roster transaction (decision 3). The spot's member row becomes the claimer: their id and W9 name, `kind` null, adder fields cleared, role and join time kept. The spot's id becomes the claimer's in `round_results` (and a solo `unit`), `round_cell`, `round_history`, `last_seen`, and every `league_round`'s players (kind becomes `app`), teams and host. `entered_by` is never changed, so host-entered cells stay `host` (decision 4). Points follow the results, so the claimer's standings row has the spot's points. Refusals change nothing: the spot is gone (removed) 404 `not_found`; the claimer has joined meanwhile 409 `already_member`; the claimer already has a row in a round the spot played 409 `conflict`.
+
+**Decline (W11)**: the spot stays unclaimed and is offered again; the same person may claim again.
+
+### W13 `GET /v1/leagues/claims?league=<id>` and `GET /v1/leagues/claims/mine`
+
+The list is the organizer's only (403 `forbidden`): `{ claims }`, pending first, each group oldest first. `mine` answers the caller's latest claim (any status) and its league in the preview shape (no owner id): `{ claim, league }`, or `{ claim: null, league: null }`.
+
+### W14 claim push
+
+Best effort after W9 is stored; a push failure never fails W9. One push, to the organizer only (the league's owner when the claim is stored). None when either has blocked the other or the organizer has no valid push token. Title `"{League}: claim request"`, body `"{Name} wants to claim {Spot}'s spot. Tap to review."` (approved 18c strings; Name = the claimer's W9 name, Spot = the spot's name), data exactly `{ kind:'league_claim_request', leagueId, claimId }`.
+
+W5 (the round-started push) never goes to a no-app player. W1 takes each player's `kind` from the roster and forces `hostEnters: true` for a no-app player.
+
+### Leave vs remove
+
+| | Remove (organizer) | Leave (W16) | Hand over and leave (W17) |
+| --- | --- | --- | --- |
+| Member row | deleted | deleted | the caller's deleted; the target becomes `owner` |
+| `removed` row | written (app member): the current code stops letting them in | **none**: the same code lets them back in | **none** |
+| Rounds, results, cells, history, claims, code | untouched | untouched | untouched |
+
+Removing a no-app player deletes the unclaimed spot and keeps its past rounds (decision 8); no `removed` row is written for a no-app id.
+
+### W16 `POST /v1/leagues/members/leave`
+
+`{ leagueId }`. Any current member except the organizer, who gets 403 `forbidden` (decision 8: hand over first). Deletes only the caller's member row. Screen 10: "Your past rounds stay in the standings. You can rejoin with the league code." No league, not a member, or blocked either way with the owner: 404 `not_found`. Answers `{ left: <callerId> }`.
+
+### W17 `POST /v1/leagues/members/handover`
+
+`{ leagueId, memberId }` (memberId = the new organizer). One roster transaction: the caller must be the organizer (403 `forbidden`); the target must be a current member (404 `not_found`) with the app and not the caller (400 `invalid_body`; decision 5). The target's role becomes `owner`, `league.owner_id` becomes the target, and the caller's member row is deleted. No `removed` row; no round or result is touched. Afterwards the new organizer passes every organizer check (reset, remove, settings, claims list, approve / decline) and the old one passes none. Answers `{ left: <callerId>, league }` with the league after the change (new `ownerId` / `ownerName`, one fewer player).
+
+Known effects: "Started by {name}" on League home is `ownerName`, so it shows the new organizer (there is one owner field; no creator field was approved). The owner-block rule follows the new organizer.
+
+### `POST /v1/friends/request-by-member`
+
+`{ league, memberId }` (`league` is the league id). Both the caller and the target must be current members of the league (404 `not_found`, also for no league or a block either way with the owner); the target must have the app and not be the caller (400 `invalid_body`). Then exactly `POST /v1/friends/requests` after its code lookup (one shared helper, `requestAfterLookup`): the caller blocked the target 409 `blocked`; the target blocked the caller `sent` (only the caller's outgoing note is stored, nothing to accept); already friends `already_friends`; your request pending `already_sent`; theirs pending `they_asked` (no second request); otherwise the request is written, `sent`. Answers `{ outcome }`. It uses no friend-code guess.
+
+### Limits
+
+- W6, W7, W10–W13, W16, W17 and request-by-member: the member read limit (`keylgread:` / `iplgread:`, 60 per key and per IP per hour).
+- W9: join's limits (the friend-code guess limit; a code that lets the caller in gives its guess back).
+- No new limiter prefix.
+
+### Not built
+
+Member handicaps (App PR 7).
