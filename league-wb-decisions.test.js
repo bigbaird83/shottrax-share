@@ -114,8 +114,9 @@ describe("2. removing a no-app spot that has a pending claim", () => {
     expect(w.pushes[0].messages).toEqual([
       {
         to: TOKEN(11),
-        title: "Saturday Crew: claim cancelled",
-        body: "Player N's spot was removed, so your claim was cancelled.",
+        // Brian, Nov 23 2026, 2:17 PM CT: the title is the league name only.
+        title: "Saturday Crew",
+        body: "The organizer removed Player N's spot, so your claim was cancelled.",
         sound: "default",
         data: { kind: "league_claim_cancelled", leagueId: id, claimId: c.claimId },
       },
@@ -155,12 +156,38 @@ describe("2. removing a no-app spot that has a pending claim", () => {
     expect(w.pushes).toHaveLength(1);
   });
 
-  it("blocked either way: the claim is still cancelled, with no push", async () => {
-    const { a, id, n, k, c } = await pending();
-    w.kv.set(`fr:block:${k.ownerId}:${a.ownerId}`, "1");
-    expect((await remove(a, id, n.memberId)).status).toBe(200);
-    expect(table(id, "SELECT status FROM claim WHERE claim_id = ?", c.claimId)).toEqual([{ status: "cancelled" }]);
-    expect(w.kv.has(`lg:claim:${k.ownerId}`)).toBe(false);
+  // Brian, Nov 23 2026, 2:17 PM CT: this push is sent even when the two are blocked either way.
+  for (const way of ["claimer blocked organizer", "organizer blocked claimer"]) {
+    it(`blocked either way (${way}): the claim is cancelled and the claimer still gets the push`, async () => {
+      const { a, id, n, k, c } = await pending();
+      const pair = way === "claimer blocked organizer" ? `${k.ownerId}:${a.ownerId}` : `${a.ownerId}:${k.ownerId}`;
+      w.kv.set(`fr:block:${pair}`, "1");
+      expect((await remove(a, id, n.memberId)).status).toBe(200);
+      expect(table(id, "SELECT status FROM claim WHERE claim_id = ?", c.claimId)).toEqual([{ status: "cancelled" }]);
+      expect(w.kv.has(`lg:claim:${k.ownerId}`)).toBe(false);
+      expect(w.pushes).toHaveLength(1);
+      expect(w.pushes[0].messages).toEqual([
+        {
+          to: TOKEN(11),
+          title: "Saturday Crew",
+          body: "The organizer removed Player N's spot, so your claim was cancelled.",
+          sound: "default",
+          data: { kind: "league_claim_cancelled", leagueId: id, claimId: c.claimId },
+        },
+      ]);
+    });
+  }
+
+  it("the other league pushes keep their block skip: W5 sends nothing across a block", async () => {
+    const setup = await w.league(2);
+    const [a, b] = setup.people;
+    const id = setup.league.id;
+    w.kv.set(`fr:push:${a.ownerId}`, TOKEN(1));
+    w.kv.set(`fr:push:${b.ownerId}`, TOKEN(2));
+    const n = (await addNoApp(a, id, "Player N")).json.member;
+    w.kv.set(`fr:block:${b.ownerId}:${a.ownerId}`, "1");
+    // W5: B blocked A, the starter, so B gets nothing.
+    expect((await post(a, "/v1/leagues/rounds", roundBody(id, [a.ownerId, n.memberId]))).status).toBe(200);
     expect(w.pushes).toHaveLength(0);
   });
 });
@@ -248,5 +275,121 @@ describe("3. the claimer joins while their claim is pending", () => {
     const list = (await members(k, id)).json.members;
     expect(list.find((m) => m.memberId === k.ownerId)).toMatchObject({ name: "Player Kay", role: "member" });
     expect(list.find((m) => m.memberId === n.memberId)).toMatchObject({ kind: "noApp", name: "Player N" });
+  });
+});
+
+describe("4. approve when the claimer and the spot played the same round (Brian, Nov 23, 2:17 PM CT)", () => {
+  /**
+   * A and N play round R1 (N only, besides A). K claims N, joins, and plays R2 with A and N
+   * (N host-entered by A). Hole 1: R1 A 5, N 3. R2 A 5, K 4, N 3.
+   */
+  async function sharedRound() {
+    const setup = await w.league(2);
+    const [a] = setup.people;
+    const id = setup.league.id;
+    const n = (await addNoApp(a, id, "Player N")).json.member;
+    const play = async (ids, strokes) => {
+      const start = await post(a, "/v1/leagues/rounds", roundBody(id, ids.map((x) => x.id)));
+      expect(start.status).toBe(200);
+      const roundId = start.json.round.roundId;
+      for (const [i, x] of ids.entries()) {
+        expect((await post(x.by, "/v1/leagues/rounds/score", { roundId, memberId: x.id, hole: 1, strokes: strokes[i], rev: 1 })).status).toBe(200);
+      }
+      // A second edit of N's cell, so N has more than one history row in the round.
+      expect((await post(a, "/v1/leagues/rounds/score", { roundId, memberId: n.memberId, hole: 1, strokes: 3, rev: 2 })).status).toBe(200);
+      expect((await post(a, "/v1/leagues/rounds/finish", { roundId })).status).toBe(200);
+      return roundId;
+    };
+    const r1 = await play([{ id: a.ownerId, by: a }, { id: n.memberId, by: a }], [5, 3]);
+    const k = await w.player(11);
+    const c = (await claim(k, setup.code, n.memberId, "Player K")).json.claim;
+    expect((await join(k, setup.code, "Player Kay")).status).toBe(200);
+    const r2 = await play([{ id: a.ownerId, by: a }, { id: k.ownerId, by: k }, { id: n.memberId, by: a }], [5, 4, 3]);
+    return { ...setup, a, id, n, k, c, r1, r2 };
+  }
+
+  it("approve merges instead of 409: the claimer's own entries in the shared round are kept, the spot's dropped", async () => {
+    const { a, id, n, k, c, r1, r2 } = await sharedRound();
+    const kR2 = {
+      results: table(id, "SELECT * FROM round_results WHERE round_id = ? AND member_id = ?", r2, k.ownerId),
+      cells: table(id, "SELECT * FROM round_cell WHERE round_id = ? AND member_id = ?", r2, k.ownerId),
+      history: table(id, "SELECT round_id, member_id, hole, strokes, rev, entered_by, by_id, at FROM round_history WHERE round_id = ? AND member_id = ? ORDER BY seq", r2, k.ownerId),
+    };
+    const nR1 = {
+      cells: table(id, "SELECT hole, strokes, rev, entered_by, by_id, at FROM round_cell WHERE round_id = ? AND member_id = ?", r1, n.memberId),
+      history: table(id, "SELECT hole, strokes, rev, entered_by, by_id, at FROM round_history WHERE round_id = ? AND member_id = ? ORDER BY seq", r1, n.memberId),
+    };
+    const kRow = table(id, "SELECT * FROM member WHERE member_id = ?", k.ownerId);
+
+    const res = await act(a, "approve", c.claimId);
+    expect(res.status).toBe(200);
+    expect(res.json.claim).toEqual({ ...c, status: "approved" });
+
+    // Nothing left under the spot's id; one member row for K, as it was.
+    for (const t of ["member", "round_results", "round_cell", "round_history", "last_seen"]) {
+      expect(table(id, `SELECT COUNT(*) AS n FROM ${t} WHERE member_id = ?`, n.memberId), t).toEqual([{ n: 0 }]);
+    }
+    expect(table(id, "SELECT * FROM member WHERE member_id = ?", k.ownerId)).toEqual(kRow);
+    // R2 (shared): K's own results, cells and history exactly as before; the spot's are gone.
+    expect(table(id, "SELECT * FROM round_results WHERE round_id = ? AND member_id = ?", r2, k.ownerId)).toEqual(kR2.results);
+    expect(table(id, "SELECT * FROM round_cell WHERE round_id = ? AND member_id = ?", r2, k.ownerId)).toEqual(kR2.cells);
+    expect(
+      table(id, "SELECT round_id, member_id, hole, strokes, rev, entered_by, by_id, at FROM round_history WHERE round_id = ? AND member_id = ? ORDER BY seq", r2, k.ownerId),
+    ).toEqual(kR2.history);
+    expect(kR2.cells[0]).toMatchObject({ strokes: 4, entered_by: "self" });
+    const p2 = JSON.parse(table(id, "SELECT players FROM league_round WHERE round_id = ?", r2)[0].players);
+    expect(p2.map((p) => p.memberId)).toEqual([a.ownerId, k.ownerId]);
+    expect(p2[1]).toMatchObject({ kind: "app", hostEnters: false });
+    // R1 (spot only): moved to K as in W10, host-entered cells stay host.
+    expect(table(id, "SELECT hole, strokes, rev, entered_by, by_id, at FROM round_cell WHERE round_id = ? AND member_id = ?", r1, k.ownerId)).toEqual(nR1.cells);
+    expect(nR1.cells[0]).toMatchObject({ entered_by: "host", by_id: a.ownerId });
+    expect(table(id, "SELECT hole, strokes, rev, entered_by, by_id, at FROM round_history WHERE round_id = ? AND member_id = ? ORDER BY seq", r1, k.ownerId)).toEqual(nR1.history);
+    const p1 = JSON.parse(table(id, "SELECT players FROM league_round WHERE round_id = ?", r1)[0].players);
+    expect(p1.map((p) => [p.memberId, p.kind, p.hostEnters])).toEqual([[a.ownerId, "app", false], [k.ownerId, "app", true]]);
+  });
+
+  it("standings recompute: the shared round is scored without the spot, the spot-only round goes to the claimer", async () => {
+    const { a, id, k, c, people } = await sharedRound();
+    expect((await act(a, "approve", c.claimId)).status).toBe(200);
+    const st = (await get(k, `/v1/leagues/standings?league=${id}`)).json;
+    expect(st.rounds).toBe(2);
+    const rows = Object.fromEntries(st.rows.map((r) => [r.memberId, { rounds: r.rounds, points: r.points, rank: r.rank }]));
+    // R1: N (now K) 1st of 2 = 6, A 2nd = 5. R2 without N: K 1st = 6, A 2nd = 5.
+    expect(rows).toEqual({
+      [k.ownerId]: { rounds: 2, points: 12, rank: 1 },
+      [a.ownerId]: { rounds: 2, points: 10, rank: 2 },
+    });
+    // B never played: no row.
+    expect(st.rows.some((r) => r.memberId === people[1].ownerId)).toBe(false);
+  });
+
+  it("works in a full league (no cap check) and leaves one row per member", async () => {
+    const { a, id, k, c } = await sharedRound();
+    for (let i = 0; (await members(a, id)).json.league.players < LEAGUE_MAX_PLAYERS; i += 1) {
+      expect((await addNoApp(a, id, `Player S${i}`)).status).toBe(200);
+    }
+    expect((await act(a, "approve", c.claimId)).status).toBe(200);
+    expect(table(id, "SELECT COUNT(*) AS n FROM member")).toEqual([{ n: LEAGUE_MAX_PLAYERS - 1 }]);
+    expect(table(id, "SELECT COUNT(*) AS n FROM member WHERE member_id = ?", k.ownerId)).toEqual([{ n: 1 }]);
+  });
+
+  it("a former member who played alongside the spot (left before claiming) merges the same way", async () => {
+    const setup = await w.league(3);
+    const [a, , cc] = setup.people;
+    const id = setup.league.id;
+    const n = (await addNoApp(a, id, "Player N")).json.member;
+    const start = await post(a, "/v1/leagues/rounds", roundBody(id, [a.ownerId, cc.ownerId, n.memberId]));
+    const roundId = start.json.round.roundId;
+    expect((await post(cc, "/v1/leagues/rounds/score", { roundId, memberId: cc.ownerId, hole: 1, strokes: 4, rev: 1 })).status).toBe(200);
+    expect((await post(a, "/v1/leagues/rounds/score", { roundId, memberId: n.memberId, hole: 1, strokes: 3, rev: 1 })).status).toBe(200);
+    expect((await post(a, "/v1/leagues/rounds/finish", { roundId })).status).toBe(200);
+    expect((await post(cc, "/v1/leagues/members/leave", { leagueId: id })).status).toBe(200);
+    const c = (await claim(cc, setup.code, n.memberId, "Player C")).json.claim;
+    const res = await act(a, "approve", c.claimId);
+    expect(res).toMatchObject({ status: 200, json: { claim: { status: "approved" } } });
+    expect(table(id, "SELECT hole, strokes, entered_by FROM round_cell WHERE member_id = ?", cc.ownerId)).toEqual([{ hole: 1, strokes: 4, entered_by: "self" }]);
+    expect(table(id, "SELECT COUNT(*) AS n FROM round_results WHERE member_id = ?", cc.ownerId)).toEqual([{ n: 1 }]);
+    expect(table(id, "SELECT member_id, name, kind FROM member WHERE member_id = ?", cc.ownerId)).toEqual([{ member_id: cc.ownerId, name: "Player C", kind: null }]);
+    expect(table(id, "SELECT COUNT(*) AS n FROM member WHERE kind = 'noApp'")).toEqual([{ n: 0 }]);
   });
 });

@@ -1103,18 +1103,18 @@ async function sendClaimPush(env, boards, push) {
 
 /**
  * Brian, Nov 23 2026: the organizer removed a no-app spot that had a pending claim. One push to the
- * claimer only; none when the claimer and the organizer are blocked either way or the claimer has
- * no valid token. The title and body are placeholder wording (no approved mockup string yet).
+ * claimer only, none without a valid token. Sent even when the claimer and the organizer are
+ * blocked either way (Brian, Nov 23, 2:17 PM CT); the other league pushes keep their block skip.
+ * Title: the league name only. Body: Brian's wording, 2:17 PM CT.
  */
 async function sendClaimCancelledPush(env, boards, cancelled) {
-  if (await blockedEitherWay(boards, cancelled.organizerId, cancelled.claimerId)) return;
   const token = await friendGet(boards, friendKvKey("push", cancelled.claimerId));
   if (typeof token !== "string" || !PUSH_TOKEN_RE.test(token)) return;
   await postExpo(env, [
     {
       to: token,
-      title: `${cancelled.leagueName}: claim cancelled`,
-      body: `${cancelled.spotName}'s spot was removed, so your claim was cancelled.`,
+      title: cancelled.leagueName,
+      body: `The organizer removed ${cancelled.spotName}'s spot, so your claim was cancelled.`,
       sound: "default",
       data: { kind: "league_claim_cancelled", leagueId: cancelled.leagueId, claimId: cancelled.claimId },
     },
@@ -1911,8 +1911,12 @@ export class LeagueRoster {
    * Brian, Nov 23 2026: when the claimer joined with the code while the claim was pending, the spot
    * merges into their member row instead: that row is kept as it is, the spot's row is deleted (so
    * there is no duplicate and the roster shrinks by one; the cap is never checked), and everything
-   * else moves exactly as above. Answers a refusal and changes nothing when the spot is gone
-   * (not_found) or the claimer already has a row in a round the spot played (conflict).
+   * else moves exactly as above.
+   * Brian, Nov 23 2026, 2:17 PM CT: for every round both the claimer and the spot played, the
+   * claimer's own results, cells and history are kept and the spot's are dropped (its result row,
+   * cells, history, its place in the round's players and teams). Standings are derived from the
+   * remaining rows, so that round is scored without the spot. Rounds only the spot played move over.
+   * Answers not_found and changes nothing when the spot is gone.
    */
   #moveSpotToClaimer(claim) {
     const from = claim.spot_member_id;
@@ -1929,8 +1933,14 @@ export class LeagueRoster {
       return ids;
     };
     const claimerRounds = roundsOf(to);
-    if ([...roundsOf(from)].some((id) => claimerRounds.has(id))) return "conflict";
+    const shared = new Set([...roundsOf(from)].filter((id) => claimerRounds.has(id)));
     const exec = (query, ...bindings) => this.ctx.storage.sql.exec(query, ...bindings);
+    // Rounds both played: drop the spot's entries, keep the claimer's.
+    for (const roundId of shared) {
+      exec("DELETE FROM round_results WHERE round_id = ? AND member_id = ?", roundId, from);
+      exec("DELETE FROM round_cell WHERE round_id = ? AND member_id = ?", roundId, from);
+      exec("DELETE FROM round_history WHERE round_id = ? AND member_id = ?", roundId, from);
+    }
     if (merge) {
       exec("DELETE FROM member WHERE member_id = ?", from);
     } else {
@@ -1952,9 +1962,18 @@ export class LeagueRoster {
     for (const r of this.#sql("SELECT round_id, host_id, players, teams FROM league_round")) {
       const players = JSON.parse(r.players);
       if (!players.some((p) => p.memberId === from) && r.host_id !== from) continue;
+      const drop = shared.has(r.round_id);
       // As the app's moveRoundMember: the player keeps their place and hostEnters; kind becomes app.
-      const nextPlayers = players.map((p) => (p.memberId === from ? { ...p, memberId: to, kind: "app" } : p));
-      const teams = r.teams == null ? null : JSON.parse(r.teams).map((t) => ({ ...t, memberIds: t.memberIds.map((id) => (id === from ? to : id)) }));
+      // In a shared round the spot is dropped instead (the claimer is already a player there).
+      const nextPlayers = drop
+        ? players.filter((p) => p.memberId !== from)
+        : players.map((p) => (p.memberId === from ? { ...p, memberId: to, kind: "app" } : p));
+      const teams =
+        r.teams == null
+          ? null
+          : JSON.parse(r.teams)
+              .map((t) => ({ ...t, memberIds: drop ? t.memberIds.filter((id) => id !== from) : t.memberIds.map((id) => (id === from ? to : id)) }))
+              .filter((t) => t.memberIds.length > 0);
       exec(
         "UPDATE league_round SET players = ?, teams = ?, host_id = ? WHERE round_id = ?",
         JSON.stringify(nextPlayers),
