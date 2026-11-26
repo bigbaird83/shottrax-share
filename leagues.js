@@ -29,7 +29,12 @@
  * POST /v1/friends/request-by-member is the roster's friend request: the same rules as
  * POST /v1/friends/requests after its code lookup (friends.js requestAfterLookup).
  *
- * Not here yet (later PRs): member handicaps and the /l/ landing page.
+ * Member handicaps (ShotTraxx docs/leagues/net-handicaps.md): POST /v1/leagues/members/handicap. Each
+ * member publishes their OWN handicap index (or withdraws it) to the league; GET /v1/leagues/members
+ * shows it so the host's phone can work out course handicaps at round start. Only the member's own
+ * phone writes it; no-app spots never have one. W1, scoring and standings never read it.
+ *
+ * Not here yet (later PRs): the /l/ landing page.
  */
 import {
   EXPO_PUSH_URL,
@@ -209,7 +214,21 @@ const ROSTER_SCHEMA = [
     created_at INTEGER NOT NULL,
     decided_at INTEGER
   )`,
+  // Member handicaps: each member's own published handicap index (negative = plus index). Only the
+  // member writes their row; deleted when they leave, are removed or hand over and leave.
+  `CREATE TABLE IF NOT EXISTS member_handicap (member_id TEXT PRIMARY KEY, idx REAL NOT NULL, set_at INTEGER NOT NULL)`,
 ];
+
+/** The app's parseManualHandicapIndex range (ShotTraxx src/domain/handicap.ts): -54.0 to 54.0. */
+export const HANDICAP_INDEX_MAX = 54;
+
+/** null (withdraw), or a finite number from -54.0 to 54.0 with at most one decimal. */
+export function validHandicapIndex(value) {
+  if (value === null) return true;
+  if (typeof value !== "number" || !Number.isFinite(value)) return false;
+  if (value < -HANDICAP_INDEX_MAX || value > HANDICAP_INDEX_MAX) return false;
+  return Number(value.toFixed(1)) === value;
+}
 
 /** Decision 8: a code lets a caller in unless it is the code they were removed under. */
 export function codeLetsIn({ code, removedUnder }) {
@@ -230,6 +249,7 @@ const LEAGUE_ROUTES = {
   "/v1/leagues/members/rename": { POST: renameNoAppPlayer },
   "/v1/leagues/members/leave": { POST: leaveLeague },
   "/v1/leagues/members/handover": { POST: handOverAndLeave },
+  "/v1/leagues/members/handicap": { POST: setOwnHandicap },
   "/v1/leagues/code/reset": { POST: resetLeagueCode },
   "/v1/leagues/claims": { POST: claimSpot, GET: listClaims },
   "/v1/leagues/claims/mine": { GET: myLatestClaim },
@@ -558,6 +578,28 @@ async function leaveLeague(request, url, env, cors) {
   const answer = await rosterCall(env, ready.leagueId, { op: "leave", callerId: ready.caller.ownerId });
   if (!answer.ok) return friendJson(memberErrorStatus(answer.error), { error: answer.error }, cors);
   return friendJson(200, { left: ready.caller.ownerId }, cors);
+}
+
+/**
+ * Member handicaps. Body { leagueId, index }, both required. index is null (withdraw) or a number
+ * from -54.0 to 54.0 with at most one decimal (negative = plus index), else 400 invalid_body. Always
+ * the caller's own row: there is no memberId, so nobody (the organizer included) can set another
+ * member's index, and a no-app spot can never have one. 403 forbidden for a non-member; no league or
+ * blocked either way with the owner: 404 not_found. Answers { memberId, handicapIndex }. set_at is
+ * stored but never sent (Brian, Nov 26 2026: don't expose how old a shared handicap is).
+ */
+async function setOwnHandicap(request, url, env, cors) {
+  const ready = await readyMemberWrite(request, env, cors, ["leagueId", "index"]);
+  if (ready.response) return ready.response;
+  if (!("index" in ready.body) || !validHandicapIndex(ready.body.index)) return friendJson(400, { error: "invalid_body" }, cors);
+  const answer = await rosterCall(env, ready.leagueId, {
+    op: "handicapSet",
+    callerId: ready.caller.ownerId,
+    index: ready.body.index,
+    now: Date.now(),
+  });
+  if (!answer.ok) return friendJson(memberErrorStatus(answer.error), { error: answer.error }, cors);
+  return friendJson(200, { memberId: ready.caller.ownerId, handicapIndex: answer.handicapIndex }, cors);
 }
 
 /**
@@ -957,16 +999,36 @@ function readRoundPlayers(raw) {
   const seen = new Set();
   const players = [];
   for (const p of raw) {
-    if (p == null || typeof p !== "object" || Array.isArray(p) || unknownFields(p, ["memberId", "groupNo", "courseHandicap", "hostEnters"])) return null;
+    if (p == null || typeof p !== "object" || Array.isArray(p) || unknownFields(p, ["memberId", "groupNo", "courseHandicap", "hostEnters", "teeName"])) return null;
     const { memberId, groupNo, courseHandicap, hostEnters } = p;
+    const teeName = readTeeName(p.teeName);
+    if (teeName === undefined) return null;
     if (typeof memberId !== "string" || memberId.length < 1 || memberId.length > 64 || seen.has(memberId)) return null;
     if (!Number.isInteger(groupNo) || groupNo < 1) return null;
     if (courseHandicap !== null && !(Number.isInteger(courseHandicap) && courseHandicap >= 0 && courseHandicap <= LEAGUE_HANDICAP_MAX)) return null;
     if (typeof hostEnters !== "boolean") return null;
     seen.add(memberId);
-    players.push({ memberId, groupNo, courseHandicap, hostEnters });
+    // A tee name only when one was sent, so bodies without one store and read exactly as before.
+    players.push(teeName === null ? { memberId, groupNo, courseHandicap, hostEnters } : { memberId, groupNo, courseHandicap, hostEnters, teeName });
   }
   return players;
+}
+
+/** Longest per-player tee name W1 accepts (after trimming). */
+export const LEAGUE_TEE_NAME_MAX = 24;
+
+/**
+ * W1's optional per-player teeName, for display only (the host's phone works out each player's
+ * course handicap from their own tee). Absent or null -> null; a string trimmed to 1–24 characters
+ * with no control characters; anything else -> undefined (400 invalid_body).
+ */
+function readTeeName(raw) {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== "string") return undefined;
+  const name = raw.trim();
+  if (name.length < 1 || [...name].length > LEAGUE_TEE_NAME_MAX) return undefined;
+  if (/[\u0000-\u001F\u007F]/.test(name)) return undefined;
+  return name;
 }
 
 /** Teams: null, or teams of players in the round, each player in at most one team. False when invalid. */
@@ -1011,18 +1073,27 @@ async function publicMember(boards, member) {
   if (member.kind !== NOAPP) {
     // One name per player: a later Friends name change shows here too.
     const current = readInviteName(await friendGet(boards, friendKvKey("ownname", member.memberId)));
-    return { memberId: member.memberId, name: current || member.name, role: member.role, joinedAt: member.joinedAt };
+    return withHandicap({ memberId: member.memberId, name: current || member.name, role: member.role, joinedAt: member.joinedAt }, member);
   }
-  return {
-    memberId: member.memberId,
-    name: member.name,
-    role: member.role,
-    joinedAt: member.joinedAt,
-    kind: NOAPP,
-    addedBy: member.addedBy,
-    addedByName: await adderName(boards, member),
-    addedAt: member.addedAt,
-  };
+  return withHandicap(
+    {
+      memberId: member.memberId,
+      name: member.name,
+      role: member.role,
+      joinedAt: member.joinedAt,
+      kind: NOAPP,
+      addedBy: member.addedBy,
+      addedByName: await adderName(boards, member),
+      addedAt: member.addedAt,
+    },
+    member,
+  );
+}
+
+/** Adds handicapIndex only when the member published an index; otherwise no key. Never when it was set. */
+function withHandicap(out, member) {
+  if (typeof member.handicapIndex !== "number") return out;
+  return { ...out, handicapIndex: member.handicapIndex };
 }
 
 /** The adder's current Friends name, else their roster name, else null (they left). */
@@ -1266,6 +1337,7 @@ export class LeagueRoster {
     if (op === "settings") return rosterJson(this.ctx.storage.transactionSync(() => this.#settings(body)));
     if (op === "noAppAdd") return rosterJson(this.ctx.storage.transactionSync(() => this.#noAppAdd(body)));
     if (op === "noAppRename") return rosterJson(this.ctx.storage.transactionSync(() => this.#noAppRename(body)));
+    if (op === "handicapSet") return rosterJson(this.ctx.storage.transactionSync(() => this.#handicapSet(body)));
     if (op === "leave") return rosterJson(this.ctx.storage.transactionSync(() => this.#leave(body)));
     if (op === "handover") return rosterJson(this.ctx.storage.transactionSync(() => this.#handover(body)));
     if (op === "memberPair") return rosterJson(this.#memberPair(body));
@@ -1345,13 +1417,16 @@ export class LeagueRoster {
   /** A member row for the Worker. App rows carry the four fields they always had. */
   #memberOut(m) {
     const out = { memberId: m.member_id, name: m.name, role: m.role, joinedAt: Number(m.joined_at) };
-    if (m.kind !== NOAPP) return out;
+    // Member handicaps: only #members selects these columns, and only a stored row adds the fields.
+    const handicap = m.h_idx == null ? {} : { handicapIndex: Number(m.h_idx) };
+    if (m.kind !== NOAPP) return { ...out, ...handicap };
     return {
       ...out,
       kind: NOAPP,
       addedBy: m.added_by ?? null,
       addedAt: m.added_at == null ? null : Number(m.added_at),
       adderRosterName: m.adder_name ?? null,
+      ...handicap,
     };
   }
 
@@ -1453,6 +1528,7 @@ export class LeagueRoster {
     if (role === "owner") return { ok: false, error: "forbidden" };
     const noApp = this.#memberRow(memberId).kind === NOAPP;
     this.ctx.storage.sql.exec("DELETE FROM member WHERE member_id = ?", memberId);
+    this.ctx.storage.sql.exec("DELETE FROM member_handicap WHERE member_id = ?", memberId);
     // Decision 8: removing a no-app player deletes the unclaimed spot; its round_results stay.
     // Nobody can present a code as a no-app id, so no removed row is written for one.
     // Brian, Nov 23 2026: a pending claim on the spot is cancelled with it (no orphan claim).
@@ -1495,7 +1571,9 @@ export class LeagueRoster {
     const row = this.#league();
     if (!row || !this.#isMember(callerId)) return { ok: false, error: "not_found" };
     const members = this.#sql(
-      `SELECT m.*, a.name AS adder_name FROM member m LEFT JOIN member a ON a.member_id = m.added_by
+      `SELECT m.*, a.name AS adder_name, h.idx AS h_idx FROM member m
+       LEFT JOIN member a ON a.member_id = m.added_by
+       LEFT JOIN member_handicap h ON h.member_id = m.member_id
        ORDER BY m.joined_at, m.member_id`,
     ).map((m) => this.#memberOut(m));
     return { ok: true, league: this.#publicLeague(row), code: row.code, members };
@@ -1597,6 +1675,8 @@ export class LeagueRoster {
       groupNo: p.groupNo,
       courseHandicap: p.courseHandicap,
       hostEnters: noApp.has(p.memberId) ? true : p.hostEnters,
+      // Display only: scoring, finish and standings never read it.
+      ...(typeof p.teeName === "string" ? { teeName: p.teeName } : {}),
     }));
     this.ctx.storage.sql.exec(
       `INSERT INTO league_round (round_id, host_id, started_at, played_on, course, holes, game, scoring, carry_over, teams_mode, teams, players, game_points, points_mode, finished, finished_at)
@@ -1807,7 +1887,28 @@ export class LeagueRoster {
     if (role == null) return { ok: false, error: "not_found" };
     if (role === "owner") return { ok: false, error: "forbidden" };
     this.ctx.storage.sql.exec("DELETE FROM member WHERE member_id = ?", callerId);
+    this.ctx.storage.sql.exec("DELETE FROM member_handicap WHERE member_id = ?", callerId);
     return { ok: true };
+  }
+
+  /** Member handicaps: the caller's own row only (403 for a non-member). null deletes it. */
+  #handicapSet({ callerId, index, now }) {
+    if (!this.#league()) return { ok: false, error: "not_found" };
+    if (!this.#isMember(callerId)) return { ok: false, error: "forbidden" };
+    // A no-app id is never a caller (no Friends key), so this can only ever be an app member's row.
+    if (this.#memberRow(callerId).kind === NOAPP) return { ok: false, error: "forbidden" };
+    if (index === null) {
+      this.ctx.storage.sql.exec("DELETE FROM member_handicap WHERE member_id = ?", callerId);
+      return { ok: true, handicapIndex: null };
+    }
+    this.ctx.storage.sql.exec(
+      `INSERT INTO member_handicap (member_id, idx, set_at) VALUES (?, ?, ?)
+       ON CONFLICT(member_id) DO UPDATE SET idx = excluded.idx, set_at = excluded.set_at`,
+      callerId,
+      index,
+      now,
+    );
+    return { ok: true, handicapIndex: index };
   }
 
   /** W17, one transaction: the target becomes the owner, league.owner_id follows, the caller's row goes. */
@@ -1822,6 +1923,7 @@ export class LeagueRoster {
     this.ctx.storage.sql.exec("UPDATE member SET role = 'owner' WHERE member_id = ?", memberId);
     this.ctx.storage.sql.exec("UPDATE league SET owner_id = ? WHERE id = 1", memberId);
     this.ctx.storage.sql.exec("DELETE FROM member WHERE member_id = ?", callerId);
+    this.ctx.storage.sql.exec("DELETE FROM member_handicap WHERE member_id = ?", callerId);
     return { ok: true, league: this.#publicLeague(this.#league()) };
   }
 

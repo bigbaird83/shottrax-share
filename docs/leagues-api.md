@@ -11,7 +11,7 @@ Every call uses the friends `X-Friend-Key`. The caller needs a friend code alrea
 | `POST /v1/leagues` | `{ name, yourName, game, scoring, carryOver, homeCourse, seasonStarts, seasonEnds, roundDay?, gamePoints?, pointsMode? }` | `{ league, code }` |
 | `POST /v1/leagues/preview` | `{ code }` | `{ league }` (no member list, no owner id), plus `spots` when the league has a claimable no-app spot (W8) |
 | `POST /v1/leagues/join` | `{ code, name }` | `{ league, joined }` |
-| `GET /v1/leagues/members` | `?league=<id>` | `{ league, code, members: [{ memberId, name, role, joinedAt }] }`; no-app rows add `kind:'noApp', addedBy, addedByName, addedAt` |
+| `GET /v1/leagues/members` | `?league=<id>` | `{ league, code, members: [{ memberId, name, role, joinedAt }] }`; no-app rows add `kind:'noApp', addedBy, addedByName, addedAt`; a member who published a handicap index adds `handicapIndex` |
 | `GET /v1/leagues/standings` | `?league=<id>` | `{ season, rounds, rows: [{ memberId, name, rank, tied, rounds, avgNet, skins, points }] }` |
 | `POST /v1/leagues/members/remove` | `{ leagueId, memberId }` | `{ removed, league }`. Organizer only. |
 | `POST /v1/leagues/code/reset` | `{ leagueId }` | `{ code, league }`. Organizer only. |
@@ -19,6 +19,7 @@ Every call uses the friends `X-Friend-Key`. The caller needs a friend code alrea
 | `POST /v1/leagues/members/rename` (W7) | `{ memberId, name }` | `{ member }`. No-app only; organizer or adder. |
 | `POST /v1/leagues/members/leave` (W16) | `{ leagueId }` | `{ left }`. Anyone but the organizer. |
 | `POST /v1/leagues/members/handover` (W17) | `{ leagueId, memberId }` | `{ left, league }`. Organizer only. |
+| `POST /v1/leagues/members/handicap` | `{ leagueId, index }` | `{ memberId, handicapIndex }`. The caller's own index only. See [Member handicaps](#member-handicaps). |
 | `POST /v1/leagues/claims` (W9) | `{ code, spotMemberId, name }` | `{ claim }` |
 | `POST /v1/leagues/claims/approve` / `decline` / `cancel` (W10–W12) | `{ claimId }` | `{ claim }` |
 | `GET /v1/leagues/claims` (W13) | `?league=<id>` | `{ claims }`. Organizer only. |
@@ -75,13 +76,14 @@ Body (every field required, unknown fields refused, at most 16 KB):
   holes: [{ number, par, strokeIndex }],
   game, scoring, carryOver,
   teamsMode, teams: [{ teamNo, memberIds }] | null,
-  players: [{ memberId, groupNo, courseHandicap, hostEnters }] }
+  players: [{ memberId, groupNo, courseHandicap, hostEnters, teeName? }] }
 ```
 
 - `course`: 1–200 characters, no padding. `playedOn`: `YYYY-MM-DD`.
 - `holes`: 9 or 18, unique hole numbers 1–18. `par`: null or 3–6. `strokeIndex`: null or 1–18.
 - `game` / `scoring` as for create; `carryOver` true only with skins.
 - `players`: 1–20 unique current members. `groupNo` ≥ 1, `courseHandicap` null or 0–54, `hostEnters` a boolean.
+- `teeName` (optional, Brian Nov 26 2026): the player's tee, for display only. A string trimmed to 1–24 characters with no control characters, or null; absent reads as null. Anything else (a number, `""`, 25+ characters after trimming) is 400 `invalid_body`. Course handicaps are still worked out on the host's phone, each from the player's own tee, and sent in `courseHandicap`; the 0–54 range is unchanged (the app sends a plus handicap as 0). A sent name is stored in the round's players snapshot and returned on that player in every round answer (start, live read); a player with no tee has no `teeName` key, so rounds without tees read exactly as before. Scoring, finish and standings never read it.
 - `teamsMode`: null, `pairs` or `teams`. `teams`: null, or teams with an integer `teamNo` whose members are players in the round, each in at most one team. With `teamsMode` null the teams are dropped (the app reads them only with a mode).
 - Any failure: 400 `invalid_body`. A caller who isn't a member: 403 `forbidden`. A live round already in the league: 409 `round_live` (one live round per league, checked in the Durable Object's transaction).
 
@@ -90,7 +92,7 @@ Answer `{ round }`:
 ```
 { roundId, leagueId, hostId, startedAt, playedOn, course, holes, game, scoring, carryOver,
   teamsMode, teams,
-  players: [{ memberId, name, kind, groupNo, courseHandicap, hostEnters }],
+  players: [{ memberId, name, kind, groupNo, courseHandicap, hostEnters, teeName? }],
   cells: { <memberId>: { <hole>: { strokes, rev, enteredBy, by, at } } },
   finished, pointsMode, gamePoints }
 ```
@@ -256,11 +258,11 @@ Removing a no-app player deletes the unclaimed spot and keeps its past rounds (d
 
 ### W16 `POST /v1/leagues/members/leave`
 
-`{ leagueId }`. Any current member except the organizer, who gets 403 `forbidden` (decision 8: hand over first). Deletes only the caller's member row. Screen 10: "Your past rounds stay in the standings. You can rejoin with the league code." No league, not a member, or blocked either way with the owner: 404 `not_found`. Answers `{ left: <callerId> }`.
+`{ leagueId }`. Any current member except the organizer, who gets 403 `forbidden` (decision 8: hand over first). Deletes only the caller's member row (and their [member handicap](#member-handicaps) row, if any). Screen 10: "Your past rounds stay in the standings. You can rejoin with the league code." No league, not a member, or blocked either way with the owner: 404 `not_found`. Answers `{ left: <callerId> }`.
 
 ### W17 `POST /v1/leagues/members/handover`
 
-`{ leagueId, memberId }` (memberId = the new organizer). One roster transaction: the caller must be the organizer (403 `forbidden`); the target must be a current member (404 `not_found`) with the app and not the caller (400 `invalid_body`; decision 5). The target's role becomes `owner`, `league.owner_id` becomes the target, and the caller's member row is deleted. No `removed` row; no round or result is touched. Afterwards the new organizer passes every organizer check (reset, remove, settings, claims list, approve / decline) and the old one passes none. Answers `{ left: <callerId>, league }` with the league after the change (new `ownerId` / `ownerName`, one fewer player).
+`{ leagueId, memberId }` (memberId = the new organizer). One roster transaction: the caller must be the organizer (403 `forbidden`); the target must be a current member (404 `not_found`) with the app and not the caller (400 `invalid_body`; decision 5). The target's role becomes `owner`, `league.owner_id` becomes the target, and the caller's member row (and their member handicap row, if any) is deleted. No `removed` row; no round or result is touched. Afterwards the new organizer passes every organizer check (reset, remove, settings, claims list, approve / decline) and the old one passes none. Answers `{ left: <callerId>, league }` with the league after the change (new `ownerId` / `ownerName`, one fewer player).
 
 Known effects: "Started by {name}" on League home is `ownerName`, so it shows the new organizer (there is one owner field; no creator field was approved). The owner-block rule follows the new organizer.
 
@@ -274,6 +276,29 @@ Known effects: "Started by {name}" on League home is `ownerName`, so it shows th
 - W9: join's limits (the friend-code guess limit; a code that lets the caller in gives its guess back).
 - No new limiter prefix.
 
+## Member handicaps
+
+ShotTraxx plan `docs/leagues/net-handicaps.md`. Each member publishes their **own** handicap index to each league they're in, so the host's phone can read it from the members list at round start and work out a course handicap to send in W1's `courseHandicap`.
+
+### `POST /v1/leagues/members/handicap`
+
+`{ leagueId, index }`, both keys required and no others (400 `invalid_body`). `index` is `null` (withdraw) or a finite number from -54.0 to 54.0 inclusive with at most one decimal (negative = a plus index, as the app's `parseManualHandicapIndex`). Anything else (a string, `12.34`, `54.1`, `-54.1`, a missing `index`) is 400 `invalid_body`.
+
+- It always writes the caller's own row. There is no `memberId` field: nobody, the organizer included, can set another member's index, and a no-app spot can never have one.
+- Not a member: 403 `forbidden`. No league, or blocked either way with the owner: 404 `not_found`.
+- Limits: the member read limit (`keylgread:` / `iplgread:`), as W6 and W16.
+- Answers `{ memberId, handicapIndex }`. After a withdraw `handicapIndex` is `null`. When the index was set is stored (`set_at`) but never sent (Brian, Nov 26 2026: don't expose how old a shared handicap is).
+
+### Members list
+
+`GET /v1/leagues/members` adds `handicapIndex` (number) to a member who has published an index. A member without one has no such key, so those rows are exactly as before. No row ever carries when the index was set.
+
+### Storage and cleanup
+
+- A new table in the league's roster object: `member_handicap (member_id TEXT PRIMARY KEY, idx REAL NOT NULL, set_at INTEGER NOT NULL)`.
+- The row is deleted in the same transaction when the member leaves (W16), is removed, or hands over and leaves (W17, the leaving organizer only). On a claim approve the no-app spot never had a row and the claimer's own row (if any) stays as it is.
+- Nothing else reads it: W1 still snapshots whatever `courseHandicap` the host sends, and finish, scoring and standings are unchanged.
+
 ### Not built
 
-Member handicaps (App PR 7).
+The `/l/` landing page.
