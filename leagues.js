@@ -585,7 +585,8 @@ async function leaveLeague(request, url, env, cors) {
  * from -54.0 to 54.0 with at most one decimal (negative = plus index), else 400 invalid_body. Always
  * the caller's own row: there is no memberId, so nobody (the organizer included) can set another
  * member's index, and a no-app spot can never have one. 403 forbidden for a non-member; no league or
- * blocked either way with the owner: 404 not_found. Answers { memberId, handicapIndex, handicapAt }.
+ * blocked either way with the owner: 404 not_found. Answers { memberId, handicapIndex }. set_at is
+ * stored but never sent (Brian, Nov 26 2026: don't expose how old a shared handicap is).
  */
 async function setOwnHandicap(request, url, env, cors) {
   const ready = await readyMemberWrite(request, env, cors, ["leagueId", "index"]);
@@ -598,7 +599,7 @@ async function setOwnHandicap(request, url, env, cors) {
     now: Date.now(),
   });
   if (!answer.ok) return friendJson(memberErrorStatus(answer.error), { error: answer.error }, cors);
-  return friendJson(200, { memberId: ready.caller.ownerId, handicapIndex: answer.handicapIndex, handicapAt: answer.handicapAt }, cors);
+  return friendJson(200, { memberId: ready.caller.ownerId, handicapIndex: answer.handicapIndex }, cors);
 }
 
 /**
@@ -998,16 +999,36 @@ function readRoundPlayers(raw) {
   const seen = new Set();
   const players = [];
   for (const p of raw) {
-    if (p == null || typeof p !== "object" || Array.isArray(p) || unknownFields(p, ["memberId", "groupNo", "courseHandicap", "hostEnters"])) return null;
+    if (p == null || typeof p !== "object" || Array.isArray(p) || unknownFields(p, ["memberId", "groupNo", "courseHandicap", "hostEnters", "teeName"])) return null;
     const { memberId, groupNo, courseHandicap, hostEnters } = p;
+    const teeName = readTeeName(p.teeName);
+    if (teeName === undefined) return null;
     if (typeof memberId !== "string" || memberId.length < 1 || memberId.length > 64 || seen.has(memberId)) return null;
     if (!Number.isInteger(groupNo) || groupNo < 1) return null;
     if (courseHandicap !== null && !(Number.isInteger(courseHandicap) && courseHandicap >= 0 && courseHandicap <= LEAGUE_HANDICAP_MAX)) return null;
     if (typeof hostEnters !== "boolean") return null;
     seen.add(memberId);
-    players.push({ memberId, groupNo, courseHandicap, hostEnters });
+    // A tee name only when one was sent, so bodies without one store and read exactly as before.
+    players.push(teeName === null ? { memberId, groupNo, courseHandicap, hostEnters } : { memberId, groupNo, courseHandicap, hostEnters, teeName });
   }
   return players;
+}
+
+/** Longest per-player tee name W1 accepts (after trimming). */
+export const LEAGUE_TEE_NAME_MAX = 24;
+
+/**
+ * W1's optional per-player teeName, for display only (the host's phone works out each player's
+ * course handicap from their own tee). Absent or null -> null; a string trimmed to 1–24 characters
+ * with no control characters; anything else -> undefined (400 invalid_body).
+ */
+function readTeeName(raw) {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== "string") return undefined;
+  const name = raw.trim();
+  if (name.length < 1 || [...name].length > LEAGUE_TEE_NAME_MAX) return undefined;
+  if (/[\u0000-\u001F\u007F]/.test(name)) return undefined;
+  return name;
 }
 
 /** Teams: null, or teams of players in the round, each player in at most one team. False when invalid. */
@@ -1069,10 +1090,10 @@ async function publicMember(boards, member) {
   );
 }
 
-/** Adds handicapIndex and handicapAt only when the member published an index; otherwise neither key. */
+/** Adds handicapIndex only when the member published an index; otherwise no key. Never when it was set. */
 function withHandicap(out, member) {
   if (typeof member.handicapIndex !== "number") return out;
-  return { ...out, handicapIndex: member.handicapIndex, handicapAt: member.handicapAt };
+  return { ...out, handicapIndex: member.handicapIndex };
 }
 
 /** The adder's current Friends name, else their roster name, else null (they left). */
@@ -1397,7 +1418,7 @@ export class LeagueRoster {
   #memberOut(m) {
     const out = { memberId: m.member_id, name: m.name, role: m.role, joinedAt: Number(m.joined_at) };
     // Member handicaps: only #members selects these columns, and only a stored row adds the fields.
-    const handicap = m.h_idx == null ? {} : { handicapIndex: Number(m.h_idx), handicapAt: Number(m.h_at) };
+    const handicap = m.h_idx == null ? {} : { handicapIndex: Number(m.h_idx) };
     if (m.kind !== NOAPP) return { ...out, ...handicap };
     return {
       ...out,
@@ -1550,7 +1571,7 @@ export class LeagueRoster {
     const row = this.#league();
     if (!row || !this.#isMember(callerId)) return { ok: false, error: "not_found" };
     const members = this.#sql(
-      `SELECT m.*, a.name AS adder_name, h.idx AS h_idx, h.set_at AS h_at FROM member m
+      `SELECT m.*, a.name AS adder_name, h.idx AS h_idx FROM member m
        LEFT JOIN member a ON a.member_id = m.added_by
        LEFT JOIN member_handicap h ON h.member_id = m.member_id
        ORDER BY m.joined_at, m.member_id`,
@@ -1654,6 +1675,8 @@ export class LeagueRoster {
       groupNo: p.groupNo,
       courseHandicap: p.courseHandicap,
       hostEnters: noApp.has(p.memberId) ? true : p.hostEnters,
+      // Display only: scoring, finish and standings never read it.
+      ...(typeof p.teeName === "string" ? { teeName: p.teeName } : {}),
     }));
     this.ctx.storage.sql.exec(
       `INSERT INTO league_round (round_id, host_id, started_at, played_on, course, holes, game, scoring, carry_over, teams_mode, teams, players, game_points, points_mode, finished, finished_at)
@@ -1876,7 +1899,7 @@ export class LeagueRoster {
     if (this.#memberRow(callerId).kind === NOAPP) return { ok: false, error: "forbidden" };
     if (index === null) {
       this.ctx.storage.sql.exec("DELETE FROM member_handicap WHERE member_id = ?", callerId);
-      return { ok: true, handicapIndex: null, handicapAt: null };
+      return { ok: true, handicapIndex: null };
     }
     this.ctx.storage.sql.exec(
       `INSERT INTO member_handicap (member_id, idx, set_at) VALUES (?, ?, ?)
@@ -1885,7 +1908,7 @@ export class LeagueRoster {
       index,
       now,
     );
-    return { ok: true, handicapIndex: index, handicapAt: now };
+    return { ok: true, handicapIndex: index };
   }
 
   /** W17, one transaction: the target becomes the owner, league.owner_id follows, the caller's row goes. */

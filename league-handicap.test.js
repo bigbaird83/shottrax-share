@@ -38,17 +38,22 @@ describe("POST /v1/leagues/members/handicap", () => {
     const before = Date.now();
     const res = await setIndex(b, { leagueId: setup.league.id, index: 12.4 });
     expect(res.status).toBe(200);
-    expect(Object.keys(res.json)).toEqual(["memberId", "handicapIndex", "handicapAt"]);
+    // Brian, Nov 26 2026: how old a shared handicap is is never exposed.
+    expect(Object.keys(res.json)).toEqual(["memberId", "handicapIndex"]);
+    expect(res.json).not.toHaveProperty("handicapAt");
     expect(res.json).toMatchObject({ memberId: b.ownerId, handicapIndex: 12.4 });
-    expect(res.json.handicapAt).toBeGreaterThanOrEqual(before);
     const list = await members(c, setup.league.id);
     expect(list.status).toBe(200);
     const row = memberOf(list, b.ownerId);
-    expect(row).toEqual({ memberId: b.ownerId, name: "Player B", role: "member", joinedAt: row.joinedAt, handicapIndex: 12.4, handicapAt: res.json.handicapAt });
+    expect(row).toEqual({ memberId: b.ownerId, name: "Player B", role: "member", joinedAt: row.joinedAt, handicapIndex: 12.4 });
+    for (const m of list.json.members) expect(m).not.toHaveProperty("handicapAt");
     // Members without an index have neither key: their rows are exactly as before.
     expect(Object.keys(memberOf(list, a.ownerId)).sort()).toEqual(APP_MEMBER_KEYS);
     expect(Object.keys(memberOf(list, c.ownerId)).sort()).toEqual(APP_MEMBER_KEYS);
-    expect(handicapRows(setup.league.id)).toEqual([{ member_id: b.ownerId, idx: 12.4, set_at: res.json.handicapAt }]);
+    // set_at is still stored, just never sent.
+    const rows = handicapRows(setup.league.id);
+    expect(rows).toEqual([{ member_id: b.ownerId, idx: 12.4, set_at: expect.any(Number) }]);
+    expect(rows[0].set_at).toBeGreaterThanOrEqual(before);
   });
 
   it("a later set overwrites the earlier one (one row per member)", async () => {
@@ -66,7 +71,8 @@ describe("POST /v1/leagues/members/handicap", () => {
     const [a, b] = setup.people;
     await setIndex(b, { leagueId: setup.league.id, index: 9.1 });
     const res = await setIndex(b, { leagueId: setup.league.id, index: null });
-    expect(res).toMatchObject({ status: 200, json: { memberId: b.ownerId, handicapIndex: null, handicapAt: null } });
+    expect(res).toMatchObject({ status: 200, json: { memberId: b.ownerId, handicapIndex: null } });
+    expect(Object.keys(res.json)).toEqual(["memberId", "handicapIndex"]);
     const row = memberOf(await members(a, setup.league.id), b.ownerId);
     expect(Object.keys(row).sort()).toEqual(APP_MEMBER_KEYS);
     expect(handicapRows(setup.league.id)).toEqual([]);
